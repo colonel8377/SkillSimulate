@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+*.env
+conda_env/
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data & outputs (large files)
+data/raw/
+data/processed/
+outputs/simulations/
+outputs/skills/
+outputs/results/
+
+# Model cache
+*.bin
+*.safetensors
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Checkpoints
+outputs/**/checkpoints/
+/paper/
+/.agents/
+/.claude/
+/data/
+/outputs/

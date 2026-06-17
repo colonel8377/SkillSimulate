@@ -1,0 +1,18 @@
+# Full Experiment 2 — social simulation
+name: exp2_full
+datasets: [wikipedia, reddit, github]
+models: [gpt-4o, claude-3.5-sonnet, llama-3-70b, qwen-2.5-72b]
+conditions: [cadp_full, descriptive]
+num_repeats: 5
+num_rounds: 50
+population_size: 30
+alpha: 1.0
+num_clusters: 4
+cluster_method: kmeans
+top_n_threads: 20
+checkpoint_every: 10
+max_concurrency: 4
+seed: 42
+# Scale test
+scale_test: true
+scale_test_sizes: [30, 100]

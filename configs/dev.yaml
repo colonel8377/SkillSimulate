@@ -1,0 +1,16 @@
+# Dev config — minimal subset for development and testing
+name: dev_run
+datasets: [wikipedia]
+models: [gpt-4o]
+conditions: [vanilla, cadp_full]
+num_repeats: 1
+num_rounds: 5
+population_size: 6
+alpha: 1.0
+num_clusters: 3
+cluster_method: kmeans
+top_n_threads: 10
+max_threads: 500
+checkpoint_every: 5
+max_concurrency: 2
+seed: 42
