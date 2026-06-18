@@ -14,6 +14,7 @@ from typing import Any
 from src.enforcement.base import EnforcementResult, EnforcementStrategy
 from src.enforcement.mind_model_retriever import MindModelRetriever
 from src.skill.schema import MindModel
+from src.config.embedder import run_embed_in_executor
 
 
 INJECTION_TEMPLATE = """You are participating in an online discussion. Follow these reasoning guidelines strictly:
@@ -65,7 +66,9 @@ class Tier2MindModelInjection(EnforcementStrategy):
 
         # Retrieval-augmented selection: only the top-k relevant models
         state = self.retriever.infer_dialogue_state(messages)
-        selected = self.retriever.retrieve(mind_models, state)
+        selected = await run_embed_in_executor(
+            self.retriever.retrieve, mind_models, state
+        )
 
         injection_text = self._format_mind_models(selected)
         rule_message = INJECTION_TEMPLATE.format(mind_model_text=injection_text)

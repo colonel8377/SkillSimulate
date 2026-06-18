@@ -21,7 +21,7 @@ class EmbeddingExtractor:
         model_name: str | None = None,
         min_text_length: int = 10,
     ):
-        self.model_name = model_name or settings.sentence_transformer_model
+        self.model_name = model_name or settings.embedder_model
         self.min_text_length = min_text_length
         self._model: SentenceTransformer | None = None
 

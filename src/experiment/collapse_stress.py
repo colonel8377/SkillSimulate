@@ -39,6 +39,7 @@ from src.clustering.clusterer import (
     silhouette_at_state,
 )
 from src.clustering.embeddings import mean_pairwise_cosine, rolling_agent_state
+from src.config.embedder import run_embed_in_executor
 
 
 # --- Defaults from protocol §3 ------------------------------------------------
@@ -503,14 +504,13 @@ async def run_collapse_stress_cell(
         # Fall back to extracting from message log
         agent_ids = sorted({m["user_id"] for m in sim_result.messages})
 
-    measurements = compute_collapse_trajectory(
-        sim_messages=sim_result.messages,
-        agent_ids=agent_ids,
-        K_frozen=K_frozen,
-        embedder=embedder,
-        measurement_points=tuple(
-            t for t in DEFAULT_MEASUREMENT_POINTS if t <= num_turns
-        ),
+    measurements = await run_embed_in_executor(
+        compute_collapse_trajectory,
+        sim_result.messages,
+        agent_ids,
+        K_frozen,
+        embedder,
+        tuple(t for t in DEFAULT_MEASUREMENT_POINTS if t <= num_turns),
     )
 
     result = CollapseRunResult(

@@ -22,17 +22,22 @@ class Settings(BaseSettings):
     simulations_dir: Path = output_dir / "simulations"
     results_dir: Path = output_dir / "results"
 
-    # Model cache
-    sentence_transformer_model: str = "all-MiniLM-L6-v2"
+    # Shared embedder: used by clustering, Tier 1, Tier 2, Tier 3, Expression DNA.
+    # Any SentenceTransformer-compatible model name works.
+    embedder_model: str = "BAAI/bge-large-en-v1.5"
+    embedder_device: str = "auto"      # auto | cpu | cuda:N
+    embedder_gpu_id: int = 0           # used when device=auto
+    embedder_batch_size: int = 64
+
     # SIP (Semantic Information Preservation) uses a SEPARATE encoder so the
     # Linguistics layer's SIP sub-metric is NOT circular with the embedding
     # space used by Tier 1, Tier 3, clustering, and Expression DNA distillation
     # (outline §3.1 dissociation claim / §5.4 anti-leakage requirement).
-    # all-MiniLM-L6-v2 and paraphrase-mpnet-base-v2 are different model
-    # families trained on different objectives / data; using a distinct
-    # family is the cleanest way to break the circularity. Override via
-    # CADP_SIP_MODEL env var if desired.
+    # Must be a different model family from the shared embedder.
     sip_model: str = "paraphrase-mpnet-base-v2"
+    sip_device: str = "auto"           # auto | cpu | cuda:N
+    sip_gpu_id: int = 1                # used when device=auto
+    sip_batch_size: int = 64
 
     model_config = {"env_prefix": "CADP_", "env_file": ".env"}
 
@@ -42,23 +47,33 @@ settings = Settings()
 
 @lru_cache(maxsize=1)
 def get_shared_embedder():
-    """Shared SentenceTransformer singleton — avoids repeated model loading.
+    """Shared embedder singleton — used by clustering, Tier 1/2/3, Expression DNA.
 
-    Used by Tier 1 (Expression DNA 2σ filter), Tier 3 (semantic anti-pattern
-    trigger), clustering embeddings, and Expression DNA distillation. Do NOT
-    reuse this for the Linguistics SIP metric — see ``get_sip_embedder``.
+    Lives on the configured GPU by default; falls back to CPU locally.
     """
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(settings.sentence_transformer_model)
+    from src.config.embedder import EmbedderWrapper, _resolve_device
+
+    device = _resolve_device(settings.embedder_device, settings.embedder_gpu_id)
+    return EmbedderWrapper(
+        model_name=settings.embedder_model,
+        device=device,
+        batch_size=settings.embedder_batch_size,
+    )
 
 
 @lru_cache(maxsize=1)
 def get_sip_embedder():
-    """SentenceTransformer singleton dedicated to the Linguistics SIP metric.
+    """SIP embedder singleton — dedicated to the Linguistics SIP metric.
 
     Deliberately a DIFFERENT model family from ``get_shared_embedder`` so the
     SIP score is not circular with the embedding space CADP actively constrains
     text toward (outline §3.1 / §5.4).
     """
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(settings.sip_model)
+    from src.config.embedder import EmbedderWrapper, _resolve_device
+
+    device = _resolve_device(settings.sip_device, settings.sip_gpu_id)
+    return EmbedderWrapper(
+        model_name=settings.sip_model,
+        device=device,
+        batch_size=settings.sip_batch_size,
+    )

@@ -27,6 +27,7 @@ from src.skill.schema import (
     SkillFile,
 )
 from src.config.settings import settings
+from src.config.embedder import run_embed_in_executor
 
 
 QUALITY_CHECK_PROMPT = """You are verifying the quality of a behavioral skill profile.
@@ -133,7 +134,9 @@ class SkillCompiler:
         # outline §4.4.3 mandates the embedding space be identical between
         # distillation and enforcement so the 2σ boundary is meaningful).
         if cluster_embeddings is None and cluster_messages:
-            cluster_embeddings = self._embed_messages(cluster_messages)
+            cluster_embeddings = await run_embed_in_executor(
+                self._embed_messages, cluster_messages
+            )
         expression_dna = self.dna_extractor.extract(
             cluster_messages, cluster_embeddings, other_cluster_word_freq=other_freq,
         )

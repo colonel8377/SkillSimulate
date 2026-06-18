@@ -27,6 +27,7 @@ from loguru import logger
 
 from src.enforcement.base import EnforcementResult, EnforcementStrategy
 from src.skill.schema import AntiPattern
+from src.config.embedder import run_embed_in_executor
 
 
 REFORMULATION_INSTRUCTION = """IMPORTANT: Your planned response would violate a behavioral constraint.
@@ -98,7 +99,9 @@ class Tier3AntiPatternBlock(EnforcementStrategy):
 
         # Detect violations (with optional action history for Category C)
         action_history = context.get("action_history")
-        violations = self._detect_violations(check_text, anti_patterns, action_history)
+        violations = await run_embed_in_executor(
+            self._detect_violations, check_text, anti_patterns, action_history
+        )
 
         if not violations:
             return EnforcementResult(passed=True, tier="tier3", modified_messages=messages)
@@ -155,7 +158,9 @@ class Tier3AntiPatternBlock(EnforcementStrategy):
             return EnforcementResult(passed=True, tier="none", original_text=text)
 
         action_history = context.get("action_history")
-        violations = self._detect_violations(text, anti_patterns, action_history)
+        violations = await run_embed_in_executor(
+            self._detect_violations, text, anti_patterns, action_history
+        )
 
         if not violations:
             return EnforcementResult(passed=True, tier="tier3", original_text=text)
@@ -261,8 +266,10 @@ class Tier3AntiPatternBlock(EnforcementStrategy):
         import numpy as np
 
         try:
-            text_emb = self.embedder.encode(text, show_progress_bar=False)
-            ref_embs = self.embedder.encode(reference_phrases, show_progress_bar=False)
+            all_texts = [text] + list(reference_phrases)
+            all_embs = self.embedder.encode(all_texts, show_progress_bar=False)
+            text_emb = all_embs[0]
+            ref_embs = all_embs[1:]
         except Exception as e:
             logger.warning(f"Tier 3 semantic check skipped — embedder unavailable: {e}")
             return None

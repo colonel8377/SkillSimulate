@@ -9,11 +9,13 @@ from __future__ import annotations
 import random
 
 import numpy as np
+from loguru import logger
 from typing import Any
 
 from src.enforcement.base import EnforcementResult, EnforcementStrategy
 from src.llm.client import LLMClient
 from src.skill.schema import ExpressionDNA
+from src.config.embedder import run_embed_in_executor
 
 
 def _bonferroni_threshold(per_dim_sigma: float, dim: int) -> float:
@@ -132,7 +134,32 @@ class Tier1ExpressionFilter(EnforcementStrategy):
                 "Tier 1 embedding filter cannot operate."
             )
 
-        text_embedding = self.embedder.encode(text, show_progress_bar=False)
+        embedder_dim = None
+        try:
+            embedder_dim = self.embedder.get_sentence_embedding_dimension()
+        except AttributeError:
+            # Test stubs may not implement this method; skip dimension guard.
+            pass
+
+        edna_dim = len(edna.embedding_centroid)
+        if embedder_dim is not None and edna_dim != embedder_dim:
+            logger.warning(
+                f"Expression DNA dimension mismatch: skill has {edna_dim} dims, "
+                f"embedder has {embedder_dim} dims. Disabling Tier 1 for this skill. "
+                f"Recompile skills with the current embedder model."
+            )
+            return EnforcementResult(
+                passed=True,
+                tier="tier1",
+                original_text=text,
+                reason=(
+                    f"Dimension mismatch: skill={edna_dim}, embedder={embedder_dim}"
+                ),
+            )
+
+        text_embedding = await run_embed_in_executor(
+            self.embedder.encode, text, show_progress_bar=False
+        )
 
         centroid = np.array(edna.embedding_centroid)
         std = np.array(edna.embedding_std) if edna.embedding_std else np.ones_like(centroid)

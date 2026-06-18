@@ -354,8 +354,11 @@ def semantic_information_preservation(
     sim_texts = _stratified_subsample(sim_texts_full, budget=budget, seed=seed)
     real_texts = _stratified_subsample(real_texts_full, budget=budget, seed=seed)
 
-    sim_embeddings = model.encode(sim_texts, show_progress_bar=False)
-    real_embeddings = model.encode(real_texts, show_progress_bar=False)
+    # Single batched encode for both sides (GPU efficiency)
+    all_texts = sim_texts + real_texts
+    all_embeddings = model.encode(all_texts, show_progress_bar=False)
+    sim_embeddings = all_embeddings[: len(sim_texts)]
+    real_embeddings = all_embeddings[len(sim_texts) :]
 
     # Compute mean cosine similarity between distributions
     sim_centroid = sim_embeddings.mean(axis=0)
