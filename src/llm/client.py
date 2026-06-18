@@ -84,9 +84,9 @@ class LLMClient:
         # from having to provide an API key for dev-loop validation.
         if self._mock_enabled:
             return
-        import os
-        default_key = os.getenv("CADP_OPENAI_API_KEY", "")
-        default_url = os.getenv("CADP_OPENAI_BASE_URL", "https://api.openai.com/v1")
+        from src.config.settings import settings
+        default_key = settings.openai_api_key
+        default_url = settings.openai_base_url
         for name, ep in self.models.items():
             api_key = ep.api_key or default_key
             base_url = ep.base_url or default_url

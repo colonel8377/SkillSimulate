@@ -36,3 +36,15 @@ models:
     max_tokens: 2048
     cost_per_1k_input: 0.50
     cost_per_1k_output: 1.00
+
+  # Zhipu GLM — used by exp1_pilot.yaml against the CADP_OPENAI_BASE_URL
+  # coding/paas/v4 endpoint. Cost rates below are placeholder estimates;
+  # replace with actual Zhipu pricing before computing paper cost tables.
+  - name: glm-4.7
+    model: glm-4.7
+    base_url: ""
+    api_key: ""
+    temperature: 0.7
+    max_tokens: 2048
+    cost_per_1k_input: 0.50
+    cost_per_1k_output: 1.50
