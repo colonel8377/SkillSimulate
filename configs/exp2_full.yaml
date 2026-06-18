@@ -2,7 +2,18 @@
 name: exp2_full
 datasets: [wikipedia, reddit, github]
 models: [gpt-4o, claude-3.5-sonnet, llama-3-70b, qwen-2.5-72b]
-conditions: [cadp_full, descriptive]
+# Outline §6.2: Exp 2 = 4 conditions.
+#   - real_history: replay observed traces through the metric pipeline
+#     as a self-similarity ceiling / perfect-fidelity reference for the
+#     other three arms. (G5 — was missing; previously only the three
+#     runnable arms were scheduled and real data served solely as
+#     ground truth.)
+#   - cadp_full: full CADP pipeline + three-tier enforcement.
+#   - pop_aligned: strongest competitor (arXiv:2509.10127).
+#   - cadp_minus_ap: mechanism-ablation validating the §3.1 prediction
+#     that the Constraint Track drives emergent conflict / polarization.
+# Descriptive Persona is covered in Exp 1's full 13-condition comparison.
+conditions: [real_history, cadp_full, pop_aligned, cadp_minus_ap]
 num_repeats: 5
 num_rounds: 50
 population_size: 30

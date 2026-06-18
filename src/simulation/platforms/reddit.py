@@ -18,18 +18,25 @@ class RedditTopology(PlatformTopology):
     def get_valid_actions(self, thread: Thread, agent_id: str) -> list[ActionType]:
         actions = [ActionType.REPLY]  # always available
 
+        # Build message lookup once so the has_counter_to_me check below
+        # is O(n) total instead of O(n²) from the prior nested
+        # any(any(next(...))) scan (code review M4). On a 1500-message
+        # thread this cuts the per-call cost from seconds to milliseconds.
+        msg_by_id = {m.msg_id: m for m in thread.messages}
+
         # Can counter-argue if there are messages from others
         has_others = any(m.user_id != agent_id for m in thread.messages)
         if has_others:
             actions.append(ActionType.COUNTER_ARGUE)
 
-        # Can award delta if someone argued against your position
+        # Can award delta if someone argued against your position.
+        # AWARD_DELTA targets a COUNTER_ARGUE whose own parent was
+        # authored by this agent (someone rebutted this agent's claim).
         has_counter_to_me = any(
             m.action_type == ActionType.COUNTER_ARGUE
-            and any(
-                parent and parent.user_id == agent_id
-                for parent in [next((p for p in thread.messages if p.msg_id == m.parent_msg_id), None)]
-            )
+            and m.parent_msg_id is not None
+            and msg_by_id.get(m.parent_msg_id) is not None
+            and msg_by_id[m.parent_msg_id].user_id == agent_id
             for m in thread.messages
         )
         if has_counter_to_me:

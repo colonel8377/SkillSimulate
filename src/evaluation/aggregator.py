@@ -188,6 +188,15 @@ class MetricsAggregator:
             a["agent_id"]: int(a.get("cluster_id", 0))
             for a in sim_result.agent_states
         }
+        # Outline §6.2 real_history arm: the simulation IS the real data,
+        # replayed through the metric pipeline as a self-similarity ceiling.
+        # Without this override, sim_communities (from agent_states, which
+        # real_history populates with a uniform cluster_id) diverges from
+        # real_communities (external role labels or Louvain), making
+        # community-dependent metrics (E-I Polarization, ΔQ Modularity)
+        # report artificially distorted values instead of their true ceiling.
+        if sim_result.condition == "real_history":
+            sim_communities = dict(real_communities)
         sim_action_dist = self._compute_action_dist(sim_messages)
         sim_agent_counts = self._compute_agent_action_counts_from_dicts(sim_messages)
 

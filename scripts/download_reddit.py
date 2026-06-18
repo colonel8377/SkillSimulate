@@ -34,7 +34,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = PROJECT_ROOT / "data" / "raw" / "reddit"
-DEFAULT_CORPUS = "winning-args"
+DATA_DIR = PROJECT_ROOT / "data" / "external" / "convokit"
+DEFAULT_CORPUS = "winning-args-corpus"
 
 
 def _to_epoch(ts) -> int:
@@ -66,10 +67,14 @@ def _is_delta_awarded(utt) -> bool:
     keys depending on corpus version. We accept any of them and fall
     back to scanning the body for the ``Δ`` / ``!delta`` markers CMV
     uses to award a delta.
+
+    The canonical key for ``winning-args-corpus`` is ``success``
+    (1 = received a delta, 0 = matched non-delta reply, None = other).
     """
     meta = getattr(utt, "meta", {}) or {}
     flag = _meta_get(
         meta,
+        "success",
         "delta_awarded",
         "delta_label",
         "is_delta",
@@ -79,7 +84,7 @@ def _is_delta_awarded(utt) -> bool:
     if isinstance(flag, bool):
         return flag
     if isinstance(flag, (int, float)):
-        return bool(flag)
+        return flag == 1
     if isinstance(flag, str):
         return flag.strip().lower() in {"true", "1", "yes", "delta"}
 
@@ -92,7 +97,15 @@ def _is_delta_awarded(utt) -> bool:
 
 
 def _split_corpus(corpus, max_submissions: int | None):
-    """Walk the winning-args corpus and split into submissions + comments."""
+    """Walk the winning-args corpus and split into submissions + comments.
+
+    In ``winning-args-corpus`` each conversation is one CMV thread. The
+    root utterance (id ``t3_<id>``, ``reply_to == None``) carries the
+    submission body in ``.text``; downstream utterances are comments.
+    ConvoKit does not ship the submission title, so we fall back to the
+    thread id. Submission timestamp is taken from the first non-None
+    utterance timestamp in the thread (the root is often None).
+    """
     submissions: list[dict] = []
     comments: list[dict] = []
     seen = 0
@@ -102,37 +115,72 @@ def _split_corpus(corpus, max_submissions: int | None):
             break
         seen += 1
 
-        sub_id = str(convo.id)
+        sub_id_full = str(convo.id)  # e.g. ``t3_2ro9ux``
+        sub_id_bare = sub_id_full.replace("t3_", "")
         convo_meta = getattr(convo, "meta", {}) or {}
-        title = str(_meta_get(convo_meta, "title", "submission_title", default=sub_id))
-        selftext = str(_meta_get(convo_meta, "selftext", "body", "submission_body", default=""))
-        op_author = str(_meta_get(convo_meta, "author", "op", "submission_author", default="[deleted]"))
-        created = _meta_get(convo_meta, "created_utc", "created", "timestamp", default=None)
+
+        # First pass: find the root utterance (the submission) and the
+        # earliest non-None timestamp in the thread.
+        root_utt = None
+        first_ts = None
+        utts = list(convo.iter_utterances())
+        for utt in utts:
+            if root_utt is None and getattr(utt, "reply_to", None) is None:
+                root_utt = utt
+            ts = getattr(utt, "timestamp", None)
+            if ts is not None and first_ts is None:
+                first_ts = ts
+
+        # Submission body lives in the root utterance's text field.
+        if root_utt is not None:
+            selftext = root_utt.text or ""
+            op_speaker = root_utt.speaker
+            op_author = str(op_speaker.id) if op_speaker is not None and op_speaker.id else "[deleted]"
+            sub_ts = root_utt.timestamp if root_utt.timestamp is not None else first_ts
+        else:
+            selftext = str(_meta_get(convo_meta, "selftext", "body", default=""))
+            op_author = str(_meta_get(convo_meta, "author", "op", default="[deleted]"))
+            sub_ts = first_ts
+
+        # ConvoKit winning-args ships no submission title in convo.meta.
+        # Real CMV titles (e.g. "CMV: man-made things are natural") would
+        # require joining with the Reddit pushshift dump. Fall back to the
+        # selftext prefix so the downstream ``topic`` field carries real
+        # semantic content for clustering rather than a bare submission id.
+        title = str(_meta_get(convo_meta, "title", "submission_title", default=""))
+        if not title or title == sub_id_bare:
+            stripped = (selftext or "").strip().replace("\n", " ")
+            title = stripped[:120] if stripped else sub_id_bare
 
         submissions.append({
-            "submission_id": sub_id,
-            "id": sub_id,
+            "submission_id": sub_id_bare,
+            "id": sub_id_full,
             "author": op_author,
             "title": title,
             "selftext": selftext,
-            "created_utc": _to_epoch(created),
+            "created_utc": _to_epoch(sub_ts),
         })
 
-        # Top-level (depth 0) comments reply to the submission t3_<id>.
-        for utt in convo.iter_utterances():
+        root_utt_id = str(root_utt.id) if root_utt is not None else sub_id_full
+
+        # Emit one comment per non-root utterance.
+        for utt in utts:
+            if root_utt is not None and str(utt.id) == root_utt_id:
+                continue
             speaker = utt.speaker.id if utt.speaker is not None else "[deleted]"
             if not speaker:
                 continue
             parent = utt.reply_to
-            # ConvoKit stores parents as utterance IDs; the loader expects
-            # either ``t3_<submission_id>`` (top-level) or a comment id.
-            if not parent or parent == sub_id or parent == convo.root.id:
-                parent_id = f"t3_{sub_id}"
+            # Top-level comments reply to the root submission; ConvoKit
+            # stores parents as utterance IDs. Normalise to ``t3_<bare>``
+            # for top-level, otherwise keep the comment id.
+            if not parent or parent == sub_id_full or parent == sub_id_bare or parent == root_utt_id:
+                parent_id = f"t3_{sub_id_bare}"
             else:
                 parent_id = str(parent)
 
             comments.append({
-                "submission_id": sub_id,
+                "submission_id": sub_id_bare,
                 "comment_id": str(utt.id),
                 "author": str(speaker),
                 "body": utt.text or "",
@@ -158,6 +206,8 @@ def main() -> None:
                         help=f"ConvoKit corpus name (default {DEFAULT_CORPUS!r}).")
     parser.add_argument("--max-submissions", type=int, default=None,
                         help="Cap number of CMV submissions extracted (default all).")
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR,
+                        help="Directory to cache downloaded ConvoKit corpora (default data/external/convokit).")
     parser.add_argument("--out-dir", type=Path, default=OUT_DIR,
                         help="Output directory (default data/raw/reddit).")
     parser.add_argument("--force", action="store_true",
@@ -177,8 +227,9 @@ def main() -> None:
             "convokit not installed. Install with: pip install convokit"
         ) from e
 
-    print(f"[download] fetching ConvoKit corpus {args.corpus!r} …")
-    corpus = convokit.Corpus(filename=convokit.download(args.corpus))
+    print(f"[download] fetching ConvoKit corpus {args.corpus!r} to {args.data_dir} …")
+    dataset_path = convokit.download(args.corpus, data_dir=str(args.data_dir))
+    corpus = convokit.Corpus(filename=dataset_path)
     print(f"[loaded] {corpus}")
 
     submissions, comments = _split_corpus(corpus, args.max_submissions)
