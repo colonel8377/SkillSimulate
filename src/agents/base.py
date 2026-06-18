@@ -277,7 +277,7 @@ class BaseAgent(ABC):
         # Periodic reflection
         if self.reflection.should_reflect(current_round):
             recent = self.memory.retrieve(thread_id=None, current_round=current_round)
-            await self.reflection.reflect(recent, role_description=self.get_role_description(), current_round=current_round)
+            await self.reflection.reflect(recent, context=self.get_role_description(), current_round=current_round)
 
         return msg, enforcement_log
 

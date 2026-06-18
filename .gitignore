@@ -47,3 +47,4 @@ outputs/**/checkpoints/
 /.claude/
 /data/
 /outputs/
+/.serena/
