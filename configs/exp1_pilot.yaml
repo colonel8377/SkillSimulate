@@ -1,12 +1,12 @@
 # Pilot — Exp 1 lean grid for effect-size estimation and condition coverage
-# Single dataset (wikipedia), single model (gpt-4o), all 13 conditions,
+# Single dataset (wikipedia), single model, all 13 conditions,
 # reduced repeats/rounds/population. NOT paper-grade — used to (a) validate
 # that every condition executes against real LLM output, (b) estimate
 # Cohen's d for power analysis (outline §5.1), (c) sanity-check cost
 # before scaling to exp1_full.yaml.
 name: exp1_pilot
 datasets: [wikipedia]
-models: [glm-4.7]
+models: [deepseek-v4-flash]
 conditions:
   - vanilla
   - descriptive

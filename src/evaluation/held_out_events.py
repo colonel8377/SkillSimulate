@@ -299,30 +299,26 @@ class LLMDualAnnotator:
 
         common = {"event_type": event_type, "topic": topic, "exchange": exchange}
 
-        resp_a = await self.llm.chat_completion(
+        resp_a = await self.llm.chat_completion_json(
             [{"role": "user", "content": _ANNOTATOR_A_PROMPT.format(**common)}],
             self.model_name,
             temperature=0.2,
+            default={"label": 0, "notes": "parse failure"},
         )
-        resp_b = await self.llm.chat_completion(
+        resp_b = await self.llm.chat_completion_json(
             [{"role": "user", "content": _ANNOTATOR_B_PROMPT.format(**common)}],
             self.model_name,
             temperature=0.2,
+            default={"label": 0, "notes": "parse failure"},
         )
 
-        def _parse(resp: str) -> tuple[int, str]:
-            try:
-                obj = json.loads(resp)
-                return int(obj.get("label", 0)), str(obj.get("notes", ""))
-            except (json.JSONDecodeError, ValueError):
-                m = _re.search(r"\{.*\}", resp, _re.DOTALL)
-                if m:
-                    try:
-                        obj = json.loads(m.group())
-                        return int(obj.get("label", 0)), str(obj.get("notes", ""))
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                return 0, "parse failure"
+        def _parse(obj) -> tuple[int, str]:
+            if isinstance(obj, dict):
+                try:
+                    return int(obj.get("label", 0)), str(obj.get("notes", ""))
+                except (ValueError, TypeError):
+                    pass
+            return 0, "parse failure"
 
         label_a, notes_a = _parse(resp_a)
         label_b, notes_b = _parse(resp_b)

@@ -80,33 +80,40 @@ class MockLLMRouter:
             })
 
         if "expert behavioral analyst" in persona:
-            # Mind-model candidate extraction (JSON array).
-            return json.dumps([
-                {
-                    "name": f"mock_mind_model_{i}",
-                    "description": f"Deterministic mock reasoning pattern #{i}",
-                    "evidence": ["mock evidence fragment A", "mock evidence fragment B"],
-                    "application": "Applied when mock trigger conditions hold.",
-                    "limitation": "Mock limitation — does not generalise off-distribution.",
-                }
-                for i in range(3)
-            ])
+            # Mind-model candidate extraction. Wrapped in {"models": [...]}
+            # to match the json_object response_format contract used by
+            # chat_completion_json (real models are forced to objects).
+            return json.dumps({
+                "models": [
+                    {
+                        "name": f"mock_mind_model_{i}",
+                        "description": f"Deterministic mock reasoning pattern #{i}",
+                        "evidence": ["mock evidence fragment A", "mock evidence fragment B"],
+                        "application": "Applied when mock trigger conditions hold.",
+                        "limitation": "Mock limitation — does not generalise off-distribution.",
+                    }
+                    for i in range(3)
+                ]
+            })
 
         if "behavioral pattern analyst" in persona:
-            # Anti-pattern detection (JSON array). All seven trigger fields
-            # are populated so downstream enforcement has Category A/B/C
-            # triggers to bite on.
-            return json.dumps([
-                {
-                    "description": "Mock avoided behaviour: ad-hominem escalation",
-                    "trigger_conditions": ["When the user disagrees personally"],
-                    "trigger_keywords": ["idiot", "stupid"],
-                    "trigger_regex": [r"\\b(you are|you're)\\s+(stupid|idiot)\\b"],
-                    "trigger_semantic_phrases": ["personal attack instead of argument"],
-                    "trigger_action_patterns": ["disagree->report"],
-                    "reason": "This cluster defuses rather than escalates.",
-                }
-            ])
+            # Anti-pattern detection. Wrapped in {"patterns": [...]} to
+            # match the json_object response_format contract. All seven
+            # trigger fields populated so downstream enforcement has
+            # Category A/B/C triggers to bite on.
+            return json.dumps({
+                "patterns": [
+                    {
+                        "description": "Mock avoided behaviour: ad-hominem escalation",
+                        "trigger_conditions": ["When the user disagrees personally"],
+                        "trigger_keywords": ["idiot", "stupid"],
+                        "trigger_regex": [r"\\b(you are|you're)\\s+(stupid|idiot)\\b"],
+                        "trigger_semantic_phrases": ["personal attack instead of argument"],
+                        "trigger_action_patterns": ["disagree->report"],
+                        "reason": "This cluster defuses rather than escalates.",
+                    }
+                ]
+            })
 
         if "revising your response" in persona:
             # planner.replan — echo the requested action_type when given.

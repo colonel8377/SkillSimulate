@@ -464,17 +464,12 @@ class SkillCompiler:
             {"role": "user", "content": prompt},
         ]
 
-        response = await self.llm.chat_completion(messages, self.model_name, temperature=0.2)
-
-        import json
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            import re
-            match = re.search(r"\{.*\}", response, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group())
-                except json.JSONDecodeError:
-                    pass
-            return {"overall_pass": True, "issues": ["Quality check parse failed"]}
+        response = await self.llm.chat_completion_json(
+            messages,
+            self.model_name,
+            temperature=0.2,
+            default={"overall_pass": True, "issues": ["Quality check parse failed"]},
+        )
+        if isinstance(response, dict):
+            return response
+        return {"overall_pass": True, "issues": ["Quality check parse failed"]}

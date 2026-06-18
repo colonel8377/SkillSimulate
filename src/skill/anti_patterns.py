@@ -52,11 +52,12 @@ Also consider what OTHER groups commonly do that this group doesn't:
 Threads from this group:
 {threads_text}
 
-Output a JSON array of objects with keys (all seven):
+Output a JSON object with a single key "patterns" whose value is an array
+of objects, each with all seven keys:
 description, trigger_conditions (list), trigger_keywords (list),
 trigger_regex (list), trigger_semantic_phrases (list),
 trigger_action_patterns (list), reason (str).
-Output ONLY the JSON array, no other text."""
+Output ONLY this JSON object, no other text."""
 
 
 class AntiPatternDetector:
@@ -157,19 +158,16 @@ class AntiPatternDetector:
             {"role": "user", "content": prompt},
         ]
 
-        response = await self.llm.chat_completion(messages, self.model_name, temperature=0.3)
+        response = await self.llm.chat_completion_json(
+            messages, self.model_name, temperature=0.3, default={"patterns": []}
+        )
 
-        try:
-            data = json.loads(response)
-        except json.JSONDecodeError:
-            match = re.search(r"\[.*\]", response, re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group())
-                except json.JSONDecodeError:
-                    return []
-            else:
-                return []
+        # _llm_detect returns the array wrapped in {"patterns": [...]}
+        data = response
+        if isinstance(data, dict):
+            data = data.get("patterns", [])
+        if not isinstance(data, list):
+            return []
 
         return [
             AntiPattern(

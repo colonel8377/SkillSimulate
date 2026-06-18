@@ -48,3 +48,27 @@ models:
     max_tokens: 2048
     cost_per_1k_input: 0.50
     cost_per_1k_output: 1.50
+
+  # DeepSeek — OpenAI-compatible endpoint at https://api.deepseek.com
+  # deepseek-v4-flash: fast / cheap, preferred for pilot & development.
+  # deepseek-v4-pro: higher quality, reserved for full-scale runs.
+  # base_url / api_key left empty → read from CADP_OPENAI_BASE_URL /
+  # CADP_OPENAI_API_KEY env vars. Pricing below are estimates; adjust
+  # before computing paper cost tables.
+  - name: deepseek-v4-flash
+    model: deepseek-v4-flash
+    base_url: ""
+    api_key: ""
+    temperature: 0.7
+    max_tokens: 8192
+    cost_per_1k_input: 0.10
+    cost_per_1k_output: 0.40
+
+  - name: deepseek-v4-pro
+    model: deepseek-v4-pro
+    base_url: ""
+    api_key: ""
+    temperature: 0.7
+    max_tokens: 8192
+    cost_per_1k_input: 0.55
+    cost_per_1k_output: 2.19

@@ -107,21 +107,11 @@ class Planner:
             {"role": "user", "content": prompt},
         ]
 
-        response = await self.llm.chat_completion(messages, self.model_name, temperature=0.7)
+        response = await self.llm.chat_completion_json(
+            messages, self.model_name, temperature=0.7, default={}
+        )
 
-        # Parse response
-        import json, re
-        try:
-            data = json.loads(response)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", response, re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group())
-                except json.JSONDecodeError:
-                    data = {}
-            else:
-                data = {}
+        data = response if isinstance(response, dict) else {}
 
         action_str = data.get("action_type", available_actions[0].value)
         action_type = next(
@@ -216,20 +206,11 @@ Output ONLY the JSON."""
             {"role": "user", "content": prompt},
         ]
 
-        response = await self.llm.chat_completion(messages, self.model_name, temperature=0.5)
+        response = await self.llm.chat_completion_json(
+            messages, self.model_name, temperature=0.5, default={}
+        )
 
-        import json, re
-        try:
-            data = json.loads(response)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", response, re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group())
-                except json.JSONDecodeError:
-                    data = {}
-            else:
-                data = {}
+        data = response if isinstance(response, dict) else {}
 
         action_str = data.get("action_type", (prev_action_type or available_actions[0]).value)
         action_type = next(

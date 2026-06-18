@@ -29,6 +29,7 @@ from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.llm.cost_tracker import CostTracker
+from src.llm.json_utils import extract_json
 from src.llm.mock_router import MockLLMRouter
 
 
@@ -144,6 +145,42 @@ class LLMClient:
             )
 
         return response.choices[0].message.content or ""
+
+    async def chat_completion_json(
+        self,
+        messages: list[dict[str, str]],
+        model_name: str,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        default: Any = None,
+    ) -> Any:
+        """Generate a completion and parse it as JSON.
+
+        Requests ``response_format={"type": "json_object"}`` (when not in
+        mock mode) so the endpoint returns syntactically valid JSON, then
+        routes the content through :func:`extract_json` as a robustness
+        backstop for endpoints that ignore ``response_format`` or for the
+        mock path. Callers that previously did their own
+        ``json.loads`` + regex fallback should use this instead.
+
+        Args:
+            default: Value returned if no JSON can be parsed.
+
+        Returns:
+            Parsed Python object, or *default*.
+        """
+        kwargs: dict[str, Any] = {}
+        if not self._mock_enabled:
+            kwargs["response_format"] = {"type": "json_object"}
+        response = await self.chat_completion(
+            messages,
+            model_name,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs,
+        )
+        return extract_json(response, default=default)
 
     async def batch_completions(
         self,

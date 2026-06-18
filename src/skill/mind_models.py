@@ -36,8 +36,9 @@ Identify 3-7 mind models. Focus on patterns that are:
 Threads:
 {threads_text}
 
-Output as a JSON array of objects with keys: name, description, evidence (list), application, limitation.
-Output ONLY the JSON array, no other text.
+Output a JSON object with a single key "models" whose value is an array of
+objects, each with keys: name, description, evidence (list), application, limitation.
+Output ONLY this JSON object, no other text.
 """
 
 VERIFICATION_PROMPT = """You are verifying whether a reasoning pattern is distinctive to a specific group.
@@ -123,17 +124,17 @@ class MindModelExtractor:
             {"role": "user", "content": prompt},
         ]
 
-        response = await self.llm.chat_completion(messages, self.model_name, temperature=0.3)
+        response = await self.llm.chat_completion_json(
+            messages, self.model_name, temperature=0.3, default={"models": []}
+        )
 
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            # Try to extract JSON from response
-            import re
-            match = re.search(r"\[.*\]", response, re.DOTALL)
-            if match:
-                return json.loads(match.group())
-            return []
+        # extract_candidates returns the array wrapped in {"models": [...]}
+        data = response
+        if isinstance(data, dict):
+            return data.get("models", [])
+        if isinstance(data, list):
+            return data
+        return []
 
     async def _verify(self, candidate: dict, comparisons: list[str]) -> dict:
         """Run triple verification on a candidate model."""
@@ -150,16 +151,23 @@ class MindModelExtractor:
             {"role": "user", "content": prompt},
         ]
 
-        response = await self.llm.chat_completion(messages, self.model_name, temperature=0.2)
-
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            import re
-            match = re.search(r"\{.*\}", response, re.DOTALL)
-            if match:
-                return json.loads(match.group())
-            return {"cross_domain_verified": False, "predictive_verified": False, "exclusive_verified": False}
+        response = await self.llm.chat_completion_json(
+            messages,
+            self.model_name,
+            temperature=0.2,
+            default={
+                "cross_domain_verified": False,
+                "predictive_verified": False,
+                "exclusive_verified": False,
+            },
+        )
+        if isinstance(response, dict):
+            return response
+        return {
+            "cross_domain_verified": False,
+            "predictive_verified": False,
+            "exclusive_verified": False,
+        }
 
     def _format_threads(self, threads: list[Thread], max_chars: int = 8000) -> str:
         """Format threads into readable text for LLM input."""
