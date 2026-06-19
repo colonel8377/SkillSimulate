@@ -196,6 +196,7 @@ class PopulationBuilder:
         )
         from src.agents.colleague_skill import ColleagueSkillAgent
         from src.agents.clustering_only import ClusteringOnlyAgent
+        from src.agents.length_matched import LengthMatchedControlAgent
         from src.agents.pop_aligned_cadp import PopAlignedCADPAgent
 
         def _cluster_features(cluster_id: str):
@@ -339,6 +340,35 @@ class PopulationBuilder:
                 cluster_attributes=cluster_stats,
                 sampled_attributes=sampled,
                 **alpha_kwargs,
+                **common_kwargs,
+            )
+
+        elif condition == "length_matched_control":
+            # Length-matched control (ARS review 2026-06-19, DA-E1):
+            # token-budget-matched description built from a RANDOM OTHER
+            # cluster's stats via the same _build_descriptive_persona
+            # template. Isolates "matched tokens + matched form" from
+            # "matched behavioral content".
+            all_cluster_ids = list(cluster_result.get_cluster_ids())
+            other_cluster_ids = [
+                cid for cid in all_cluster_ids if str(cid) != str(cluster_id)
+            ]
+            if other_cluster_ids:
+                target_cluster = str(rng.choice(other_cluster_ids))
+            else:
+                # Single-cluster edge case: degenerates to ClusteringOnly
+                # semantics. The condition name still distinguishes it for
+                # downstream analysis; logged via MetricsReport.condition.
+                target_cluster = cluster_id
+            members = cluster_result.get_cluster_members(int(target_cluster))
+            member_features = [
+                cluster_result.user_features[uid]
+                for uid in members
+                if uid in cluster_result.user_features
+            ]
+            persona = self._build_descriptive_persona(target_cluster, member_features)
+            return LengthMatchedControlAgent(
+                persona_description=persona,
                 **common_kwargs,
             )
 

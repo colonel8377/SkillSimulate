@@ -1,0 +1,59 @@
+# Framing pilot — effect-size estimation for paper-framing decision.
+#
+# Purpose (review 2026-06-19, ARS reviewer skill, Major Revision 56/100):
+#   Decide between Paper-A (benchmark/framework-led) and Paper-B (method-led)
+#   by estimating Cohen's d for the strongest contrast (CADP vs strongest
+#   baseline) on the two most diagnostic metric layers. NOT a smoke test —
+#   see exp1_pilot.yaml for that. NOT paper-grade.
+#
+# Decision rule (pre-registered; do not change thresholds after unblinding):
+#   d >= 0.5 on >=2 layers (Micro or Predictive at least one)
+#       -> Paper-B method-led viable; add ceiling insurance
+#   d ~= 0.3 or single-layer only
+#       -> Paper-A benchmark-led (method contribution not strong enough)
+#   d < 0.3 across all layers
+#       -> CADP route rethink; pause paper submission
+#   CADP loses to pop_aligned
+#       -> Paper-A AND rewrite §2.3 (Pop-Aligned becomes reference)
+#
+# Why these settings:
+#   - 3 conditions only: enough to compute d (CADP vs descriptive,
+#     CADP vs pop_aligned). Other 10 conditions covered by smoke pilot.
+#   - 10 repeats: gives usable d estimate at ~40% power for d=0.3,
+#     ~80% power for d=0.5 (outline §5.1).
+#   - wikipedia only: smallest + cleanest ground truth.
+#   - Single model: pick the model you will actually use in Paper-A/B
+#     headline (resource-constrained: Llama-3-8B-Instruct or your
+#     cheapest API model). Replace `models:` below accordingly.
+#   - 20 rounds + pop 10: matches outline §4.6 lower bound for
+#     emergence headroom while keeping runs cheap.
+#
+# Critical anti-circularity notes:
+#   - Predictive Fidelity uses held-out events (NOT same-window traces).
+#   - Micro Behavior falls back to Louvain proxy when
+#     data/role_labels/wikipedia.jsonl is absent (outline §5.3 fallback
+#     path is already implemented in MetricsAggregator._load_role_labels).
+#     If you want non-proxy ground truth, populate role labels before
+#     running.
+#   - Alpha locked at 1.0 for all tiers (do not tune on pilot).
+name: exp1_framing_pilot
+datasets: [wikipedia]
+models: [deepseek-v4-flash]   # REPLACE with your target headline model
+conditions:
+  - descriptive
+  - pop_aligned
+  - cadp_full
+num_repeats: 10
+num_rounds: 20
+population_size: 10
+alpha: 1.0
+alpha_tier1: 1.0
+alpha_tier2: 1.0
+alpha_tier3: 1.0
+num_clusters: 4
+cluster_method: kmeans
+top_n_threads: 20
+max_threads: 500
+checkpoint_every: 5
+max_concurrency: 4
+seed: 42

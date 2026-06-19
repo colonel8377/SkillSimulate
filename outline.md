@@ -235,8 +235,11 @@
 11. **CADP minus Anti-patterns** — 消融（移除 Constraint Track）
 12. **CADP Constraint-Only** — mirror 消融：仅保留 Constraint Track（Tier 3 ON，Capability Track 关闭）。与 11 互补：11 测试移除 Constraint Track 的损失，12 测试 Constraint Track 单独是否足够。两者共同构成 dual-track 必要性的双向证据
 13. **Pop-Aligned + CADP** — 叠加条件：Pop-Aligned 选人 + CADP 赋予行为规则；测试可叠加性
+14. **Length-Matched Control** *(review-driven robustness check, ARS 2026-06-19, DA-E1)* — 等长随机描述：与 Descriptive Persona 相同的模板和 token 预算，但描述来自**随机其他 cluster** 的行为统计（破坏语义对应）。隔离 "匹配的 token 数 + 匹配的形式" vs "匹配的行为内容"。若 CADP / Descriptive Persona 显著优于本控制 → 提升不能归因于 "更多 context tokens" 的替代解释
 
 > **13 条件设计说明**：原始设计为 12 条件。Code review (2026-06-16) 发现实际 config (`configs/exp1_full.yaml`) 实现了 13 条件，其中 `cadp_constraint_only` (条件 12) 是有价值的 mirror 消融——回答 "Constraint Track 单独是否足够" 这一与条件 11 ("移除 Constraint Track 损失") 互补的问题。本节正式将 13 条件纳入 outline。Cell 总数：13 × 3 datasets × 4 models × 5 repeats = 780 cells。
+
+> **条件 14 (Length-Matched Control) 定位**：本条件**不**进入主 13×3×4 factorial，作为 anti-circularity robustness check 在 reduced grid (1 dataset × 1-2 models, ≥5 repeats) 上运行，直接回应 Devil's Advocate CRITICAL C-C（训练/测试循环性）。其结果作为 §5.7.5 Ceiling Analysis 与 §7.4 Threats to Validity 的输入，不参与 §5.7 主结果表的 13-条件对比。
 
 > **实验设计原则**：所有条件共享 Step 1 聚类结果（相同的 agent 分组结构），差异仅在于每组 agent 接收的 persona/skill 内容和 enforcement 机制。这隔离了"聚类结构"与"行为规则蒸馏"的贡献，避免混淆。
 > **消融逻辑链**：COLLEAGUE.SKILL (single-track, no enforcement) → CADP minus Anti-patterns enforcement (dual-track, no enforcement) → CADP Full (dual-track + three-tier enforcement)，逐层隔离 structural contribution
@@ -252,6 +255,7 @@
 - 重复: 每条件 5-10 次
 - **样本量与可行性说明**：156 cells × 10 repeats = 1,560 simulation runs per metric；API 成本估算（GPT-4o + Claude 3.5）约 $3,000–7,000；开源模型推理（Llama-3-70B, Qwen-2.5-72B）需 4× A100 80GB，估算 300–500 GPU-hours。条件 10-13（Clustering-Only, COLLEAGUE.SKILL, Constraint-Only, Pop-Aligned+CADP）可在单数据集（Wikipedia）+ 双模型（GPT-4o + Llama-3-70B）上运行作为 reduced factorial，降低成本
 - **Power analysis**：基于 pilot data（Wikipedia 单数据集）的 effect size 估计，Cohen's d ≥ 0.5 时 5 次重复即可达到 80% power (α=0.05)；若 pilot 显示 d < 0.5，则增加至 10 次重复
+- **Framing pilot（review-driven, ARS 2026-06-19）**：在主实验之前运行 `configs/exp1_framing_pilot.yaml`——3 条件 (descriptive / pop_aligned / cadp_full) × 10 repeats × Wikipedia × 单模型，仅测 Micro Behavior + Predictive Fidelity 两层。**Pre-registered 决策规则**（unblinding 前冻结，不可事后调整）：d ≥ 0.5 on ≥2 layers → method 主导 framing 可行；d ≈ 0.3 或单层 → benchmark 主导 framing；d < 0.3 → CADP 路线重构；CADP 输给 Pop-Aligned → benchmark framing + 重写 §2.3。Framing pilot 与 §5.1 Power analysis 共享 effect-size 估计但作用不同：前者决定 paper framing，后者决定主实验 repeat 数
 - **聚类共享原则**：所有 13 个条件使用相同的 Step 1 聚类结果（相同 agent 分组），差异仅在 persona/skill 内容和 enforcement 机制。这隔离聚类结构贡献与行为规则蒸馏贡献
 - **Statistical analysis（确认性 vs 探索性声明）**：Confirmatory comparisons = CADP (Full) vs 每个 baseline 在 5 个 metric layer 上的逐层检验，层内 Bonferroni 校正；报告 effect size (Cohen's d) + 95% CI，不仅 p 值。消融（条件 9-12）、α-sweep（§5.6.5）、迁移测试（§5.5）、trigger calibration（§5.3.5）归为 exploratory，描述性报告、不做 family-wise 校正，结论措辞相应弱化（"suggest"/"indicate" 而非 "prove"）
 - **可复现性 (Reproducibility)**：发布 (a) 完整 pipeline 代码 + nuwa-skill 编译器，(b) 化名（anonymized）聚合级 .skill 文件（不发布个体级，见 §7.5 dual-use），(c) 全部随机种子，(d) API 模型快照日期（GPT-4o / Claude 3.5 Sonnet 具体版本）与开源模型 commit hash（Llama-3-70B / Qwen-2.5-72B），(e) 标注协议 + 标注数据。数据集来自公开平台 API（CC-BY-SA / 平台 ToS 研究用途）
@@ -270,11 +274,13 @@
 11. **CADP minus Anti-patterns** — 去反模式消融 (测 RLHF override 假设)
 12. **CADP Constraint-Only** — mirror 消融：仅保留 Constraint Track（Tier 3 ON，Capability Track 关闭）。与条件 11 互补：11 测试移除 Constraint Track 的损失，12 测试 Constraint Track 单独是否足够。两者共同构成 dual-track 必要性的双向证据
 13. **Pop-Aligned + CADP** — 叠加条件：Pop-Aligned 人口属性选人 + CADP 行为规则蒸馏。测试可叠加性——若叠加显著优于纯 CADP，说明属性维度与行为维度互补；若无显著差异，说明行为规则已隐含属性信息
+14. **Length-Matched Control** *(robustness check, ARS 2026-06-19 DA-E1, reduced grid)* — 等长随机描述：与 Descriptive Persona 相同模板和 token 预算，但描述基于**随机其他 cluster** 的行为统计（破坏语义对应）。对比逻辑：Descriptive Persona 显著优于本控制 → "descriptive persona effect" 不能归因于 token 预算；Length-Matched ≈ Descriptive Persona → descriptive 提升部分是 token-mass artifact；CADP 显著优于本控制 → CADP 提升不依赖于 "更多 context tokens"
 
 > 消融实验目的：隔离三维各自贡献，回应"维度选择是否arbitrary"的审稿质疑
 > **消融逻辑链**（逐层隔离结构贡献）：
 > - COLLEAGUE.SKILL (single-track) → CADP minus Anti-patterns enforcement → CADP Full：隔离 dual-track + enforcement 的增量
 > - Clustering-Only → Descriptive Persona：隔离聚类贡献
+> - Length-Matched Control → Descriptive Persona → CADP Full：隔离 token 预算贡献（DA-E1 反循环性辩护）
 > - CADP (Full) vs CADP (Shuffled)：验证正确 .skill 分配的必要性
 > - Pop-Aligned + CADP vs CADP alone：测试属性/行为维度互补性
 > 预期：Anti-patterns 移除对冲突/极化指标影响最大；Expression DNA 移除对语言指标影响最大；COLLEAGUE.SKILL 弱于 CADP minus Anti-patterns（说明 Constraint Track 结构本身有价值）
@@ -358,6 +364,7 @@
 - 关键对比: CADP vs Segmentation Persona 逐维度差异；CADP vs Population-Aligned Persona 的行为保真度差异
 - **Pop-Aligned + CADP 叠加效果**：是否显著优于纯 CADP（属性/行为互补性）
 - 置换检验: Shuffled（agent→skill 重新分配）显著弱于 Full
+- **Length-Matched Control 结果**：CADP / Descriptive Persona 是否显著优于等长随机描述（DA-E1 反循环性辩护）。若 Length-Matched ≈ Descriptive Persona → descriptive 提升部分是 token-mass artifact，需在 §5.8 / §7.4 讨论
 - 跨数据集迁移: 全组件迁移 vs 方法论迁移的 Wikipedia→Reddit 结果；Reddit→GitHub 跨结构部分迁移结果（分维度保持率）
 - 预测性保真度: held-out 事件预测准确率
 - Trigger calibration: per-category P/R/F1 + 跨域迁移性能
@@ -368,8 +375,28 @@
 > Table 1: 主结果表 (13 conditions × 5 metric layers)
 > Table 2: 消融结果表 (3 维度 × 5 metric layers) + COLLEAGUE.SKILL 链式对比
 > Table 2b: Clustering-Only vs Descriptive vs CADP（聚类贡献隔离）
+> Table 2c: Length-Matched Control vs Descriptive vs CADP（token-budget 贡献隔离，DA-E1）
 > Figure 3: 雷达图 — 13 条件 5 层指标对比
 > Figure 4: 交互网络可视化对比
+
+### 5.7.5 Ceiling Analysis（review-driven, ARS 2026-06-19）
+
+**目的**：负结果保险。无论 CADP 在 13 条件对比中排第几，本节都贡献一个可发表的 finding——按 method family × metric layer 报告"剩余 sim-to-real gap"，量化当前方法族在闭合 gap 上的天花板。这回应 panel 共识：contribution 不应绑死在 CADP 绝对排名上。
+
+**方法族定义**（`src/analysis/ceiling.py::DEFAULT_METHOD_FAMILIES`）：
+- `none`：vanilla（无 persona）—— 地板参考
+- `persona_prompting`：descriptive / segmentation / pop_aligned / clustering_only / length_matched_control —— 身份/属性注入无 enforcement
+- `distillation_advisory`：colleague_skill —— 规则蒸馏无硬约束
+- `distillation_enforced`：cadp_full / cadp_shuffled / cadp_minus_* / cadp_constraint_only / pop_aligned_cadp —— 规则蒸馏 + 三层 enforcement
+- `perfect_reference`：real_history（§6.2 Exp2 replay arm）—— 自相似 ceiling，定义 "zero gap"
+
+**计算**：对每个 (family, layer) cell，取该 family 在该 layer 上的最佳 condition 的归一化 fidelity，与 `perfect_reference` 的 fidelity 之差即 "remaining gap"。Per-metric direction（higher-better vs lower-better）按 `DEFAULT_METRIC_DIRECTION` 处理。Bootstrap 95% CI（n_resamples=1000）。
+
+**报告格式**（`format_ceiling_table`）：Markdown 表，行 = method family，列 = metric layer，cell = "remaining gap [95% CI] (best: <condition>)"。
+
+**可发表性保证**：本节的输出**不依赖 CADP 赢**。例如，即使 `distillation_enforced` 在所有 layer 都只闭合 `persona_prompting` 已闭合 gap 的额外 10%，这本身是一个 finding："distillation + enforcement 路线相对于 persona prompting 的边际贡献为 10%，剩余 Z% gap 需要新机制"。Paper framing（method 主导 vs benchmark 主导）由 §5.1 framing pilot 决定，但本节内容在两种 framing 下都保留。
+
+**与 §7.4 的关系**：Ceiling Analysis 的数字直接喂入 Threats to Validity 对方法学循环性和当前方法极限的讨论。
 
 ### 5.8 Analysis
 - 各维度贡献分析 (基于消融)
@@ -502,6 +529,8 @@ Exp 1 证明 CADP 可信 → Exp 2 模拟真实社区
 | Table 1 | 13 conditions × 5 metric layers main results | 5.7 |
 | Table 2 | Ablation + COLLEAGUE.SKILL chain comparison (3 dimensions + single-track baseline × 5 metric layers) | 5.7 |
 | Table 2b | Clustering contribution isolation (Descriptive vs Clustering-Only vs CADP) | 5.7 |
+| Table 2c | Token-budget contribution isolation — Length-Matched Control vs Descriptive vs CADP (DA-E1) | 5.7 |
+| Table 2d | Ceiling Analysis — remaining sim-to-real gap per method family × metric layer (review-driven, ARS 2026-06-19) | 5.7.5 |
 | Table 3 | Positioning comparison (5 methods × 7 dims) | 2.5 |
 | Table 4 | Three-tier enforcement mechanism + trigger formalization | 4.4 |
 | Table 5 | Trigger calibration results (P/R/F1 per category × 3 datasets) | 5.3.5 |

@@ -26,6 +26,14 @@ class ConditionName(str, Enum):
     CADP_MINUS_AP = "cadp_minus_ap"
     CADP_CONSTRAINT_ONLY = "cadp_constraint_only"
     POP_ALIGNED_CADP = "pop_aligned_cadp"
+    # Length-matched control (ARS review 2026-06-19, DA-E1 anti-circularity
+    # defense): token-budget-matched behavioral description built from a
+    # RANDOM OTHER cluster's stats. Same template and token count as
+    # Descriptive Persona; broken semantic correspondence. Tests whether
+    # CADP's fidelity gain comes from rule-level content vs simply "more
+    # behavioral context tokens". NOT a CADP variant — does not compile
+    # or mount .skill rules.
+    LENGTH_MATCHED_CONTROL = "length_matched_control"
     # Exp2 §6.2 fourth arm: replay the observed real traces through the
     # metric pipeline as both sim and ground truth, yielding a self-
     # similarity ceiling / "perfect fidelity" reference for the other
