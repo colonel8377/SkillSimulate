@@ -23,18 +23,20 @@ def _bonferroni_threshold(per_dim_sigma: float, dim: int) -> float:
 
     B1 reproducibility fix: the original code rejected when the per-dim
     max z-score exceeded ``sigma_threshold``. For high-dim embeddings
-    (e.g. d=384 for ``all-MiniLM-L6-v2``), the expected max of |z| over
-    d independent standard normals is ≈ sqrt(2 ln d) ≈ 3.45 — well above
-    the legacy 2.0 threshold — so the filter would systematically
-    over-flag and inflate CADP-Full's safe-template fallback rate (g5
-    over-alignment distortion).
+    (production: d=1024 for ``bge-large-en-v1.5``; debug: d=384 for
+    ``all-MiniLM-L6-v2``), the expected max of |z| over d independent
+    standard normals is ≈ sqrt(2 ln d) (d=1024: ≈ 3.79; d=384: ≈ 3.45)
+    — well above the legacy 2.0 threshold — so the filter would
+    systematically over-flag and inflate CADP-Full's safe-template
+    fallback rate (g5 over-alignment distortion).
 
     Fix: treat "outside 2σ" as a multiple-comparison problem. Holding
     the family-wise error rate at the same tail probability as a single
     2σ two-sided test (P(|z|>2) ≈ 0.0455), the per-dim significance
     required to flag *any* of d dimensions is alpha/d. The corrected
-    per-dim threshold is the (1 - alpha/d / 2) standard-normal quantile.
-    For d=384 this is ≈ 3.54 — close to the theoretical E[max|z|].
+    per-dim threshold is the (1 - alpha/d / 2) standard-normal quantile:
+    d=1024 → ≈ 4.13σ; d=384 → ≈ 3.84σ. Both are well above their
+    respective E[max|z|], preventing systematic over-rejection.
 
     Args:
         per_dim_sigma: User-facing σ boundary (e.g. 2.0).

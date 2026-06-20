@@ -2,6 +2,7 @@
 name: dev_run
 datasets: [wikipedia]
 models: [deepseek-v4-flash]
+compile_model: deepseek-v4-pro
 conditions: [vanilla, cadp_full]
 num_repeats: 1
 num_rounds: 3

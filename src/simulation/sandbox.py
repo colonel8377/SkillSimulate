@@ -135,8 +135,8 @@ class SimulationSandbox:
             enforcement_violations += round_violations
             enforcement_total += round_total
 
-            logger.debug(
-                f"Run {run_id} round {round_num}: "
+            logger.info(
+                f"Run {run_id} round {round_num}/{num_rounds - 1}: "
                 f"{len(round_messages)} messages, "
                 f"{round_violations}/{round_total} enforcement violations"
             )
@@ -249,7 +249,10 @@ class SimulationSandbox:
                         # Use the agent's message directly (no duplicate creation)
                         thread.add_message(msg)
 
-                        # Record message with parent info for chain analysis
+                        # Record message with parent info for chain analysis.
+                        # Also propagate ``metadata`` so downstream evaluation
+                        # (outline §5.7 / §4.4.2 step 4) can stratify by the
+                        # ``constraint_forced`` safe-template flag.
                         msg_dict = {
                             "msg_id": msg.msg_id,
                             "thread_id": msg.thread_id,
@@ -258,6 +261,7 @@ class SimulationSandbox:
                             "text": msg.text,
                             "round": round_num,
                             "parent_msg_id": msg.parent_msg_id,
+                            "metadata": dict(msg.metadata) if msg.metadata else {},
                         }
                         messages.append(msg_dict)
 
@@ -272,9 +276,11 @@ class SimulationSandbox:
                             violations += enf_log.total_violations
 
                     except Exception as e:
+                        import traceback
                         logger.error(
                             f"Error in round {round_num}, "
-                            f"agent {agent.agent_id}: {e}"
+                            f"agent {agent.agent_id}: {e}\n"
+                            f"{traceback.format_exc()}"
                         )
 
         return messages, violations, total_checks

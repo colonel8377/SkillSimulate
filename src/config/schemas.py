@@ -58,6 +58,7 @@ class ExperimentConfig:
     name: str
     datasets: list[str] = field(default_factory=list)
     models: list[str] = field(default_factory=list)
+    compile_model: str = ""  # model for skill compilation (empty = use models[0])
     conditions: list[str] = field(default_factory=list)
     num_repeats: int = 1
     num_rounds: int = 30

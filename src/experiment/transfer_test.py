@@ -43,6 +43,7 @@ class CrossDatasetTransferRunner(ExperimentRunner):
         self.metrics_agg = MetricsAggregator(
             held_out_events_dir=str(settings.held_out_events_dir),
             role_labels_dir=str(settings.role_labels_dir),
+            model_provenance=self.llm.get_all_provenance(),
         )
 
     async def run_transfer_test(

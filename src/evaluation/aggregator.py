@@ -35,6 +35,12 @@ class MetricsReport:
     # paper's per-dataset validity table (G8).
     used_role_label_proxy: bool = False
     used_held_out_events_heuristic: bool = False
+    # Audit P5 / outline §5.1(d): reproducibility provenance for the model
+    # that produced this run. Empty strings when unrecorded (the paper's
+    # reproducibility table should then show ``unrecorded`` rather than
+    # silently dropping the row).
+    model_snapshot_date: str = ""
+    model_commit_hash: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -45,6 +51,8 @@ class MetricsReport:
             "repeat": self.repeat,
             "used_role_label_proxy": self.used_role_label_proxy,
             "used_held_out_events_heuristic": self.used_held_out_events_heuristic,
+            "model_snapshot_date": self.model_snapshot_date,
+            "model_commit_hash": self.model_commit_hash,
             **self.metrics,
         }
 
@@ -75,12 +83,17 @@ class MetricsAggregator:
         self,
         held_out_events_dir: str | None = None,
         role_labels_dir: str | None = None,
+        model_provenance: dict[str, dict[str, str]] | None = None,
     ):
         self.reports: list[MetricsReport] = []
         self.held_out_events_dir = held_out_events_dir
         self.role_labels_dir = role_labels_dir
         # Tracks which datasets fell back to the Louvain proxy, for §7.4 reporting
         self.datasets_using_role_label_proxy: set[str] = set()
+        # Audit P5: ``{model_name: {"snapshot_date": ..., "commit_hash": ...}}``
+        # Stamped into every MetricsReport so the paper's reproducibility
+        # table can cite the exact dated snapshot / commit per row.
+        self.model_provenance: dict[str, dict[str, str]] = dict(model_provenance or {})
 
     def _load_held_out_events(self, dataset: str) -> list | None:
         """Load annotated held-out events for a dataset, if available."""
@@ -269,10 +282,51 @@ class MetricsAggregator:
             all_real_msgs = [m for t in real_threads for m in t.messages if m.text.strip()]
             if len(all_real_msgs) > 500:
                 all_real_msgs = _rand.Random(42).sample(all_real_msgs, 500)
-            all_metrics.update(LinguisticMetrics.compute(
+
+            # outline §5.7 / §4.4.2 step 4: messages produced via the Forced
+            # Reformulation safe-template fallback are linguistically degenerate
+            # by construction (deliberately bland to dodge anti-patterns). Pooling
+            # them with normal outputs deflates the linguistics scores of
+            # constraint-heavy conditions (e.g. ``cadp_constraint_only``,
+            # ``cadp_full``). We therefore report two stratified families:
+            #   linguistics_*_normal         — headline (drops safe-templates)
+            #   linguistics_*_safe_template  — audit-only (safe-templates only)
+            # plus the legacy pooled metric (kept for backward compatibility).
+            sim_normal = [
+                m for m in sim_msg_objects
+                if not m.metadata.get("constraint_forced", False)
+            ]
+            sim_safe = [
+                m for m in sim_msg_objects
+                if m.metadata.get("constraint_forced", False)
+            ]
+
+            pooled_metrics = LinguisticMetrics.compute(
                 sim_messages=sim_msg_objects,
                 real_messages=all_real_msgs,
-            ))
+            )
+            all_metrics.update(pooled_metrics)
+
+            # Headline stratum: normal (non-safe-template) outputs.
+            if sim_normal:
+                normal_metrics = LinguisticMetrics.compute(
+                    sim_messages=sim_normal,
+                    real_messages=all_real_msgs,
+                )
+                for k, v in normal_metrics.items():
+                    all_metrics[f"{k}_normal"] = v
+
+            # Audit stratum: safe-template outputs only. May be empty for most
+            # conditions — surface that fact via a count rather than NaN.
+            all_metrics["linguistics_safe_template_count"] = float(len(sim_safe))
+            all_metrics["linguistics_normal_count"] = float(len(sim_normal))
+            if sim_safe:
+                safe_metrics = LinguisticMetrics.compute(
+                    sim_messages=sim_safe,
+                    real_messages=all_real_msgs,
+                )
+                for k, v in safe_metrics.items():
+                    all_metrics[f"{k}_safe_template"] = v
         except Exception as e:
             logger.warning(f"LinguisticMetrics computation failed: {e}")
 
@@ -309,6 +363,8 @@ class MetricsAggregator:
             metrics=all_metrics,
             used_role_label_proxy=sim_result.dataset in self.datasets_using_role_label_proxy,
             used_held_out_events_heuristic=(held_out_events is None),
+            model_snapshot_date=self.model_provenance.get(sim_result.model, {}).get("snapshot_date", ""),
+            model_commit_hash=self.model_provenance.get(sim_result.model, {}).get("commit_hash", ""),
         )
         self.reports.append(report)
         return report
@@ -389,6 +445,9 @@ class MetricsAggregator:
             platform = Platform.GITHUB
         else:
             platform = Platform.WIKIPEDIA
+        # Preserve metadata so downstream evaluation can stratify by the
+        # ``constraint_forced`` safe-template flag (outline §5.7).
+        raw_meta = d.get("metadata") or {}
         return Message(
             msg_id=d.get("msg_id", ""),
             thread_id=tid,
@@ -397,6 +456,7 @@ class MetricsAggregator:
             timestamp=datetime.now(),
             text=d.get("text", ""),
             action_type=ActionType(d.get("action_type", "post")),
+            metadata=dict(raw_meta) if isinstance(raw_meta, dict) else {},
         )
 
     def _build_graph_from_threads(self, threads: list[Thread]) -> nx.Graph:

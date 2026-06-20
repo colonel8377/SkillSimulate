@@ -49,6 +49,69 @@ def cliffs_delta(treatment: np.ndarray, control: np.ndarray) -> float:
     return (greater - less) / (n * m)
 
 
+def cohens_d(treatment: np.ndarray, control: np.ndarray) -> float:
+    """Cohen's d (independent groups, pooled SD).
+
+    Used as the parametric companion to :func:`cliffs_delta` so the paper
+    can report both a non-parametric (Cliff's δ) and a parametric (Cohen's
+    d) effect size, addressing P2 of the audit.
+    """
+    t = np.asarray(treatment, dtype=float)
+    c = np.asarray(control, dtype=float)
+    n_t, n_c = len(t), len(c)
+    if n_t < 2 or n_c < 2:
+        return float("nan")
+    var_t = float(np.var(t, ddof=1))
+    var_c = float(np.var(c, ddof=1))
+    pooled = np.sqrt(((n_t - 1) * var_t + (n_c - 1) * var_c) / (n_t + n_c - 2))
+    if pooled == 0.0:
+        return 0.0
+    return float((np.mean(t) - np.mean(c)) / pooled)
+
+
+def paired_d_with_ci(
+    treatment: np.ndarray,
+    control: np.ndarray,
+    confidence: float = 0.95,
+    n_resamples: int = 10000,
+) -> dict[str, float]:
+    """Paired Cohen's d (a.k.a. d_z = mean(Δ) / sd(Δ)) with bootstrap CI.
+
+    Pairs are taken in order; if the two arrays differ in length they are
+    truncated to the shorter (consistent with :func:`compare_conditions`).
+    Returns ``{"paired_d": d_z, "ci_low": l, "ci_high": h, "n_pairs": n}``.
+    """
+    t = np.asarray(treatment, dtype=float)
+    c = np.asarray(control, dtype=float)
+    n = min(len(t), len(c))
+    if n < 2:
+        return {"paired_d": float("nan"), "ci_low": float("nan"),
+                "ci_high": float("nan"), "n_pairs": float(n)}
+    diffs = t[:n] - c[:n]
+    sd = float(np.std(diffs, ddof=1))
+    d_z = float(np.mean(diffs) / sd) if sd > 0 else 0.0
+
+    def _d_stat(sample: np.ndarray) -> float:
+        s = float(np.std(sample, ddof=1))
+        return float(np.mean(sample) / s) if s > 0 else 0.0
+
+    try:
+        boot = bootstrap(
+            (diffs,),
+            _d_stat,
+            n_resamples=n_resamples,
+            confidence_level=confidence,
+            method="percentile",
+        )
+        ci_low = float(boot.confidence_interval.low)
+        ci_high = float(boot.confidence_interval.high)
+    except Exception:
+        # SciPy occasionally raises on degenerate inputs; degrade gracefully.
+        ci_low = float("nan")
+        ci_high = float("nan")
+    return {"paired_d": d_z, "ci_low": ci_low, "ci_high": ci_high, "n_pairs": float(n)}
+
+
 def benjamini_hochberg(p_values: np.ndarray, alpha: float = 0.05) -> np.ndarray:
     """Benjamini-Hochberg multiple comparison correction.
 
@@ -110,6 +173,10 @@ def compare_conditions(
         test = paired_wilcoxon_test(t, c)
         delta = cliffs_delta(t, c)
         ci_low, ci_high = bootstrap_ci(t - c)
+        # P2: Cohen's d (independent) + paired d_z with bootstrap CI for the
+        # parametric companion to Cliff's δ.
+        d_indep = cohens_d(t, c)
+        d_paired = paired_d_with_ci(t, c)
 
         # Significance marker
         p = test["p_value"]
@@ -120,6 +187,10 @@ def compare_conditions(
             "treatment_mean": float(np.mean(t)),
             "control_mean": float(np.mean(c)),
             "cliffs_delta": delta,
+            "cohens_d": d_indep,
+            "paired_d": d_paired["paired_d"],
+            "paired_d_ci_low": d_paired["ci_low"],
+            "paired_d_ci_high": d_paired["ci_high"],
             "p_value": p,
             "ci_low": ci_low,
             "ci_high": ci_high,
@@ -128,6 +199,82 @@ def compare_conditions(
         })
 
     return pd.DataFrame(results)
+
+
+def benjamini_hochberg_qvalues(p_values: np.ndarray) -> np.ndarray:
+    """Return BH-adjusted q-values (one per input p-value).
+
+    Companion to :func:`benjamini_hochberg` (which only returns reject/keep
+    booleans). Used by :func:`compare_conditions_layered` so callers can
+    threshold q at any α post-hoc.
+    """
+    p = np.asarray(p_values, dtype=float)
+    n = len(p)
+    if n == 0:
+        return p
+    order = np.argsort(p)
+    ranked = p[order]
+    # Standard BH q: q_i = min_{j>=i} (n / rank_j) * p_j
+    raw = ranked * n / (np.arange(n) + 1)
+    # Enforce monotonicity from the top (largest rank) downward and clip to 1.
+    q_sorted = np.minimum.accumulate(raw[::-1])[::-1]
+    q_sorted = np.clip(q_sorted, 0.0, 1.0)
+    q = np.empty(n, dtype=float)
+    q[order] = q_sorted
+    return q
+
+
+def compare_conditions_layered(
+    df: pd.DataFrame,
+    treatment: str = "cadp_full",
+    baselines: list[str] | None = None,
+    layer_metrics: dict[str, list[str]] | None = None,
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """Layer-wise comparison with within-layer Benjamini-Hochberg correction.
+
+    Audit P3: outline §5.1 promises layer-internal multiple-testing
+    correction, but :func:`compare_conditions` reports raw p-values only.
+    This wrapper iterates :data:`DEFAULT_LAYER_METRICS` (or a caller-
+    supplied mapping), runs ``compare_conditions`` per metric, then applies
+    BH within each layer's (metric × baseline) test family. Result columns:
+    ``layer``, ``metric``, plus all columns of ``compare_conditions``,
+    plus ``q_value`` (BH-corrected) and ``rejected_at_alpha``.
+
+    Args:
+        df: Long-form results DataFrame with a ``condition`` column.
+        treatment: Treatment condition name.
+        baselines: Baselines list (default = same as ``compare_conditions``).
+        layer_metrics: Override mapping ``{layer: [metric, ...]}``. Defaults
+            to :data:`DEFAULT_LAYER_METRICS`.
+        alpha: Family-wise α used for the ``rejected_at_alpha`` flag.
+    """
+    layer_metrics = layer_metrics or DEFAULT_LAYER_METRICS
+    pieces: list[pd.DataFrame] = []
+    for layer, metrics in layer_metrics.items():
+        layer_rows: list[pd.DataFrame] = []
+        for metric in metrics:
+            if metric not in df.columns:
+                continue
+            sub = compare_conditions(df, metric, treatment, baselines)
+            if sub.empty:
+                continue
+            sub = sub.copy()
+            sub.insert(0, "metric", metric)
+            sub.insert(0, "layer", layer)
+            layer_rows.append(sub)
+        if not layer_rows:
+            continue
+        layer_df = pd.concat(layer_rows, ignore_index=True)
+        # Within-layer BH on the (metric × baseline) family.
+        layer_df["q_value"] = benjamini_hochberg_qvalues(
+            layer_df["p_value"].to_numpy()
+        )
+        layer_df["rejected_at_alpha"] = layer_df["q_value"] <= alpha
+        pieces.append(layer_df)
+    if not pieces:
+        return pd.DataFrame()
+    return pd.concat(pieces, ignore_index=True)
 
 
 def behavioral_entropy(action_counts: dict[str, int] | list[str]) -> float:
@@ -283,6 +430,9 @@ def compare_ablations(
         test = paired_wilcoxon_test(t, c)
         delta = cliffs_delta(t, c)
         ci_low, ci_high = bootstrap_ci(t - c)
+        # P2: parametric effect-size companions.
+        d_indep = cohens_d(t, c)
+        d_paired = paired_d_with_ci(t, c)
 
         p = test["p_value"]
         sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
@@ -292,6 +442,10 @@ def compare_ablations(
             "full_mean": float(np.mean(t)),
             "ablation_mean": float(np.mean(c)),
             "cliffs_delta": delta,
+            "cohens_d": d_indep,
+            "paired_d": d_paired["paired_d"],
+            "paired_d_ci_low": d_paired["ci_low"],
+            "paired_d_ci_high": d_paired["ci_high"],
             "p_value": p,
             "ci_low": ci_low,
             "ci_high": ci_high,

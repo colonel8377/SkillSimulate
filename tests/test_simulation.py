@@ -488,3 +488,57 @@ def test_g4_alpha_sweep_75_cells():
     module_src = inspect.getsource(__import__("src.experiment.alpha_sensitivity", fromlist=["x"]))
     assert "5^3" not in module_src.replace(" ", "")
     assert "=125" not in module_src.replace(" ", "")
+
+
+# ----------------------------------------------------------------------
+# Audit P7 — Tier-1 Bonferroni regression test
+# ----------------------------------------------------------------------
+
+def test_tier1_bonferroni_threshold_d384():
+    """Pin the dimension-aware Bonferroni threshold at d=384.
+
+    Outline §4.4 + tier1_filter docstring derive: alpha_per_dim = 2(1-Φ(2))/d,
+    threshold = Φ⁻¹(1 - alpha_per_dim/2). For per_dim_sigma=2.0 and d=384
+    (the embedding dim of ``all-MiniLM-L6-v2``) this evaluates to ≈3.85,
+    safely above E[max|z|]≈sqrt(2 ln 384)≈3.45 so the filter does not
+    systematically over-flag.
+    """
+    from scipy.stats import norm
+    from src.enforcement.tier1_filter import _bonferroni_threshold
+
+    expected = float(norm.ppf(1.0 - (2.0 * (1.0 - norm.cdf(2.0)) / 384) / 2.0))
+    actual = _bonferroni_threshold(per_dim_sigma=2.0, dim=384)
+    assert abs(actual - expected) < 1e-9
+    # Anchor on the analytic value to catch silent regressions (e.g. anyone
+    # reverting to the legacy 2.0 threshold or to the sqrt(2 ln d) Gumbel
+    # approximation ≈3.45 used by the no-scipy fallback path).
+    assert 3.80 < actual < 3.90, f"expected ≈3.85 at d=384, got {actual}"
+    # And distinctly above both the legacy 2σ and the Gumbel approximation,
+    # so a refactor that mistakenly uses either of those would fail here.
+    assert actual > 3.50, "threshold collapsed below sqrt(2 ln 384)≈3.45"
+
+
+def test_tier1_bonferroni_threshold_low_dim():
+    """At d=1 the Bonferroni correction is a no-op: threshold == per_dim_sigma."""
+    from src.enforcement.tier1_filter import _bonferroni_threshold
+    assert abs(_bonferroni_threshold(2.0, 1) - 2.0) < 1e-9
+
+
+def test_tier1_bonferroni_monotone_in_d():
+    """Threshold strictly increases with embedding dimensionality."""
+    from src.enforcement.tier1_filter import _bonferroni_threshold
+    thresholds = [_bonferroni_threshold(2.0, d) for d in (1, 32, 128, 384, 1024)]
+    assert all(b > a for a, b in zip(thresholds, thresholds[1:])), thresholds
+
+
+def test_tier1_filter_dimension_aware_default():
+    """Tier1ExpressionFilter must default to dimension_aware=True.
+
+    Falling back to the legacy 2σ threshold silently would systematically
+    over-flag at d=384 — the exact regression P7 is meant to prevent.
+    """
+    import inspect
+    from src.enforcement.tier1_filter import Tier1ExpressionFilter
+    sig = inspect.signature(Tier1ExpressionFilter.__init__)
+    assert sig.parameters["dimension_aware"].default is True
+

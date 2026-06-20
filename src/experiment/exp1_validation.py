@@ -30,6 +30,7 @@ class Experiment1Runner(ExperimentRunner):
         self.metrics_agg = MetricsAggregator(
             held_out_events_dir=str(settings.held_out_events_dir),
             role_labels_dir=str(settings.role_labels_dir),
+            model_provenance=self.llm.get_all_provenance(),
         )
         # Cache compiled skills per dataset
         self._skill_cache: dict[str, dict[str, Any]] = {}
@@ -217,7 +218,7 @@ class Experiment1Runner(ExperimentRunner):
                 logger.info(f"Compiling new skills for {dataset}")
                 compiler = SkillCompiler(
                     llm_client=self.llm,
-                    model_name=self.config.models[0],
+                    model_name=self.config.compile_model or self.config.models[0],
                     top_n_threads=self.config.top_n_threads,
                 )
                 skills = await compiler.compile_all(

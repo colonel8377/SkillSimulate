@@ -48,3 +48,4 @@ outputs/**/checkpoints/
 /data/
 /outputs/
 /.serena/
+/.qoder/

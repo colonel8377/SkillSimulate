@@ -26,19 +26,44 @@ def delta_q_modularity(
 
     Returns:
         ΔQ = |Q_sim - Q_real| (lower is better).
+        Returns 0.0 when either graph has no edges (modularity undefined).
     """
-    q_sim = nx.community.modularity(sim_graph, _communities_to_partitions(sim_graph, sim_communities))
-    q_real = nx.community.modularity(real_graph, _communities_to_partitions(real_graph, real_communities))
+    # Modularity is undefined for edgeless graphs
+    if sim_graph.number_of_edges() == 0 or real_graph.number_of_edges() == 0:
+        return 0.0
+
+    sim_partition = _communities_to_partitions(sim_graph, sim_communities)
+    real_partition = _communities_to_partitions(real_graph, real_communities)
+
+    if not sim_partition or not real_partition:
+        return 0.0
+
+    q_sim = nx.community.modularity(sim_graph, sim_partition)
+    q_real = nx.community.modularity(real_graph, real_partition)
     return abs(q_sim - q_real)
 
 
 def _communities_to_partitions(graph: nx.Graph, communities: dict[str, int]) -> list[set]:
-    """Convert community mapping to partition list."""
+    """Convert community mapping to partition list.
+
+    Assigns nodes present in *communities* to their mapped cluster.
+    Nodes in the graph but absent from *communities* are grouped into a
+    single ``-1`` bucket so the partition always covers every node
+    (required by ``nx.community.modularity``).
+    """
     partitions: dict[int, set] = {}
+    covered: set[str] = set()
     for node, cid in communities.items():
         if node in graph:
             partitions.setdefault(cid, set()).add(node)
-    return list(partitions.values())
+            covered.add(node)
+    # Group uncovered nodes into a single "unassigned" community
+    uncovered = set(graph.nodes()) - covered
+    if uncovered:
+        partitions.setdefault(-1, set()).update(uncovered)
+    result = list(partitions.values())
+    # Edge case: empty graph — return empty partition
+    return result if result else []
 
 
 def ei_polarization_index(
