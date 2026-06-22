@@ -57,9 +57,21 @@ _ESCALATION_ACTIONS = {
 # Feature extraction
 # ----------------------------------------------------------------------
 
-def extract_features(messages: list[dict], thread_id: str, user_id: str) -> np.ndarray:
+def _build_thread_index(messages: list[dict]) -> dict[str, list[dict]]:
+    """Build {thread_id: [messages]} index for O(1) thread lookup."""
+    index: dict[str, list[dict]] = {}
+    for m in messages:
+        index.setdefault(m["thread_id"], []).append(m)
+    return index
+
+
+def extract_features(messages: list[dict], thread_id: str, user_id: str,
+                     thread_index: dict[str, list[dict]] | None = None) -> np.ndarray:
     """Extract behavioral features for a user in a thread."""
-    thread_msgs = [m for m in messages if m["thread_id"] == thread_id]
+    if thread_index is not None:
+        thread_msgs = thread_index.get(thread_id, [])
+    else:
+        thread_msgs = [m for m in messages if m["thread_id"] == thread_id]
     user_msgs = [m for m in thread_msgs if m["user_id"] == user_id]
 
     if not user_msgs:
@@ -187,6 +199,7 @@ def predict_conflict(
     sim_messages: list[dict],
     ground_truth: dict[str, int],
     real_messages: list[dict],
+    real_thread_index: dict[str, list[dict]] | None = None,
 ) -> dict[str, float]:
     """Train on simulation to predict per-user conflict on held-out threads.
 
@@ -194,16 +207,20 @@ def predict_conflict(
         sim_messages: Simulated messages (training).
         ground_truth: {thread_id: consensus_label} from held-out annotation.
         real_messages: Real messages (for feature extraction on test set).
+        real_thread_index: Pre-built {thread_id: [msgs]} index for O(1) lookup.
     """
     sim_thread_ids = list({m["thread_id"] for m in sim_messages})
     sim_feats, sim_labels = _build_user_conflict_dataset(sim_messages, sim_thread_ids)
 
+    if real_thread_index is None:
+        real_thread_index = _build_thread_index(real_messages)
+
     test_feats, test_labels = [], []
     for tid, label in ground_truth.items():
-        thread_msgs = [m for m in real_messages if m["thread_id"] == tid]
+        thread_msgs = real_thread_index.get(tid, [])
         participants = {m["user_id"] for m in thread_msgs}
         for uid in participants:
-            test_feats.append(extract_features(real_messages, tid, uid))
+            test_feats.append(extract_features(real_messages, tid, uid, real_thread_index))
             test_labels.append(label)
 
     return _train_and_evaluate(
@@ -216,12 +233,14 @@ def predict_persuasion(
     sim_messages: list[dict],
     ground_truth: dict[str, int],
     real_messages: list[dict],
+    real_thread_index: dict[str, list[dict]] | None = None,
 ) -> dict[str, float]:
     """Train on simulation to predict persuasion success on held-out threads."""
     def _thread_feats(messages, thread_ids):
         feats, labels = [], []
+        idx = _build_thread_index(messages)
         for tid in thread_ids:
-            thread_msgs = [m for m in messages if m["thread_id"] == tid]
+            thread_msgs = idx.get(tid, [])
             if not thread_msgs:
                 continue
             actions = [m["action_type"] for m in thread_msgs]
@@ -245,10 +264,13 @@ def predict_persuasion(
     sim_thread_ids = list({m["thread_id"] for m in sim_messages})
     sim_feats, sim_labels = _thread_feats(sim_messages, sim_thread_ids)
 
+    if real_thread_index is None:
+        real_thread_index = _build_thread_index(real_messages)
+
     # Test features from real messages, labels from ground truth
     test_feats, test_labels = [], []
     for tid, label in ground_truth.items():
-        thread_msgs = [m for m in real_messages if m["thread_id"] == tid]
+        thread_msgs = real_thread_index.get(tid, [])
         if not thread_msgs:
             continue
         actions = [m["action_type"] for m in thread_msgs]
@@ -277,12 +299,14 @@ def predict_escalation(
     ground_truth: dict[str, int],
     real_messages: list[dict],
     conflict_threshold: float = 0.3,
+    real_thread_index: dict[str, list[dict]] | None = None,
 ) -> dict[str, float]:
     """Train on simulation to predict conflict escalation on held-out threads."""
     def _escalation_feats(messages, thread_ids):
         feats, labels = [], []
+        idx = _build_thread_index(messages)
         for tid in thread_ids:
-            thread_msgs = [m for m in messages if m["thread_id"] == tid]
+            thread_msgs = idx.get(tid, [])
             if not thread_msgs:
                 continue
             total = len(thread_msgs)
@@ -310,9 +334,12 @@ def predict_escalation(
     sim_thread_ids = list({m["thread_id"] for m in sim_messages})
     sim_feats, sim_labels = _escalation_feats(sim_messages, sim_thread_ids)
 
+    if real_thread_index is None:
+        real_thread_index = _build_thread_index(real_messages)
+
     test_feats, test_labels = [], []
     for tid, label in ground_truth.items():
-        thread_msgs = [m for m in real_messages if m["thread_id"] == tid]
+        thread_msgs = real_thread_index.get(tid, [])
         if not thread_msgs:
             continue
         total = len(thread_msgs)
@@ -346,13 +373,16 @@ def _heuristic_ground_truth(
     real_messages: list[dict],
     holdout_ratio: float,
     event_type: str,
+    thread_index: dict[str, list[dict]] | None = None,
 ) -> dict[str, int]:
     """Derive ground-truth labels from action types when no annotations exist.
 
     Flags the result as heuristic — Cohen's κ is unavailable, so this does
     NOT satisfy the outline §5.3 protocol.
     """
-    all_threads = sorted({m["thread_id"] for m in real_messages})
+    if thread_index is None:
+        thread_index = _build_thread_index(real_messages)
+    all_threads = sorted(thread_index.keys())
     n = max(int(len(all_threads) * holdout_ratio), 1)
     holdout = all_threads[:n]
 
@@ -365,7 +395,7 @@ def _heuristic_ground_truth(
     target_actions = actions_map.get(event_type, _CONFLICT_ACTIONS)
 
     for tid in holdout:
-        thread_msgs = [m for m in real_messages if m["thread_id"] == tid]
+        thread_msgs = thread_index.get(tid, [])
         if event_type == EVENT_ESCALATION:
             total = len(thread_msgs) or 1
             conflict = sum(
@@ -424,6 +454,8 @@ class PredictiveMetrics:
             predictive fidelity, and the annotation protocol used.
         """
         result: dict[str, Any] = {}
+        # Build thread index once for O(1) lookup across all operations
+        real_thread_index = _build_thread_index(real_messages)
         # Per-task protocol tracking (outline §5.3 transparency). Each of the
         # three predictive tasks may independently fall back to heuristic GT
         # when consensus labels are unavailable; reporting a single flat
@@ -457,7 +489,7 @@ class PredictiveMetrics:
                     f"(κ NOT reported for this task)"
                 )
                 per_task_protocol[event_type] = "heuristic"
-                return _heuristic_ground_truth(real_messages, holdout_ratio, event_type)
+                return _heuristic_ground_truth(real_messages, holdout_ratio, event_type, real_thread_index)
 
             gt_conflict = _resolve_or_fallback(gt_conflict, EVENT_CONFLICT, "conflict")
             gt_persuasion = _resolve_or_fallback(gt_persuasion, EVENT_PERSUASION, "persuasion")
@@ -470,13 +502,13 @@ class PredictiveMetrics:
                 "No held_out_events provided; Predictive Fidelity uses heuristic "
                 "labels (Cohen's κ unavailable, outline §5.3 protocol NOT met)."
             )
-            gt_conflict = _heuristic_ground_truth(real_messages, holdout_ratio, EVENT_CONFLICT)
-            gt_persuasion = _heuristic_ground_truth(real_messages, holdout_ratio, EVENT_PERSUASION)
-            gt_escalation = _heuristic_ground_truth(real_messages, holdout_ratio, EVENT_ESCALATION)
+            gt_conflict = _heuristic_ground_truth(real_messages, holdout_ratio, EVENT_CONFLICT, real_thread_index)
+            gt_persuasion = _heuristic_ground_truth(real_messages, holdout_ratio, EVENT_PERSUASION, real_thread_index)
+            gt_escalation = _heuristic_ground_truth(real_messages, holdout_ratio, EVENT_ESCALATION, real_thread_index)
 
-        conflict_result = predict_conflict(sim_messages, gt_conflict, real_messages)
-        persuasion_result = predict_persuasion(sim_messages, gt_persuasion, real_messages)
-        escalation_result = predict_escalation(sim_messages, gt_escalation, real_messages)
+        conflict_result = predict_conflict(sim_messages, gt_conflict, real_messages, real_thread_index)
+        persuasion_result = predict_persuasion(sim_messages, gt_persuasion, real_messages, real_thread_index)
+        escalation_result = predict_escalation(sim_messages, gt_escalation, real_messages, real_thread_index=real_thread_index)
 
         # M3 transparency: surface which of the three tasks hit the
         # single-class / empty-feature ceiling so consumers can see

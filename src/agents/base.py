@@ -232,6 +232,10 @@ class BaseAgent(ABC):
                 reflection_context=reflection_context,
             )
             final_text = plan.text
+            if not final_text.strip():
+                raise RuntimeError(
+                    f"Planner produced empty output for agent {self.agent_id}"
+                )
 
         # Construct message — pick parent via platform topology (outline §6.3)
         # Falls back to legacy "reply to last message" when no topology is

@@ -107,11 +107,26 @@ class Planner:
             {"role": "user", "content": prompt},
         ]
 
-        response = await self.llm.chat_completion_json(
-            messages, self.model_name, temperature=0.7, default={}
-        )
+        # Retry up to 2 times if JSON parsing fails (HKUST proxy without
+        # response_format support occasionally returns non-JSON text).
+        data: dict = {}
+        for attempt in range(3):
+            response = await self.llm.chat_completion_json(
+                messages, self.model_name, temperature=0.7, default=None
+            )
+            if isinstance(response, dict) and response:
+                data = response
+                break
+            # JSON parsing failed — retry with stronger instruction
+            if attempt < 2:
+                messages = messages + [
+                    {"role": "assistant", "content": str(response) if response else ""},
+                    {"role": "user", "content": "Your response was not valid JSON. Please respond with ONLY a valid JSON object containing: action_type, text, target_msg_id, reasoning."},
+                ]
 
-        data = response if isinstance(response, dict) else {}
+        # Fallback: if all retries failed, use defaults
+        if not data:
+            data = {}
 
         action_str = data.get("action_type", available_actions[0].value)
         action_type = next(

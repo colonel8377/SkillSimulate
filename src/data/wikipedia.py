@@ -114,13 +114,18 @@ class WikipediaLoader(DatasetLoader):
         )
 
         # Parent message ID
+        # NOTE: the meta-reply_to fallback must be parenthesised so the
+        # ``if isinstance(…)`` guard applies ONLY to the meta lookup,
+        # not to the entire ``or`` chain (Python ternary precedence).
         parent_id = (
             src.get("parent_comment_id")
             or src.get("parent_id")
             or src.get("reply_to")
-            or src.get("meta", {}).get("reply_to")
-            if isinstance(src.get("meta"), dict)
-            else src.get("reply_to")
+            or (
+                src.get("meta", {}).get("reply_to")
+                if isinstance(src.get("meta"), dict)
+                else None
+            )
         )
 
         # Timestamp
@@ -128,9 +133,11 @@ class WikipediaLoader(DatasetLoader):
             src.get("timestamp")
             or src.get("created_at")
             or src.get("utc_timestamp")
-            or src.get("meta", {}).get("timestamp", "")
-            if isinstance(src.get("meta"), dict)
-            else src.get("timestamp", "")
+            or (
+                src.get("meta", {}).get("timestamp", "")
+                if isinstance(src.get("meta"), dict)
+                else None
+            )
         )
         try:
             if isinstance(raw_ts, (int, float)):
