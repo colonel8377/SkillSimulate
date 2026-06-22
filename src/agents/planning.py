@@ -56,12 +56,17 @@ Output ONLY the JSON."""
 class Planner:
     """Plans actions considering constraints and platform rules."""
 
-    def __init__(self, llm_client, model_name: str = "gpt-4o", max_memory_tokens: int = 0):
+    def __init__(self, llm_client, model_name: str = "gpt-4o", max_memory_tokens: int = 0,
+                 per_msg_token_ratio: int = 10, per_msg_token_floor: int = 60,
+                 max_thread_messages: int = 5):
         self.llm = llm_client
         self.model_name = model_name
         # When > 0, memory_context and thread_state are truncated to fit
         # within this budget (token-aware). When 0, legacy char-slicing.
         self.max_memory_tokens = max_memory_tokens
+        self.per_msg_token_ratio = per_msg_token_ratio
+        self.per_msg_token_floor = per_msg_token_floor
+        self.max_thread_messages = max_thread_messages
 
     async def plan(
         self,
@@ -92,8 +97,8 @@ class Planner:
         # Truncate each message text to a per-message budget derived from
         # max_memory_tokens (Issue 1); falls back to [:200] when no token
         # budget is configured (legacy).
-        per_msg_budget = max(60, self.max_memory_tokens // 10) if self.max_memory_tokens else 0
-        recent = thread.messages[-5:]
+        per_msg_budget = max(self.per_msg_token_floor, self.max_memory_tokens // self.per_msg_token_ratio) if self.max_memory_tokens else 0
+        recent = thread.messages[-self.max_thread_messages:]
         thread_text = "\n".join(
             f"<msg id={m.msg_id}> [{m.user_id}] ({m.action_type.value}): "
             f"{truncate_to_token_budget(m.text, per_msg_budget) if per_msg_budget else m.text[:200]}"
@@ -209,8 +214,8 @@ Output ONLY the JSON."""
         """
         actions_str = ", ".join(a.value for a in available_actions)
 
-        per_msg_budget = max(60, self.max_memory_tokens // 10) if self.max_memory_tokens else 0
-        recent = thread.messages[-5:]
+        per_msg_budget = max(self.per_msg_token_floor, self.max_memory_tokens // self.per_msg_token_ratio) if self.max_memory_tokens else 0
+        recent = thread.messages[-self.max_thread_messages:]
         thread_text = "\n".join(
             f"<msg id={m.msg_id}> [{m.user_id}] ({m.action_type.value}): "
             f"{truncate_to_token_budget(m.text, per_msg_budget) if per_msg_budget else m.text[:200]}"

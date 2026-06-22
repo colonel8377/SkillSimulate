@@ -44,6 +44,10 @@ class BaseAgent(ABC):
         memory_strategy: str = "sliding",
         compaction_interval: int = 5,
         compaction_keep_recent: int = 10,
+        max_display_items: int = 5,
+        per_msg_token_ratio: int = 10,
+        per_msg_token_floor: int = 60,
+        max_thread_messages: int = 5,
     ):
         self.agent_id = agent_id
         self.llm = llm_client
@@ -54,11 +58,18 @@ class BaseAgent(ABC):
         # and for endpoints with no total-token cap configured).
         self.max_memory_tokens = max_memory_tokens
         self.memory_strategy = memory_strategy
+        self.max_display_items = max_display_items
+        self.per_msg_token_ratio = per_msg_token_ratio
+        self.per_msg_token_floor = per_msg_token_floor
+        self.max_thread_messages = max_thread_messages
         self.memory = AgentMemory(
             max_context_items=max_context_items,
             max_context_tokens=max_memory_tokens,
         )
-        self.planner = Planner(llm_client, model_name, max_memory_tokens=max_memory_tokens)
+        self.planner = Planner(llm_client, model_name, max_memory_tokens=max_memory_tokens,
+                               per_msg_token_ratio=per_msg_token_ratio,
+                               per_msg_token_floor=per_msg_token_floor,
+                               max_thread_messages=max_thread_messages)
         self.reflection = ReflectionModule(llm_client, model_name, reflection_interval, max_memory_tokens=max_memory_tokens)
         self.state = AgentState(agent_id=agent_id, cluster_id=cluster_id)
         self.enforcement_harness: EnforcementHarness | None = None
@@ -111,14 +122,14 @@ class BaseAgent(ABC):
         # Perceive: retrieve relevant memory
         memory_msgs = self.memory.retrieve(thread.thread_id, current_round)
         # Per-message truncation: when max_memory_tokens > 0 we cap each
-        # message to ~10% of the memory budget so a single verbose turn
-        # cannot crowd out other retrieved items. When 0 we fall back to
-        # the legacy [:200] char cap (back-compat).
-        per_msg_budget = max(60, self.max_memory_tokens // 10) if self.max_memory_tokens else 0
+        # message to max_memory_tokens // per_msg_token_ratio so a single
+        # verbose turn cannot crowd out other retrieved items.
+        # When 0 we fall back to the legacy [:200] char cap (back-compat).
+        per_msg_budget = max(self.per_msg_token_floor, self.max_memory_tokens // self.per_msg_token_ratio) if self.max_memory_tokens else 0
         memory_context = "\n".join(
             f"[{m.user_id}] ({m.action_type.value}): "
             f"{truncate_to_token_budget(m.text, per_msg_budget) if per_msg_budget else m.text[:200]}"
-            for m in memory_msgs[:5]
+            for m in memory_msgs[:self.max_display_items]
         )
 
         # Build reflection context (consolidated beliefs from prior rounds)

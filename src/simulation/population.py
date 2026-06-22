@@ -35,6 +35,10 @@ class PopulationBuilder:
         memory_strategy: str = "sliding",
         compaction_interval: int = 5,
         compaction_keep_recent: int = 10,
+        max_display_items: int = 5,
+        per_msg_token_ratio: int = 10,
+        per_msg_token_floor: int = 60,
+        max_thread_messages: int = 5,
     ):
         """Initialize population builder.
 
@@ -52,6 +56,10 @@ class PopulationBuilder:
                 compaction every N turns.
             compaction_keep_recent: When memory_strategy="rolling_summary",
                 keep this many most-recent raw items unsummarized.
+            max_display_items: memory items shown to planner per turn.
+            per_msg_token_ratio: per-msg budget = max_memory_tokens // ratio.
+            per_msg_token_floor: per-msg token floor.
+            max_thread_messages: recent thread messages in planner prompt.
         """
         self.llm = llm_client
         self.model_name = model_name
@@ -63,6 +71,10 @@ class PopulationBuilder:
         self.memory_strategy = memory_strategy
         self.compaction_interval = compaction_interval
         self.compaction_keep_recent = compaction_keep_recent
+        self.max_display_items = max_display_items
+        self.per_msg_token_ratio = per_msg_token_ratio
+        self.per_msg_token_floor = per_msg_token_floor
+        self.max_thread_messages = max_thread_messages
         # Issue 1: derive the per-agent memory token budget from the
         # model endpoint's input-token cap. We reserve ~30% of the
         # input budget for system prompt + thread context + planner
@@ -258,6 +270,10 @@ class PopulationBuilder:
             memory_strategy=self.memory_strategy,
             compaction_interval=self.compaction_interval,
             compaction_keep_recent=self.compaction_keep_recent,
+            max_display_items=self.max_display_items,
+            per_msg_token_ratio=self.per_msg_token_ratio,
+            per_msg_token_floor=self.per_msg_token_floor,
+            max_thread_messages=self.max_thread_messages,
         )
 
         # Per-tier alpha + backend kwargs for CADP agents

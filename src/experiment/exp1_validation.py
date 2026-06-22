@@ -70,6 +70,10 @@ class Experiment1Runner(ExperimentRunner):
             memory_strategy=self.config.memory_strategy,
             compaction_interval=self.config.compaction_interval,
             compaction_keep_recent=self.config.compaction_keep_recent,
+            max_display_items=self.config.max_context_items,
+            per_msg_token_ratio=self.config.per_msg_token_ratio,
+            per_msg_token_floor=self.config.per_msg_token_floor,
+            max_thread_messages=self.config.max_thread_messages,
         )
         agents = pop_builder.build_population(
             cluster_result=cluster_result,

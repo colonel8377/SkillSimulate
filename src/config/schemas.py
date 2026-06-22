@@ -73,6 +73,10 @@ class ExperimentConfig:
     max_threads: int | None = None  # cap on threads loaded per dataset (None = no cap)
     checkpoint_every: int = 5    # save state every N rounds
     max_concurrency: int = 4     # parallel LLM calls
+    max_context_items: int = 5       # memory items shown per turn (to planner)
+    per_msg_token_ratio: int = 10    # per-msg budget = max_memory_tokens // ratio
+    per_msg_token_floor: int = 60    # per-msg token floor (legacy fallback)
+    max_thread_messages: int = 5     # recent thread messages shown in prompt
     seed: int = 42
     backend: str = "base"
     # Exp 2 scale test
