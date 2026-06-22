@@ -118,7 +118,7 @@ class BaseAgent(ABC):
         memory_context = "\n".join(
             f"[{m.user_id}] ({m.action_type.value}): "
             f"{truncate_to_token_budget(m.text, per_msg_budget) if per_msg_budget else m.text[:200]}"
-            for m in memory_msgs[-5:]
+            for m in memory_msgs[:5]
         )
 
         # Build reflection context (consolidated beliefs from prior rounds)

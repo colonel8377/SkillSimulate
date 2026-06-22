@@ -52,16 +52,14 @@ from src.llm.token_counter import estimate_messages_tokens
 
 
 # Only these exceptions are worth retrying — they are transient by definition.
-# Auth / permission / bad-request errors will fail identically on every retry,
-# so propagating them immediately surfaces config bugs instead of burning
-# 5 × 30s = 2.5 minutes per failing call. PromptBudgetExceeded is retryable
-# because the caller (agent layer) may truncate memory and retry.
+# Auth / permission / bad-request / budget-exceeded errors will fail
+# identically on every retry, so propagating them immediately surfaces
+# config bugs instead of burning retry budget.
 _RETRYABLE = (
     RateLimitError,
     APITimeoutError,
     APIConnectionError,
     InternalServerError,
-    PromptBudgetExceeded,
     TransientResponseError,
 )
 
@@ -449,6 +447,8 @@ class LLMClient:
         kwargs.pop("response_format", None)
         kwargs.pop("tools", None)
         kwargs.pop("tool_choice", None)
+        kwargs.pop("thinking_budget", None)
+        kwargs.pop("reasoning_effort", None)
         return await client.completions.create(
             model=ep.model,
             prompt=prompt,

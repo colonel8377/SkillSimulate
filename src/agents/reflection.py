@@ -69,7 +69,7 @@ class ReflectionModule:
         msgs_text = "\n".join(
             f"[Round {m.metadata.get('round', '?')}]: "
             f"{truncate_to_token_budget(m.text, max(80, self.max_memory_tokens // 20)) if self.max_memory_tokens else m.text[:150]}"
-            for m in recent_messages[-10:]
+            for m in recent_messages[:10]
         )
 
         prompt = REFLECTION_PROMPT.format(
