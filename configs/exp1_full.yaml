@@ -37,3 +37,7 @@ top_n_threads: 20
 checkpoint_every: 5
 max_concurrency: 4
 seed: 42
+# Issue 1: token-aware sliding window (default). 30 rounds is short
+# enough that long-horizon signal loss is acceptable; switching to
+# "rolling_summary" would add ~140K extra LLM calls across the grid.
+memory_strategy: sliding

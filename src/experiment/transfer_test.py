@@ -108,6 +108,9 @@ class CrossDatasetTransferRunner(ExperimentRunner):
             alpha_tier2=self.config.alpha_tier2,
             alpha_tier3=self.config.alpha_tier3,
             backend=self.config.backend,
+            memory_strategy=self.config.memory_strategy,
+            compaction_interval=self.config.compaction_interval,
+            compaction_keep_recent=self.config.compaction_keep_recent,
         )
         agents = pop_builder.build_population(
             cluster_result=target_clusters,
@@ -156,6 +159,9 @@ class CrossDatasetTransferRunner(ExperimentRunner):
             alpha_tier2=self.config.alpha_tier2,
             alpha_tier3=self.config.alpha_tier3,
             backend=self.config.backend,
+            memory_strategy=self.config.memory_strategy,
+            compaction_interval=self.config.compaction_interval,
+            compaction_keep_recent=self.config.compaction_keep_recent,
         )
         native_agents = native_pop.build_population(
             cluster_result=target_clusters,

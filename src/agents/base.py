@@ -15,7 +15,7 @@ from src.agents.reflection import ReflectionModule
 from src.data.schemas import ActionType, Message, Thread
 from src.enforcement.harness import EnforcementHarness, EnforcementLog
 from src.llm.client import LLMClient
-
+from src.llm.token_counter import truncate_to_token_budget
 
 @dataclass
 class AgentState:
@@ -40,17 +40,43 @@ class BaseAgent(ABC):
         max_context_items: int = 20,
         reflection_interval: int = 10,
         max_reformulation_retries: int = 3,
+        max_memory_tokens: int = 0,
+        memory_strategy: str = "sliding",
+        compaction_interval: int = 5,
+        compaction_keep_recent: int = 10,
     ):
         self.agent_id = agent_id
         self.llm = llm_client
         self.model_name = model_name
-        self.memory = AgentMemory(max_context_items=max_context_items)
-        self.planner = Planner(llm_client, model_name)
-        self.reflection = ReflectionModule(llm_client, model_name, reflection_interval)
+        # When max_memory_tokens > 0, AgentMemory.retrieve() accumulates
+        # ranked items until the token budget is hit (Issue 1). When 0,
+        # legacy item-count behaviour applies (back-compat for unit tests
+        # and for endpoints with no total-token cap configured).
+        self.max_memory_tokens = max_memory_tokens
+        self.memory_strategy = memory_strategy
+        self.memory = AgentMemory(
+            max_context_items=max_context_items,
+            max_context_tokens=max_memory_tokens,
+        )
+        self.planner = Planner(llm_client, model_name, max_memory_tokens=max_memory_tokens)
+        self.reflection = ReflectionModule(llm_client, model_name, reflection_interval, max_memory_tokens=max_memory_tokens)
         self.state = AgentState(agent_id=agent_id, cluster_id=cluster_id)
         self.enforcement_harness: EnforcementHarness | None = None
         self.max_reformulation_retries = max_reformulation_retries
         self.engagement_ratio: float = 0.5
+        # Rolling-summary compactor for R4 path (Issue 1). Lazily created
+        # only when memory_strategy == "rolling_summary"; stays None for
+        # the default sliding-window path so there is zero overhead on
+        # exp1/exp2 cells.
+        self._compactor = None
+        if memory_strategy == "rolling_summary":
+            from src.agents.compaction import RollingSummaryCompactor
+            self._compactor = RollingSummaryCompactor(
+                llm_client=llm_client,
+                model_name=model_name,
+                compaction_interval=compaction_interval,
+                keep_recent=compaction_keep_recent,
+            )
         # Injected by SimulationSandbox at run time (outline §6.3 platform
         # topology fidelity). When None, take_turn falls back to the legacy
         # "reply to last message" behaviour.
@@ -84,8 +110,14 @@ class BaseAgent(ABC):
 
         # Perceive: retrieve relevant memory
         memory_msgs = self.memory.retrieve(thread.thread_id, current_round)
+        # Per-message truncation: when max_memory_tokens > 0 we cap each
+        # message to ~10% of the memory budget so a single verbose turn
+        # cannot crowd out other retrieved items. When 0 we fall back to
+        # the legacy [:200] char cap (back-compat).
+        per_msg_budget = max(60, self.max_memory_tokens // 10) if self.max_memory_tokens else 0
         memory_context = "\n".join(
-            f"[{m.user_id}] ({m.action_type.value}): {m.text[:200]}"
+            f"[{m.user_id}] ({m.action_type.value}): "
+            f"{truncate_to_token_budget(m.text, per_msg_budget) if per_msg_budget else m.text[:200]}"
             for m in memory_msgs[-5:]
         )
 
@@ -105,7 +137,7 @@ class BaseAgent(ABC):
             # Build initial messages for enforcement context extraction
             gen_messages = [
                 {"role": "system", "content": self.get_role_description()},
-                {"role": "user", "content": f"Topic: {thread.topic}\nMemory: {memory_context[:500]}"},
+                {"role": "user", "content": f"Topic: {thread.topic}\nMemory: {truncate_to_token_budget(memory_context, self.max_memory_tokens) if self.max_memory_tokens else memory_context[:500]}"},
             ]
 
             gen_messages, pre_log, enforcement_context = await self.enforcement_harness.enforce_generation(
@@ -282,6 +314,15 @@ class BaseAgent(ABC):
         if self.reflection.should_reflect(current_round):
             recent = self.memory.retrieve(thread_id=None, current_round=current_round)
             await self.reflection.reflect(recent, context=self.get_role_description(), current_round=current_round)
+
+        # Rolling-summary compaction (R4 path only — Issue 1). Runs every
+        # compaction_interval turns, summarizing the oldest raw memory
+        # items into a single ``kind="summary"`` MemoryItem. This keeps
+        # long-horizon signal available to the planner for the 50-turn
+        # persona-collapse stress test. Failures are non-fatal: the
+        # compactor logs a WARNING and leaves raw memory untouched.
+        if self._compactor is not None and self._compactor.should_compact(current_round):
+            await self._compactor.compact(self.memory, current_round)
 
         return msg, enforcement_log
 

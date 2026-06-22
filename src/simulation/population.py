@@ -32,6 +32,9 @@ class PopulationBuilder:
         alpha_tier2: float | None = None,
         alpha_tier3: float | None = None,
         backend: str = "base",
+        memory_strategy: str = "sliding",
+        compaction_interval: int = 5,
+        compaction_keep_recent: int = 10,
     ):
         """Initialize population builder.
 
@@ -44,6 +47,11 @@ class PopulationBuilder:
             alpha: Constraint hardness parameter (global default).
             alpha_tier1/2/3: Per-tier alpha overrides (None = use alpha).
             backend: Skill adapter backend ("base", "langchain", etc.).
+            memory_strategy: "sliding" (default, exp1/exp2) or "rolling_summary" (R4).
+            compaction_interval: When memory_strategy="rolling_summary", run
+                compaction every N turns.
+            compaction_keep_recent: When memory_strategy="rolling_summary",
+                keep this many most-recent raw items unsummarized.
         """
         self.llm = llm_client
         self.model_name = model_name
@@ -52,6 +60,24 @@ class PopulationBuilder:
         self.alpha_tier2 = alpha_tier2
         self.alpha_tier3 = alpha_tier3
         self.backend = backend
+        self.memory_strategy = memory_strategy
+        self.compaction_interval = compaction_interval
+        self.compaction_keep_recent = compaction_keep_recent
+        # Issue 1: derive the per-agent memory token budget from the
+        # model endpoint's input-token cap. We reserve ~30% of the
+        # input budget for system prompt + thread context + planner
+        # template + reflection; the remaining 70% is the agent-memory
+        # slice. When the endpoint has no cap configured (max_total_tokens=0)
+        # max_memory_tokens stays 0 and legacy char-slicing applies.
+        ep = getattr(llm_client, "models", {}).get(model_name)
+        input_budget = getattr(ep, "max_input_tokens", 0) if ep else 0
+        # Reserve ~3K tokens for system/skill prompt (CADP dual-track can
+        # be sizeable) and split the rest 70/30 between memory and thread.
+        if input_budget > 0:
+            reserved = min(3000, input_budget // 4)
+            self._max_memory_tokens = max(512, int((input_budget - reserved) * 0.7))
+        else:
+            self._max_memory_tokens = 0
 
         # Load skills: either from dict or from directory
         if skills is not None:
@@ -221,6 +247,17 @@ class PopulationBuilder:
             llm_client=self.llm,
             model_name=self.model_name,
             cluster_id=cluster_id,
+            # Issue 1: thread the per-model input-token budget through to
+            # every agent so Planner / AgentMemory / ReflectionModule can
+            # truncate in token-aware fashion. 0 = legacy char-slicing.
+            max_memory_tokens=self._max_memory_tokens,
+            # Issue 1: memory strategy (sliding vs rolling_summary) and
+            # the compactor's knobs. Default "sliding" is a no-op for
+            # exp1/exp2 cells; "rolling_summary" is set by the R4 collapse
+            # stress test config.
+            memory_strategy=self.memory_strategy,
+            compaction_interval=self.compaction_interval,
+            compaction_keep_recent=self.compaction_keep_recent,
         )
 
         # Per-tier alpha + backend kwargs for CADP agents

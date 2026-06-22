@@ -1,0 +1,40 @@
+# R4 Persona-Collapse Stress Test (outline §5.6.7, docs/r4_persona_collapse_stress_test.md)
+#
+# Long-horizon 50-turn stress test that measures per-turn cluster drift to
+# detect persona collapse (H1-H6, see src/experiment/collapse_stress.py).
+#
+# Issue 1: this is the only config that uses the "rolling_summary" memory
+# strategy. The collapse signature is a *long-horizon trajectory* — turn-1
+# signal must still be visible to the planner at turn 50 — so the default
+# sliding-window memory is insufficient. Rolling summary compacts every
+# `compaction_interval` turns into a single MemoryItem(kind="summary"),
+# preserving the agent's accumulated belief trajectory.
+#
+# Cost note: rolling summary adds one LLM call per agent per compaction
+# interval. At 50 turns / interval=5 / population=30 / 3 conditions /
+# 4 models / 3 datasets / 5 repeats ≈ 18K extra summary calls. Acceptable
+# for a single hypothesis-testing stress test; do NOT use for exp1/exp2.
+name: collapse_stress
+datasets: [wikipedia, reddit, github]
+models: [gpt-4o, claude-3.5-sonnet, llama-3-70b, qwen-2.5-72b]
+conditions:
+  - descriptive        # H1, H3, H5 positive collapse arm
+  - cadp_full          # H2, H4 — should resist collapse
+  - cadp_minus_ap      # H6 — mechanism isolation (Tier 3 removed)
+num_repeats: 5
+num_rounds: 50         # outline §5.6.7 protocol
+population_size: 30
+alpha: 1.0
+alpha_tier1: 1.0
+alpha_tier2: 1.0
+alpha_tier3: 1.0
+num_clusters: 4
+cluster_method: kmeans
+top_n_threads: 20
+checkpoint_every: 10
+max_concurrency: 4
+seed: 42
+# Issue 1: rolling-summary memory compaction for long-horizon fidelity.
+memory_strategy: rolling_summary
+compaction_interval: 5     # one summary every 5 turns
+compaction_keep_recent: 10 # keep this many raw items unsummarized

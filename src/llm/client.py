@@ -25,12 +25,45 @@ from typing import Any
 
 import yaml
 from loguru import logger
-from openai import AsyncOpenAI
-from tenacity import retry, stop_after_attempt, wait_exponential
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitError,
+)
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
+from src.llm.circuit_breaker import get_breaker
 from src.llm.cost_tracker import CostTracker
+from src.llm.exceptions import CircuitBreakerOpen, PromptBudgetExceeded, TransientResponseError
 from src.llm.json_utils import extract_json
 from src.llm.mock_router import MockLLMRouter
+from src.llm.token_counter import estimate_messages_tokens
+
+
+# Only these exceptions are worth retrying — they are transient by definition.
+# Auth / permission / bad-request errors will fail identically on every retry,
+# so propagating them immediately surfaces config bugs instead of burning
+# 5 × 30s = 2.5 minutes per failing call. PromptBudgetExceeded is retryable
+# because the caller (agent layer) may truncate memory and retry.
+_RETRYABLE = (
+    RateLimitError,
+    APITimeoutError,
+    APIConnectionError,
+    InternalServerError,
+    PromptBudgetExceeded,
+    TransientResponseError,
+)
 
 
 @dataclass
@@ -65,6 +98,55 @@ class ModelEndpoint:
     # row instead of silently omitting it.
     snapshot_date: str = ""
     commit_hash: str = ""
+    # --- Token budget caps (Issue 1) ----------------------------------
+    # ``max_tokens`` above remains the *output* cap (passed to the API as
+    # the OpenAI ``max_tokens`` kwarg). For reasoning models whose total
+    # token budget (input + output + thinking) is capped — e.g.
+    # DeepSeek-V4-Flash at 65535 — the three fields below let the
+    # pre-flight guard in :meth:`LLMClient.chat_completion` refuse to
+    # send a prompt that would overflow the input budget. For non-
+    # reasoning models, leave ``max_total_tokens=0`` and the guard is
+    # skipped (back-compat with pre-existing behaviour).
+    max_total_tokens: int = 0      # 0 = no shared cap (legacy behaviour)
+    max_thinking_tokens: int = 0   # 0 = no thinking budget reserved
+    # ``max_output_tokens`` is an alias for ``max_tokens`` — both fields
+    # are kept in sync via __post_init__ so callers can use whichever
+    # name reads better at the call site.
+    max_output_tokens: int = 0     # 0 = mirror max_tokens in __post_init__
+
+    def __post_init__(self) -> None:
+        # Keep max_tokens and max_output_tokens in sync. Whoever was set
+        # explicitly wins; if both were set inconsistently, max_tokens
+        # wins because it is the historical field name.
+        if self.max_output_tokens and not self.max_tokens:
+            self.max_tokens = self.max_output_tokens
+        elif self.max_tokens and not self.max_output_tokens:
+            self.max_output_tokens = self.max_tokens
+        elif self.max_tokens and self.max_output_tokens and \
+                self.max_tokens != self.max_output_tokens:
+            from loguru import logger
+            logger.warning(
+                f"ModelEndpoint '{self.name}': max_tokens={self.max_tokens} "
+                f"!= max_output_tokens={self.max_output_tokens}; "
+                f"using max_tokens={self.max_tokens}."
+            )
+            self.max_output_tokens = self.max_tokens
+
+    @property
+    def max_input_tokens(self) -> int:
+        """Input-token budget = total − thinking − output.
+
+        Returns 0 when ``max_total_tokens`` is 0 (legacy mode, guard
+        skipped). When thinking + output ≥ total (misconfigured),
+        returns 0 — the pre-flight guard will then refuse every prompt,
+        surfacing the config bug loudly.
+        """
+        if self.max_total_tokens <= 0:
+            return 0
+        return max(
+            0,
+            self.max_total_tokens - self.max_thinking_tokens - self.max_output_tokens,
+        )
 
 
 # Suffixes that the OpenAI Python SDK appends automatically.  If the
@@ -114,6 +196,12 @@ class LLMClient:
             )
         else:
             self._mock = None
+        # Process-global circuit breaker. Threshold is configurable via env
+        # so operators can tighten it for fragile endpoints. The breaker is
+        # reset on each new runner.run_all() invocation.
+        self._breaker = get_breaker(
+            threshold=int(os.getenv("CADP_BREAKER_THRESHOLD", "3"))
+        )
         self._init_clients()
 
     def _load_models(self, path: str) -> dict[str, ModelEndpoint]:
@@ -134,6 +222,9 @@ class LLMClient:
                 cost_per_1k_output=entry.get("cost_per_1k_output", 0.0),
                 snapshot_date=str(entry.get("snapshot_date", "")),
                 commit_hash=str(entry.get("commit_hash", "")),
+                max_total_tokens=int(entry.get("max_total_tokens", 0)),
+                max_thinking_tokens=int(entry.get("max_thinking_tokens", 0)),
+                max_output_tokens=int(entry.get("max_output_tokens", entry.get("max_tokens", 0))),
             )
         return endpoints
 
@@ -160,11 +251,6 @@ class LLMClient:
                 )
             self.clients[name] = AsyncOpenAI(api_key=api_key, base_url=clean_url)
 
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=2, max=30),
-        reraise=True,
-    )
     async def chat_completion(
         self,
         messages: list[dict[str, str]],
@@ -173,7 +259,13 @@ class LLMClient:
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> str:
-        """Generate a chat completion.
+        """Generate a chat completion (public API).
+
+        Wraps :meth:`_chat_completion_with_retry` with circuit-breaker
+        accounting. The breaker is checked before every call and any
+        exception that survives the inner retry loop is recorded as a
+        failure — this is what makes sustained issues trip the run-all
+        halt. Successful calls reset the consecutive-failure counter.
 
         Args:
             messages: OpenAI-format messages [{"role": ..., "content": ...}].
@@ -183,6 +275,52 @@ class LLMClient:
 
         Returns:
             Generated text content.
+
+        Raises:
+            CircuitBreakerOpen: breaker has tripped; halts run_all().
+            PromptBudgetExceeded: prompt exceeds max_input_tokens.
+            AuthenticationError / BadRequestError / etc.: non-retryable,
+                propagated after being recorded on the breaker.
+            RateLimitError / APITimeoutError / etc.: retried up to 5
+                times; if all retries fail, recorded on the breaker and
+                re-raised.
+        """
+        await self._breaker.check()
+        try:
+            content = await self._chat_completion_with_retry(
+                messages, model_name, temperature, max_tokens, **kwargs,
+            )
+            await self._breaker.record_success()
+            return content
+        except CircuitBreakerOpen:
+            raise  # already accounted for
+        except Exception as exc:
+            # Any exception that survived the retry loop counts as a
+            # terminal failure for breaker purposes. This includes both
+            # non-retryable exceptions (auth, bad request) on attempt 1
+            # AND retryable exceptions (rate limit, timeout) that burnt
+            # all 5 attempts.
+            await self._breaker.record_failure(last_error=str(exc))
+            raise
+
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type(_RETRYABLE),
+        reraise=True,
+    )
+    async def _chat_completion_with_retry(
+        self,
+        messages: list[dict[str, str]],
+        model_name: str,
+        temperature: float | None,
+        max_tokens: int | None,
+        **kwargs: Any,
+    ) -> str:
+        """Inner retryable completion — do not call directly.
+
+        Tenacity wraps this method; the public :meth:`chat_completion`
+        handles breaker accounting around it.
         """
         if self._mock_enabled:
             return self._mock.route(messages, model_name)
@@ -191,6 +329,34 @@ class LLMClient:
         client = self.clients[model_name]
         temp = temperature if temperature is not None else ep.temperature
         tokens = max_tokens if max_tokens is not None else ep.max_tokens
+
+        # --- Pre-flight token budget guard (Issue 1) ------------------
+        # Refuse to send prompts that would overflow the input budget.
+        # Uses a conservative tiktoken estimate (1.15× multiplier); when
+        # max_total_tokens is 0 the guard is skipped (legacy behaviour).
+        if ep.max_input_tokens > 0:
+            estimated = estimate_messages_tokens(messages, model=ep.model)
+            if estimated > ep.max_input_tokens:
+                raise PromptBudgetExceeded(
+                    model=ep.model,
+                    requested=estimated,
+                    budget=ep.max_input_tokens,
+                )
+
+        # --- thinking-budget passthrough (Issue 1) --------------------
+        # DeepSeek-V4 reasoning models accept ``reasoning_effort`` /
+        # ``thinking_budget`` style kwargs depending on the proxy. We only
+        # add the kwarg when the endpoint has a non-zero thinking budget
+        # AND the caller hasn't already supplied one.
+        if ep.max_thinking_tokens > 0 and "reasoning_effort" not in kwargs \
+                and "thinking_budget" not in kwargs:
+            # Most OpenAI-compatible proxies for DeepSeek-V4 use
+            # ``reasoning_effort`` as a low/medium/high enum. We pass the
+            # raw token count via ``thinking_budget`` for proxies that
+            # support it; for enum-style proxies, the caller should
+            # override via kwargs. The kwarg is silently ignored by
+            # strict OpenAI endpoints.
+            kwargs.setdefault("thinking_budget", ep.max_thinking_tokens)
 
         # ---- route by api_type ----
         if ep.api_type == "completions":
@@ -219,9 +385,9 @@ class LLMClient:
 
         # Defensive guard: some proxies (e.g. HKUST gateway) occasionally
         # return a response with ``choices=None`` on transient errors.
-        # Raising here triggers the @retry backoff above.
+        # Raising TransientResponseError here triggers the @retry backoff.
         if not response.choices:
-            raise RuntimeError(
+            raise TransientResponseError(
                 f"API returned empty choices for model '{ep.model}' "
                 f"(response.id={getattr(response, 'id', '?')})"
             )
@@ -229,9 +395,9 @@ class LLMClient:
         content = response.choices[0].message.content
         # Defensive guard: DeepSeek / HKUST proxies occasionally return
         # a valid response structure but with empty or None content.
-        # Raising here triggers the @retry backoff above.
+        # Raising TransientResponseError here triggers the @retry backoff.
         if not content or not content.strip():
-            raise RuntimeError(
+            raise TransientResponseError(
                 f"API returned empty content for model '{ep.model}' "
                 f"(response.id={getattr(response, 'id', '?')})"
             )

@@ -80,10 +80,35 @@ class ExperimentConfig:
     scale_test_sizes: list[int] = field(default_factory=lambda: [30, 100])
     # Transfer test mode (outline §5.5)
     transfer_mode: str = "full_component"
+    # --- Memory strategy (Issue 1: token budget) ----------------------
+    # "sliding"        — token-aware top-K retrieval (default; exp1/exp2).
+    #                   Bounded by max_input_tokens; oldest/lowest-importance
+    #                   items dropped when budget exceeded.
+    # "rolling_summary" — every `compaction_interval` turns, summarize the
+    #                   oldest N raw messages into a single MemoryItem and
+    #                   keep recent M turns raw. Used by the R4 collapse
+    #                   stress test where long-horizon signal matters.
+    memory_strategy: str = "sliding"
+    compaction_interval: int = 5  # only used when memory_strategy="rolling_summary"
+    compaction_keep_recent: int = 10  # M raw items kept after compaction
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "ExperimentConfig":
         import yaml
+        import dataclasses
         with open(path) as f:
             data = yaml.safe_load(f)
-        return cls(**data)
+        # Filter to known fields so adding a new dataclass field doesn't
+        # require every config file to be updated simultaneously. Unknown
+        # keys would otherwise raise TypeError from cls(**data). Note:
+        # this *does* silently drop typo'd keys — but every field has a
+        # sensible default, so a typo at worst means the default applies.
+        known = {f.name for f in dataclasses.fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in known}
+        dropped = set(data) - known
+        if dropped:
+            from loguru import logger
+            logger.warning(
+                f"ExperimentConfig.from_yaml ignored unknown keys: {sorted(dropped)}"
+            )
+        return cls(**filtered)

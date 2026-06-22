@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.data.schemas import ActionType, Message, Thread
+from src.llm.token_counter import truncate_to_token_budget
 
 
 @dataclass
@@ -55,9 +56,12 @@ Output ONLY the JSON."""
 class Planner:
     """Plans actions considering constraints and platform rules."""
 
-    def __init__(self, llm_client, model_name: str = "gpt-4o"):
+    def __init__(self, llm_client, model_name: str = "gpt-4o", max_memory_tokens: int = 0):
         self.llm = llm_client
         self.model_name = model_name
+        # When > 0, memory_context and thread_state are truncated to fit
+        # within this budget (token-aware). When 0, legacy char-slicing.
+        self.max_memory_tokens = max_memory_tokens
 
     async def plan(
         self,
@@ -84,10 +88,15 @@ class Planner:
         actions_str = ", ".join(a.value for a in available_actions)
 
         # Format recent thread messages — include msg_id so the LLM can
-        # emit target_msg_id for directed replies (outline §6.3 topology)
+        # emit target_msg_id for directed replies (outline §6.3 topology).
+        # Truncate each message text to a per-message budget derived from
+        # max_memory_tokens (Issue 1); falls back to [:200] when no token
+        # budget is configured (legacy).
+        per_msg_budget = max(60, self.max_memory_tokens // 10) if self.max_memory_tokens else 0
         recent = thread.messages[-5:]
         thread_text = "\n".join(
-            f"<msg id={m.msg_id}> [{m.user_id}] ({m.action_type.value}): {m.text[:200]}"
+            f"<msg id={m.msg_id}> [{m.user_id}] ({m.action_type.value}): "
+            f"{truncate_to_token_budget(m.text, per_msg_budget) if per_msg_budget else m.text[:200]}"
             for m in recent
         )
 
@@ -97,7 +106,7 @@ class Planner:
             role_description=role_description or "A community participant",
             available_actions=actions_str,
             thread_state=thread_text,
-            recent_messages=memory_context[:1000],
+            recent_messages=truncate_to_token_budget(memory_context, self.max_memory_tokens) if self.max_memory_tokens else memory_context[:1000],
             reflection_context=reflection_context or "",
             constraints=constraints or "",
         )
@@ -200,9 +209,11 @@ Output ONLY the JSON."""
         """
         actions_str = ", ".join(a.value for a in available_actions)
 
+        per_msg_budget = max(60, self.max_memory_tokens // 10) if self.max_memory_tokens else 0
         recent = thread.messages[-5:]
         thread_text = "\n".join(
-            f"<msg id={m.msg_id}> [{m.user_id}] ({m.action_type.value}): {m.text[:200]}"
+            f"<msg id={m.msg_id}> [{m.user_id}] ({m.action_type.value}): "
+            f"{truncate_to_token_budget(m.text, per_msg_budget) if per_msg_budget else m.text[:200]}"
             for m in recent
         )
 
@@ -210,7 +221,7 @@ Output ONLY the JSON."""
             platform=thread.platform.value,
             topic=thread.topic,
             role_description=role_description or "A community participant",
-            prev_text=prev_text[:500],
+            prev_text=truncate_to_token_budget(prev_text, self.max_memory_tokens) if self.max_memory_tokens else prev_text[:500],
             violation_feedback=violation_feedback,
             constraints=constraints or "",
             action_type=(prev_action_type or available_actions[0]).value,

@@ -10,6 +10,23 @@
 #                   commit or HuggingFace revision hash.
 # Either field may be empty; downstream MetricsReport rows will then
 # carry an empty string instead of fabricated provenance.
+#
+# Token budget (Issue 1) — configurable per model:
+#   max_total_tokens    — hard cap on input + output + thinking combined.
+#                         Set to the model's documented context window.
+#                         0 = no cap enforced (legacy behaviour, guard
+#                         skipped — use only for endpoints whose limit
+#                         you don't know).
+#   max_thinking_tokens — reserved reasoning budget. 0 for non-reasoning
+#                         models (gpt-4o, claude, llama, qwen, glm).
+#                         >0 for reasoning models (DeepSeek-V4 etc.).
+#   max_tokens          — output-only cap (passed to the API as the
+#                         OpenAI ``max_tokens`` kwarg). Historical field,
+#                         kept for back-compat.
+#   Derived: max_input_tokens = max_total_tokens - max_thinking_tokens - max_tokens
+#   The pre-flight guard in LLMClient refuses prompts that would exceed
+#   max_input_tokens. Verify the context-window values against your
+#   actual endpoint / proxy before paper-scale runs.
 models:
   - name: gpt-4o
     model: gpt-4o
@@ -17,6 +34,8 @@ models:
     api_key: ""          # uses CADP_OPENAI_API_KEY env
     temperature: 0.7
     max_tokens: 2048
+    max_total_tokens: 128000      # gpt-4o context window
+    max_thinking_tokens: 0        # non-reasoning model
     cost_per_1k_input: 2.50
     cost_per_1k_output: 10.00
     snapshot_date: ""    # e.g. "2024-08-06" — fill before submission
@@ -28,6 +47,8 @@ models:
     api_key: ""
     temperature: 0.7
     max_tokens: 2048
+    max_total_tokens: 200000      # claude-3.5-sonnet context window
+    max_thinking_tokens: 0        # non-reasoning model
     cost_per_1k_input: 3.00
     cost_per_1k_output: 15.00
     snapshot_date: "2024-10-22"   # encoded in model id
@@ -39,6 +60,11 @@ models:
     api_key: ""
     temperature: 0.7
     max_tokens: 2048
+    # Llama-3-70B native context is 8K; most hosted providers (Together,
+    # Groq, etc.) extend to 128K via RoPE scaling. Adjust to match your
+    # actual endpoint.
+    max_total_tokens: 128000
+    max_thinking_tokens: 0        # non-reasoning model
     cost_per_1k_input: 0.60
     cost_per_1k_output: 0.90
     snapshot_date: ""
@@ -50,6 +76,8 @@ models:
     api_key: ""
     temperature: 0.7
     max_tokens: 2048
+    max_total_tokens: 131072      # Qwen2.5 supports up to 128K context
+    max_thinking_tokens: 0        # non-reasoning model
     cost_per_1k_input: 0.50
     cost_per_1k_output: 1.00
     snapshot_date: ""
@@ -64,6 +92,8 @@ models:
     api_key: ""
     temperature: 0.7
     max_tokens: 2048
+    max_total_tokens: 131072      # Zhipu GLM-4.x supports 128K context
+    max_thinking_tokens: 0        # non-reasoning model
     cost_per_1k_input: 0.50
     cost_per_1k_output: 1.50
     snapshot_date: ""
@@ -75,6 +105,13 @@ models:
   # base_url / api_key left empty → read from CADP_OPENAI_BASE_URL /
   # CADP_OPENAI_API_KEY env vars. Pricing below are estimates; adjust
   # before computing paper cost tables.
+  #
+  # Token budget: DeepSeek-V4 reasoning models enforce a hard 65535-token
+  # cap covering input + output + thinking combined. We split this as
+  # 32K thinking + 8K output + 24K input by default — the input budget
+  # is what AgentMemory / Planner / ReflectionModule truncate to.
+  # Adjust max_thinking_tokens up/down to trade reasoning depth for
+  # prompt size; keep the three fields summing ≤ 65535.
   - name: deepseek-v4-flash
     model: DeepSeek-V4-Flash
     base_url: ""
@@ -82,7 +119,9 @@ models:
     api_type: auto
     supports_json_mode: false
     temperature: 0.7
-    max_tokens: 8192
+    max_tokens: 8192              # output cap (also exposed as max_output_tokens)
+    max_total_tokens: 65535      # input + output + thinking, hard cap
+    max_thinking_tokens: 32768   # reserved reasoning budget
     cost_per_1k_input: 0.10
     cost_per_1k_output: 0.40
     snapshot_date: ""
@@ -95,7 +134,9 @@ models:
     api_type: auto
     supports_json_mode: false
     temperature: 0.7
-    max_tokens: 8192
+    max_tokens: 8192              # output cap
+    max_total_tokens: 65535
+    max_thinking_tokens: 32768
     cost_per_1k_input: 0.55
     cost_per_1k_output: 2.19
     snapshot_date: ""

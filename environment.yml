@@ -32,3 +32,4 @@ dependencies:
     - tenacity>=8.2.0
     - aiohttp>=3.9.0
     - dtw-python>=1.4.0
+    - tiktoken>=0.7.0

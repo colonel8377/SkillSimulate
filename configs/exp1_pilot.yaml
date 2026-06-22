@@ -33,3 +33,7 @@ max_threads: 500
 checkpoint_every: 5
 max_concurrency: 32
 seed: 42
+# Issue 1: memory strategy. "sliding" = token-aware top-K retrieval (default).
+# Leave explicit so the operator sees the knob exists; the R4 collapse
+# stress test (configs/collapse_stress.yaml) sets this to "rolling_summary".
+memory_strategy: sliding

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from src.data.schemas import Message
+from src.llm.token_counter import truncate_to_token_budget
 
 
 REFLECTION_PROMPT = """You are reflecting on your recent interactions in an online community.
@@ -35,10 +36,11 @@ class ReflectionState:
 class ReflectionModule:
     """Manages periodic belief consolidation."""
 
-    def __init__(self, llm_client, model_name: str = "gpt-4o", interval: int = 10):
+    def __init__(self, llm_client, model_name: str = "gpt-4o", interval: int = 10, max_memory_tokens: int = 0):
         self.llm = llm_client
         self.model_name = model_name
         self.interval = interval
+        self.max_memory_tokens = max_memory_tokens
         self.state = ReflectionState()
 
     def should_reflect(self, current_round: int) -> bool:
@@ -65,7 +67,8 @@ class ReflectionModule:
             return self.state
 
         msgs_text = "\n".join(
-            f"[Round {m.metadata.get('round', '?')}]: {m.text[:150]}"
+            f"[Round {m.metadata.get('round', '?')}]: "
+            f"{truncate_to_token_budget(m.text, max(80, self.max_memory_tokens // 20)) if self.max_memory_tokens else m.text[:150]}"
             for m in recent_messages[-10:]
         )
 

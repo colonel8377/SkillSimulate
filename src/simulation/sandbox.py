@@ -111,14 +111,41 @@ class SimulationSandbox:
         for agent in agents:
             agent.platform_topology = self.platform
 
-        # Check for existing checkpoint to resume
+        # Check for existing checkpoint to resume. We consult BOTH the
+        # round-level snapshot (carries agents_state) AND the turn-level
+        # JSONL (carries per-turn messages, the resume-granularity source
+        # of truth — Issue 2). When both exist, the JSONL wins for
+        # ``all_messages`` because it is more recent.
         start_round = 0
         if self.checkpoint:
             latest = self.checkpoint.load(run_id)
             if latest:
                 start_round = latest["round"] + 1
                 all_messages = latest.get("messages_log", [])
-                logger.info(f"Resuming run {run_id} from round {start_round}")
+                logger.info(f"Resuming run {run_id} from round {start_round} (round-level snapshot)")
+            # Turn-level JSONL may have progress beyond the last round
+            # snapshot (up to ``checkpoint_every - 1`` rounds + partial
+            # current round). Prefer it when present.
+            turns = self.checkpoint.load_turns(run_id)
+            if turns:
+                ok_turns = [t for t in turns if t.get("status") == "ok" and t.get("message")]
+                if ok_turns:
+                    jsonl_rounds = {t.get("round", 0) for t in ok_turns}
+                    last_jsonl_round = max(jsonl_rounds)
+                    # Rebuild all_messages from JSONL — it's at least as
+                    # recent as the round snapshot and may be newer.
+                    all_messages = [t["message"] for t in ok_turns]
+                    # Resume from the round AFTER the last fully-attested
+                    # round in the JSONL. The last round may have been
+                    # partial (crash mid-round) — we accept the loss of
+                    # its unfinished turns rather than try to reconstruct
+                    # RNG-dependent thread sampling.
+                    start_round = last_jsonl_round + 1
+                    logger.info(
+                        f"Resuming run {run_id} from round {start_round} "
+                        f"(turn-level JSONL: {len(ok_turns)} ok turns across "
+                        f"rounds {min(jsonl_rounds)}-{last_jsonl_round})"
+                    )
 
         logger.info(
             f"Starting simulation: {run_id} | "
@@ -128,7 +155,7 @@ class SimulationSandbox:
 
         for round_num in range(start_round, num_rounds):
             round_messages, round_violations, round_total = await self._run_round(
-                agents, threads, round_num
+                agents, threads, round_num, run_id=run_id,
             )
 
             all_messages.extend(round_messages)
@@ -181,7 +208,12 @@ class SimulationSandbox:
         )
 
         if self.checkpoint:
-            result_path = self.checkpoint.checkpoint_dir / f"{run_id}_result.json"
+            # Final round-level snapshot. Note: we deliberately do NOT
+            # call ``mark_completed`` here — the result file is written
+            # by the *runner* (ExperimentRunner.run_all) under a different
+            # directory (results_dir, not simulations_dir), and the
+            # COMPLETE marker needs to reference that real file so the
+            # integrity check in ``is_completed`` passes.
             self.checkpoint.save(
                 run_id=run_id,
                 round_num=num_rounds - 1,
@@ -190,7 +222,6 @@ class SimulationSandbox:
                 interaction_graph_data=result.interaction_graph,
                 extra={"enforcement_stats": result.enforcement_stats},
             )
-            self.checkpoint.mark_completed(run_id, result_path)
 
         return result
 
@@ -200,6 +231,7 @@ class SimulationSandbox:
         threads: list[Thread],
         round_num: int,
         agent_engagement_ratio: float = 0.5,
+        run_id: str = "",
     ) -> tuple[list[dict], int, int]:
         """Run a single round of simulation.
 
@@ -209,6 +241,8 @@ class SimulationSandbox:
             round_num: Current round number.
             agent_engagement_ratio: Default engagement ratio, overridden
                 by per-agent ``agent.engagement_ratio`` if set.
+            run_id: Cell identifier — used for turn-level checkpoint
+                appends (Issue 2). Empty string disables checkpointing.
 
         Returns:
             Tuple of (messages, violations, total_checks).
@@ -224,6 +258,9 @@ class SimulationSandbox:
         messages = []
         violations = 0
         total_checks = 0
+        # Per-round turn index — used to record the position of each
+        # successful / failed turn in the JSONL for resume-ordering.
+        turn_idx = 0
 
         for agent in agents:
             # Use per-agent engagement ratio (sampled from real activity distribution)
@@ -265,6 +302,18 @@ class SimulationSandbox:
                         }
                         messages.append(msg_dict)
 
+                        # Issue 2: append a turn record to the JSONL so
+                        # the next resume picks up at this exact turn.
+                        if self.checkpoint is not None and run_id:
+                            self.checkpoint.append_turn(
+                                run_id=run_id,
+                                round_num=round_num,
+                                turn_idx=turn_idx,
+                                agent_id=agent.agent_id,
+                                status="ok",
+                                message=msg_dict,
+                            )
+
                         # Other agents observe this message
                         for other in agents:
                             if other.agent_id != agent.agent_id:
@@ -282,6 +331,20 @@ class SimulationSandbox:
                             f"agent {agent.agent_id}: {e}\n"
                             f"{traceback.format_exc()}"
                         )
+                        # Issue 2: record the failure in the JSONL so the
+                        # next resume knows this turn produced no message
+                        # (avoids silent drops corrupting metrics).
+                        if self.checkpoint is not None and run_id:
+                            self.checkpoint.append_turn(
+                                run_id=run_id,
+                                round_num=round_num,
+                                turn_idx=turn_idx,
+                                agent_id=agent.agent_id,
+                                status="failed",
+                                error=repr(e),
+                            )
+
+                turn_idx += 1
 
         return messages, violations, total_checks
 
