@@ -20,7 +20,7 @@ import asyncio
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
@@ -45,7 +45,13 @@ from tenacity import (
 
 from src.llm.circuit_breaker import get_breaker
 from src.llm.cost_tracker import CostTracker
-from src.llm.exceptions import CircuitBreakerOpen, PromptBudgetExceeded, TransientResponseError
+from src.llm.endpoint_pool import EndpointConfig, EndpointPool, EndpointState
+from src.llm.exceptions import (
+    AllEndpointsExhausted,
+    CircuitBreakerOpen,
+    PromptBudgetExceeded,
+    TransientResponseError,
+)
 from src.llm.json_utils import extract_json
 from src.llm.mock_router import MockLLMRouter
 from src.llm.token_counter import estimate_messages_tokens
@@ -111,6 +117,13 @@ class ModelEndpoint:
     # are kept in sync via __post_init__ so callers can use whichever
     # name reads better at the call site.
     max_output_tokens: int = 0     # 0 = mirror max_tokens in __post_init__
+    # --- Multi-endpoint support ----------------------------------------
+    # When non-empty, the client creates an EndpointPool and round-robins
+    # across these endpoints instead of using the parent base_url/api_key.
+    # Each endpoint may override the model name (e.g. when the same
+    # DeepSeek-V4-Flash is called "deepseek-v4-flash-260425" on one proxy
+    # and "DeepSeek-V4-Flash" on another).
+    endpoints: list[dict[str, str]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Keep max_tokens and max_output_tokens in sync. Whoever was set
@@ -182,8 +195,14 @@ class LLMClient:
     """Async LLM client that routes to OpenAI-compatible endpoints."""
 
     def __init__(self, models_config_path: str = "configs/models.yaml"):
+        # Load .env before reading os.getenv for endpoint vars.
+        # _load_models() calls _load_endpoints_from_env() which needs them.
+        from dotenv import load_dotenv
+        load_dotenv(".env", override=False)
+
         self.models = self._load_models(models_config_path)
         self.clients: dict[str, AsyncOpenAI] = {}
+        self.endpoint_pools: dict[str, EndpointPool] = {}
         self.cost_tracker = CostTracker()
         self._mock_enabled = os.getenv("CADP_MOCK_LLM", "0") == "1"
         if self._mock_enabled:
@@ -207,6 +226,9 @@ class LLMClient:
             config = yaml.safe_load(f)
         endpoints = {}
         for entry in config.get("models", []):
+            # Endpoints are loaded from env, not YAML.
+            # YAML may contain a comment-placeholder ``endpoints:`` key
+            # (parsed as None); we ignore it and always read from env.
             endpoints[entry["name"]] = ModelEndpoint(
                 name=entry["name"],
                 model=entry["model"],
@@ -223,8 +245,64 @@ class LLMClient:
                 max_total_tokens=int(entry.get("max_total_tokens", 0)),
                 max_thinking_tokens=int(entry.get("max_thinking_tokens", 0)),
                 max_output_tokens=int(entry.get("max_output_tokens", entry.get("max_tokens", 0))),
+                endpoints=self._load_endpoints_from_env(entry["name"]),
             )
         return endpoints
+
+    @staticmethod
+    def _load_endpoints_from_env(model_name: str) -> list[dict[str, str]]:
+        """Load endpoint list from environment variable.
+
+        Reads ``CADP_ENDPOINTS_<NAME>`` where ``<NAME>`` is *model_name*
+        uppercased with hyphens replaced by underscores.
+
+        Example for ``deepseek-v4-flash``::
+
+            CADP_ENDPOINTS_DEEPSEEK_V4_FLASH='[
+              {"base_url": "https://api.deepseek.com", "api_key": "sk-xxx", "model": "deepseek-chat"},
+              {"base_url": "https://proxy.example.com/v1", "api_key": "sk-yyy", "model": "deepseek-v4-flash"}
+            ]'
+
+        When the env var is unset or empty, returns an empty list (legacy
+        single-endpoint path).
+        """
+        env_key = f"CADP_ENDPOINTS_{model_name.upper().replace('-', '_')}"
+        raw = os.getenv(env_key, "")
+        if not raw.strip():
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                f"Failed to parse {env_key} as JSON: {exc}. "
+                f"Skipping multi-endpoint for model '{model_name}'."
+            )
+            return []
+        if not isinstance(parsed, list):
+            logger.error(
+                f"{env_key} is not a JSON array. "
+                f"Skipping multi-endpoint for model '{model_name}'."
+            )
+            return []
+        # Validate each entry is a dict
+        result: list[dict[str, str]] = []
+        for i, item in enumerate(parsed):
+            if not isinstance(item, dict):
+                logger.error(
+                    f"{env_key}[{i}] is not a JSON object; skipping entry."
+                )
+                continue
+            result.append({
+                "base_url": str(item.get("base_url", "")),
+                "api_key": str(item.get("api_key", "")),
+                "model": str(item.get("model", "")),
+            })
+        if result:
+            logger.info(
+                f"Loaded {len(result)} endpoint(s) from {env_key} "
+                f"for model '{model_name}'"
+            )
+        return result
 
     def _init_clients(self) -> None:
         # Skip real client init when mock mode is on — saves the caller
@@ -235,8 +313,54 @@ class LLMClient:
         default_key = settings.openai_api_key
         default_url = settings.openai_base_url
         for name, ep in self.models.items():
+            # --- Multi-endpoint path ---
+            if ep.endpoints:
+                pool_states: list[EndpointState] = []
+                for i, ep_cfg in enumerate(ep.endpoints):
+                    api_key = ep_cfg.get("api_key", "") or default_key
+                    raw_url = ep_cfg.get("base_url", "") or default_url
+                    clean_url, detected_type = _normalize_base_url(raw_url)
+                    ep_model = ep_cfg.get("model", "") or ep.model
+                    client = AsyncOpenAI(api_key=api_key, base_url=clean_url)
+                    pool_states.append(EndpointState(
+                        config=EndpointConfig(
+                            base_url=clean_url,
+                            api_key=api_key,
+                            model=ep_model,
+                        ),
+                        client=client,
+                        model=ep_model,
+                        idx=i,
+                    ))
+                failure_threshold = int(os.getenv(
+                    "CADP_ENDPOINT_FAILURE_THRESHOLD", "10"
+                ))
+                pool = EndpointPool(
+                    model_name=name,
+                    endpoints=pool_states,
+                    failure_threshold=failure_threshold,
+                )
+                self.endpoint_pools[name] = pool
+                logger.info(
+                    f"Model '{name}': {len(pool_states)} endpoint(s) pooled "
+                    f"(failure_threshold={failure_threshold})"
+                )
+                for st in pool_states:
+                    logger.info(
+                        f"  endpoint[{st.idx}]: model='{st.model}' "
+                        f"base_url='{st.config.base_url}'"
+                    )
+                continue  # skip legacy single-client init for this model
+            # --- Legacy single-client path ---
             api_key = ep.api_key or default_key
             raw_url = ep.base_url or default_url
+            if not api_key.strip():
+                logger.warning(
+                    f"Model '{name}': no api_key configured (neither "
+                    f"models.yaml nor CADP_OPENAI_API_KEY is set). "
+                    f"Skipping legacy client — calls to this model will fail."
+                )
+                continue
             # Strip endpoint suffixes so the SDK gets a clean root URL.
             clean_url, detected_type = _normalize_base_url(raw_url)
             # Resolve api_type: explicit config > auto-detect from URL.
@@ -265,6 +389,12 @@ class LLMClient:
         failure — this is what makes sustained issues trip the run-all
         halt. Successful calls reset the consecutive-failure counter.
 
+        When the model has an :class:`EndpointPool`, this method round-robins
+        across alive endpoints. An endpoint that exhausts its 5 retries gets
+        a failure recorded on the pool; after 10 consecutive failures the
+        endpoint is marked dead and the next alive endpoint is tried. When
+        all endpoints are dead, :class:`AllEndpointsExhausted` is raised.
+
         Args:
             messages: OpenAI-format messages [{"role": ..., "content": ...}].
             model_name: Key from models.yaml (e.g. "gpt-4o").
@@ -276,6 +406,7 @@ class LLMClient:
 
         Raises:
             CircuitBreakerOpen: breaker has tripped; halts run_all().
+            AllEndpointsExhausted: all endpoints dead for this model.
             PromptBudgetExceeded: prompt exceeds max_input_tokens.
             AuthenticationError / BadRequestError / etc.: non-retryable,
                 propagated after being recorded on the breaker.
@@ -284,6 +415,53 @@ class LLMClient:
                 re-raised.
         """
         await self._breaker.check()
+        pool = self.endpoint_pools.get(model_name)
+
+        # --- Multi-endpoint path ---
+        if pool is not None:
+            last_error: str = ""
+            while True:
+                try:
+                    ep_state = await pool.pick_alive()
+                except AllEndpointsExhausted:
+                    await self._breaker.record_failure(
+                        last_error=f"AllEndpointsExhausted for {model_name}"
+                    )
+                    raise
+
+                try:
+                    content = await self._chat_completion_with_retry(
+                        messages, model_name, temperature, max_tokens,
+                        endpoint_state=ep_state,
+                        **kwargs,
+                    )
+                    await self._breaker.record_success()
+                    pool.record_success(ep_state)
+                    return content
+                except AllEndpointsExhausted:
+                    raise  # re-raised from pick_alive inside retry
+                except CircuitBreakerOpen:
+                    raise
+                except Exception as exc:
+                    pool.record_failure(ep_state, error=str(exc))
+                    last_error = str(exc)
+                    if pool.all_dead:
+                        logger.error(
+                            f"All endpoints dead for model '{model_name}' "
+                            f"after exhausting last endpoint "
+                            f"#{ep_state.idx}: {exc!r}"
+                        )
+                        await self._breaker.record_failure(last_error=last_error)
+                        raise AllEndpointsExhausted(model_name, pool.total_endpoints)
+                    logger.warning(
+                        f"EndpointPool[{model_name}]#{ep_state.idx} failed "
+                        f"({pool.alive_count} alive remaining). "
+                        f"Retrying with next endpoint."
+                    )
+                    # loop to next alive endpoint
+                    continue
+
+        # --- Legacy single-client path ---
         try:
             content = await self._chat_completion_with_retry(
                 messages, model_name, temperature, max_tokens, **kwargs,
@@ -313,18 +491,29 @@ class LLMClient:
         model_name: str,
         temperature: float | None,
         max_tokens: int | None,
+        endpoint_state: EndpointState | None = None,
         **kwargs: Any,
     ) -> str:
         """Inner retryable completion — do not call directly.
 
         Tenacity wraps this method; the public :meth:`chat_completion`
         handles breaker accounting around it.
+
+        When *endpoint_state* is provided, the endpoint's client and
+        model name are used instead of the parent model entry's.
         """
         if self._mock_enabled:
             return self._mock.route(messages, model_name)
 
         ep = self.models[model_name]
-        client = self.clients[model_name]
+        # When routed through an endpoint pool, use the endpoint's
+        # client and per-endpoint model name.
+        if endpoint_state is not None:
+            client = endpoint_state.client
+            effective_model = endpoint_state.model
+        else:
+            client = self.clients[model_name]
+            effective_model = ep.model
         temp = temperature if temperature is not None else ep.temperature
         tokens = max_tokens if max_tokens is not None else ep.max_tokens
 
@@ -359,11 +548,13 @@ class LLMClient:
         # ---- route by api_type ----
         if ep.api_type == "completions":
             response = await self._call_completions(
-                client, ep, messages, temp, tokens, **kwargs,
+                client, ep, messages, temp, tokens,
+                effective_model=effective_model,
+                **kwargs,
             )
         else:
             response = await client.chat.completions.create(
-                model=ep.model,
+                model=effective_model,
                 messages=messages,
                 temperature=temp,
                 max_tokens=tokens,
@@ -386,7 +577,7 @@ class LLMClient:
         # Raising TransientResponseError here triggers the @retry backoff.
         if not response.choices:
             raise TransientResponseError(
-                f"API returned empty choices for model '{ep.model}' "
+                f"API returned empty choices for model '{effective_model}' "
                 f"(response.id={getattr(response, 'id', '?')})"
             )
 
@@ -396,7 +587,7 @@ class LLMClient:
         # Raising TransientResponseError here triggers the @retry backoff.
         if not content or not content.strip():
             raise TransientResponseError(
-                f"API returned empty content for model '{ep.model}' "
+                f"API returned empty content for model '{effective_model}' "
                 f"(response.id={getattr(response, 'id', '?')})"
             )
 
@@ -433,6 +624,7 @@ class LLMClient:
         messages: list[dict[str, str]],
         temp: float,
         tokens: int,
+        effective_model: str = "",
         **kwargs: Any,
     ) -> Any:
         """Call the legacy ``/completions`` endpoint.
@@ -449,8 +641,9 @@ class LLMClient:
         kwargs.pop("tool_choice", None)
         kwargs.pop("thinking_budget", None)
         kwargs.pop("reasoning_effort", None)
+        model_name = effective_model or ep.model
         return await client.completions.create(
-            model=ep.model,
+            model=model_name,
             prompt=prompt,
             temperature=temp,
             max_tokens=tokens,

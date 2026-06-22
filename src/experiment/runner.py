@@ -16,7 +16,7 @@ from src.config.schemas import ExperimentConfig
 from src.config.settings import settings
 from src.llm.circuit_breaker import get_breaker, reset_global_breaker
 from src.llm.client import LLMClient
-from src.llm.exceptions import CircuitBreakerOpen
+from src.llm.exceptions import AllEndpointsExhausted, CircuitBreakerOpen
 from src.simulation.checkpoint import CheckpointManager
 from src.utils.io import save_json
 from src.utils.seed import seed_everything
@@ -172,6 +172,21 @@ class ExperimentRunner:
                     # Trip — write FAILED marker and halt the whole run.
                     self._on_circuit_breaker_trip(cell, exc)
                     raise  # Re-raise so the outer handler runs once and exits.
+                except AllEndpointsExhausted as exc:
+                    # All endpoints dead for this model — no point continuing.
+                    # Write a recoverable FAILED marker so the cell is
+                    # re-attempted when endpoints are restored.
+                    logger.error(
+                        f"All endpoints exhausted on cell {cell.cell_id}: {exc}. "
+                        f"Halt run_all()."
+                    )
+                    self.checkpoint.mark_failed(
+                        cell.cell_id,
+                        reason="all_endpoints_exhausted",
+                        last_error=str(exc),
+                        recoverable=True,
+                    )
+                    raise  # Propagate to outer handler.
                 except Exception as e:
                     # Per-cell failure that did NOT trip the breaker
                     # (e.g. a one-off transient that exhausted its 5
@@ -199,6 +214,14 @@ class ExperimentRunner:
                 "markers, and recoverable FAILED cells are re-attempted."
             )
             sys.exit(2)
+        except AllEndpointsExhausted:
+            # All endpoints for a model are dead — halt the run.
+            logger.error(
+                "All endpoints exhausted — halting run_all(). "
+                "Restore endpoint health, then re-run; "
+                "previously-completed cells are skipped via COMPLETE markers."
+            )
+            sys.exit(3)
 
         # Print cost summary
         costs = self.llm.get_cost_summary()

@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     sip_gpu_id: int = 1                # used when device=auto
     sip_batch_size: int = 64
 
-    model_config = {"env_prefix": "CADP_", "env_file": ".env"}
+    model_config = {"env_prefix": "CADP_", "env_file": ".env", "extra": "ignore"}
 
 
 settings = Settings()

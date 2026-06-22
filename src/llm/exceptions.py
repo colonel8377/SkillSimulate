@@ -63,3 +63,21 @@ class CircuitBreakerOpen(LLMClientError):
             f"Circuit breaker open: {consecutive_failures} consecutive failures "
             f"(threshold={threshold}). Last error: {last_error}"
         )
+
+
+class AllEndpointsExhausted(LLMClientError):
+    """Raised when all endpoints for a model have been marked dead.
+
+    Occurs when every endpoint in an :class:`EndpointPool` has exceeded
+    the consecutive-failure threshold. The runner catches this to write a
+    ``_FAILED.json`` marker and halt — there is no point trying other
+    cells when no endpoint is functional.
+    """
+
+    def __init__(self, model_name: str, dead_count: int):
+        self.model_name = model_name
+        self.dead_count = dead_count
+        super().__init__(
+            f"All {dead_count} endpoints exhausted for model '{model_name}'. "
+            f"Manual intervention required — check keys, quotas, and endpoint health."
+        )
