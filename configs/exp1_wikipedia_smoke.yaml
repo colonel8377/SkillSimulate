@@ -1,0 +1,38 @@
+# Single-dataset smoke test — Wikipedia only
+# 13 conditions × 1 dataset × 5 repeats = 65 cells (vs 195 full)
+# 预估: ~1-2小时, ~$15-30
+name: exp1_wikipedia_smoke
+datasets: [wikipedia]
+models: [deepseek-v4-flash]
+compile_model: deepseek-v4-pro
+conditions:
+  - vanilla
+  - descriptive
+  - segmentation
+  - pop_aligned
+  - colleague_skill
+  - clustering_only
+  - cadp_full
+  - cadp_shuffled
+  - cadp_minus_edna
+  - cadp_minus_mm
+  - cadp_minus_ap
+  - cadp_constraint_only
+  - pop_aligned_cadp
+num_repeats: 1
+num_rounds: 50
+population_size: 30
+alpha: 1.0
+alpha_tier1: 1.0
+alpha_tier2: 1.0
+alpha_tier3: 1.0
+num_clusters: 4
+cluster_method: kmeans
+top_n_threads: 20
+checkpoint_every: 5
+max_threads: 2000
+max_concurrency: 16
+seed: 42
+max_context_items: 12
+max_thread_messages: 10
+memory_strategy: sliding

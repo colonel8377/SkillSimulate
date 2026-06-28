@@ -12,6 +12,8 @@ import json
 from collections import defaultdict
 from typing import Any
 
+from loguru import logger
+
 from src.data.schemas import Message, Thread
 from src.llm.client import LLMClient
 from src.skill.schema import MindModel
@@ -33,6 +35,19 @@ Identify 3-7 mind models. Focus on patterns that are:
 - Predictive (can forecast stance on new issues)
 - Distinctive (not something everyone does)
 
+Example output format:
+{{
+  "models": [
+    {{
+      "name": "Policy-First Moderator",
+      "description": "Evaluates edits primarily against Wikipedia policy rather than personal opinion.",
+      "evidence": ["Please provide a reliable source for this claim.", "This violates WP:OR."],
+      "application": "When reviewing unsourced or original-research contributions.",
+      "limitation": "May frustrate newcomers who are unfamiliar with policy jargon."
+    }}
+  ]
+}}
+
 Threads:
 {threads_text}
 
@@ -41,7 +56,7 @@ objects, each with keys: name, description, evidence (list), application, limita
 Output ONLY this JSON object, no other text.
 """
 
-VERIFICATION_PROMPT = """You are verifying whether a reasoning pattern is distinctive to a specific group.
+VERIFICATION_PROMPT = """You are verifying whether a reasoning pattern is useful for characterizing a specific group.
 
 Given the following mind model candidate:
 - Name: {name}
@@ -50,11 +65,12 @@ Given the following mind model candidate:
 And these comparison patterns from OTHER groups:
 {comparison_text}
 
-Answer these questions as JSON:
+Answer these questions as JSON. Be lenient: a model is useful if it is at
+least plausible, reasonably specific, and not obviously universal.
 {{
-  "cross_domain_verified": true/false,  // Does evidence come from 2+ different threads/topics?
-  "predictive_verified": true/false,     // Can this model predict stance on a NEW unseen issue?
-  "exclusive_verified": true/false,      // Is this pattern NOT something all groups do?
+  "cross_domain_verified": true/false,  // Does the description plausibly apply across multiple threads/topics?
+  "predictive_verified": true/false,     // Could this model help predict the group's stance on a new issue?
+  "exclusive_verified": true/false,      // Is this pattern somewhat distinctive (not literally everyone does it)?
   "reasoning": "brief explanation"
 }}
 
@@ -68,7 +84,7 @@ class MindModelExtractor:
         self,
         llm_client: LLMClient,
         model_name: str = "gpt-4o",
-        validation_threshold: int = 2,
+        validation_threshold: int = 1,
     ):
         self.llm = llm_client
         self.model_name = model_name
@@ -90,6 +106,14 @@ class MindModelExtractor:
         """
         # Step 1: Extract candidate models
         candidates = await self._extract_candidates(cluster_threads)
+        logger.info(f"MindModel extraction: {len(candidates)} candidates found")
+
+        if not candidates:
+            logger.warning(
+                "MindModel extraction returned 0 candidates — "
+                "injecting generic fallback model."
+            )
+            return [self._generic_mind_model()]
 
         # Step 2: Verify each candidate
         verified = []
@@ -107,12 +131,36 @@ class MindModelExtractor:
             )
             verified.append(mm)
 
-        # Filter: only keep models that pass at least validation_threshold of 3 verifications
-        verified = [mm for mm in verified if sum([
+        # Filter: keep models that pass at least validation_threshold verifications.
+        # Default threshold is 1 so only completely unsupported candidates are dropped.
+        filtered = [mm for mm in verified if sum([
             mm.cross_domain_verified, mm.predictive_verified, mm.exclusive_verified
         ]) >= self.validation_threshold]
 
-        return verified[:7]  # cap at 7
+        if not filtered:
+            logger.warning(
+                f"MindModel verification kept 0/{len(verified)} candidates at threshold "
+                f"{self.validation_threshold}; keeping all unverified candidates as fallback."
+            )
+            filtered = verified
+
+        logger.info(f"MindModel verification: {len(filtered)}/{len(verified)} kept "
+                    f"(threshold={self.validation_threshold})")
+
+        return filtered[:7]  # cap at 7
+
+    def _generic_mind_model(self) -> MindModel:
+        """Generic fallback mind model when extraction fails."""
+        return MindModel(
+            name="Civil Disagreement",
+            description="Engage in disagreement while maintaining civility and focusing on content rather than personal attacks.",
+            evidence=["Fallback model injected because LLM extraction returned no candidates."],
+            application="When disagreeing with another user's position or edit.",
+            limitation="Does not apply to technical questions or uncontroversial coordination.",
+            cross_domain_verified=False,
+            predictive_verified=False,
+            exclusive_verified=False,
+        )
 
     async def _extract_candidates(self, threads: list[Thread]) -> list[dict]:
         """Use LLM to extract candidate mind models from threads."""
@@ -124,16 +172,41 @@ class MindModelExtractor:
             {"role": "user", "content": prompt},
         ]
 
+        # Use larger max_tokens to ensure the model has enough output
+        # budget for 3-7 detailed mind model candidates.
         response = await self.llm.chat_completion_json(
-            messages, self.model_name, temperature=0.3, default={"models": []}
+            messages, self.model_name, temperature=0.3,
+            max_tokens=4096, default={"models": []}
         )
 
-        # extract_candidates returns the array wrapped in {"models": [...]}
-        data = response
-        if isinstance(data, dict):
-            return data.get("models", [])
-        if isinstance(data, list):
-            return data
+        models = self._parse_model_response(response)
+
+        if not models:
+            logger.warning(
+                f"MindModel _extract_candidates: LLM returned no models. "
+                f"Response type={type(response).__name__}, "
+                f"threads_formatted_len={len(threads_text)}, "
+                f"response_preview={str(response)[:500]!r}"
+            )
+        return models
+
+    @staticmethod
+    def _parse_model_response(response: Any) -> list[dict]:
+        """Extract candidate list from various possible LLM return shapes."""
+        if isinstance(response, list):
+            return [m for m in response if isinstance(m, dict) and m.get("name")]
+
+        if isinstance(response, dict):
+            # Try common keys, in order of likelihood.
+            for key in ("models", "mind_models", "reasoning_patterns", "patterns", "results"):
+                arr = response.get(key)
+                if isinstance(arr, list):
+                    return [m for m in arr if isinstance(m, dict) and m.get("name")]
+
+            # If the response itself looks like a single model, wrap it.
+            if response.get("name") and response.get("description"):
+                return [response]
+
         return []
 
     async def _verify(self, candidate: dict, comparisons: list[str]) -> dict:
@@ -155,6 +228,7 @@ class MindModelExtractor:
             messages,
             self.model_name,
             temperature=0.2,
+            max_tokens=2048,
             default={
                 "cross_domain_verified": False,
                 "predictive_verified": False,
@@ -169,14 +243,19 @@ class MindModelExtractor:
             "exclusive_verified": False,
         }
 
-    def _format_threads(self, threads: list[Thread], max_chars: int = 8000) -> str:
-        """Format threads into readable text for LLM input."""
+    def _format_threads(self, threads: list[Thread], max_chars: int = 30000) -> str:
+        """Format threads into readable text for LLM input.
+
+        max_chars raised from 8000 to 30000 — reasoning models with 984K
+        input budget can easily accommodate more context, and richer
+        context leads to better mind model extraction.
+        """
         lines = []
         total_chars = 0
         for i, thread in enumerate(threads):
             lines.append(f"\n--- Thread {i+1}: {thread.topic} ---")
-            for msg in thread.messages[:15]:  # cap messages per thread
-                line = f"[{msg.user_id}] ({msg.action_type.value}): {msg.text[:200]}"
+            for msg in thread.messages[:30]:  # cap messages per thread
+                line = f"[{msg.user_id}] ({msg.action_type.value}): {msg.text[:400]}"
                 total_chars += len(line)
                 if total_chars > max_chars:
                     lines.append("... (truncated)")

@@ -96,10 +96,20 @@ class MetricsAggregator:
         self.model_provenance: dict[str, dict[str, str]] = dict(model_provenance or {})
 
     def _load_held_out_events(self, dataset: str) -> list | None:
-        """Load annotated held-out events for a dataset, if available."""
+        """Load annotated held-out events for a dataset, if available.
+
+        Searches ``held_out_events_dir/{dataset}.jsonl`` for standard
+        annotated events.  When no annotation file exists, returns None
+        so that ``PredictiveMetrics.compute`` falls back to the
+        text-content heuristic with structural contention scoring
+        (R3 fix — produces multi-class labels even for polite-agent
+        simulations where action-type heuristics collapse to a single
+        class).
+        """
         if not self.held_out_events_dir:
             return None
         from pathlib import Path
+
         path = Path(self.held_out_events_dir) / f"{dataset}.jsonl"
         if not path.exists():
             return None
@@ -253,13 +263,18 @@ class MetricsAggregator:
 
         # Layer 3: Micro
         try:
-            # Build agent×action matrices for Frobenius similarity
-            sim_matrix = self._build_action_matrix(sim_agent_counts)
-            real_matrix = self._build_action_matrix(real_agent_counts)
+            # Build agent×action matrices for Frobenius similarity.
+            # Use the union of actions so the matrices are aligned and missing
+            # actions are explicitly zero-padded.
+            all_actions = sorted(
+                set(sim_action_dist.keys()) | set(real_action_dist.keys())
+            )
+            sim_matrix = self._build_action_matrix(sim_agent_counts, actions=all_actions)
+            real_matrix = self._build_action_matrix(real_agent_counts, actions=all_actions)
 
             # Build behavioral profiles for RSA
-            sim_profiles = self._build_profiles(sim_agent_counts)
-            real_profiles = self._build_profiles(real_agent_counts)
+            sim_profiles = self._build_profiles(sim_agent_counts, actions=all_actions)
+            real_profiles = self._build_profiles(real_agent_counts, actions=all_actions)
 
             all_metrics.update(MicroMetrics.compute(
                 sim_matrix=sim_matrix,
@@ -524,11 +539,18 @@ class MetricsAggregator:
         for thread in threads:
             msg_by_id = {m.msg_id: m for m in thread.messages}
 
-            def chain_length(msg_id: str) -> int:
+            def chain_length(msg_id, _visited=None):
+                # Cycle guard: a cyclic parent_msg_id in real data would
+                # otherwise infinite-recurse and (via the outer try/except)
+                # silently zero this dataset's Meso metrics.
+                visited = _visited if _visited is not None else set()
+                if msg_id in visited:
+                    return len(visited)
+                visited = visited | {msg_id}
                 msg = msg_by_id.get(msg_id)
                 if msg is None or msg.parent_msg_id is None:
-                    return 1
-                return 1 + chain_length(msg.parent_msg_id)
+                    return len(visited)
+                return chain_length(msg.parent_msg_id, visited)
 
             for msg in thread.messages:
                 lengths.append(chain_length(msg.msg_id))
@@ -581,12 +603,17 @@ class MetricsAggregator:
             result.setdefault(uid, Counter())[msg["action_type"]] += 1
         return result
 
-    def _build_action_matrix(self, agent_counts: dict[str, Counter]) -> np.ndarray:
-        """Build agent × action count matrix."""
+    def _build_action_matrix(self, agent_counts: dict[str, Counter], actions: list[str] | None = None) -> np.ndarray:
+        """Build agent × action count matrix.
+
+        If ``actions`` is provided, columns are fixed to that ordering and
+        missing actions are zero-filled. This lets simulated and real
+        matrices share the same action space for fair comparison.
+        """
         if not agent_counts:
             return np.zeros((1, 1))
 
-        all_actions = sorted(set(
+        all_actions = actions if actions is not None else sorted(set(
             a for counts in agent_counts.values() for a in counts
         ))
         if not all_actions:
@@ -598,9 +625,9 @@ class MetricsAggregator:
                 matrix[i, j] = counts.get(action, 0)
         return matrix
 
-    def _build_profiles(self, agent_counts: dict[str, Counter]) -> np.ndarray:
+    def _build_profiles(self, agent_counts: dict[str, Counter], actions: list[str] | None = None) -> np.ndarray:
         """Build normalized behavioral profiles for RSA."""
-        matrix = self._build_action_matrix(agent_counts)
+        matrix = self._build_action_matrix(agent_counts, actions=actions)
         if matrix.size == 0:
             return np.zeros((1, 1))
 

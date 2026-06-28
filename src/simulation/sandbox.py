@@ -255,27 +255,52 @@ class SimulationSandbox:
         # is safe across the semaphore-gated agent turns.
         rng = self._run_rng
         semaphore = asyncio.Semaphore(self.max_concurrency)
-        messages = []
-        violations = 0
-        total_checks = 0
-        # Per-round turn index — used to record the position of each
-        # successful / failed turn in the JSONL for resume-ordering.
-        turn_idx = 0
 
+        # Phase 1 (sequential — preserves seeded-RNG reproducibility):
+        # decide which threads each agent engages this round, in agent order.
+        # The RNG is consumed ONLY here, never inside the concurrent agent
+        # coroutines below, so identical seeds reproduce identical
+        # thread-engagement decisions. The *designed* randomness (who engages
+        # what) stays deterministic; only execution *interleaving* (a
+        # non-designed variable) becomes concurrent in Phase 2.
+        agent_plan = []
+        turn_idx = 0
         for agent in agents:
-            # Use per-agent engagement ratio (sampled from real activity distribution)
             ratio = getattr(agent, "engagement_ratio", agent_engagement_ratio)
             n_threads_for_agent = max(1, int(len(threads) * ratio))
+            if len(threads) > n_threads_for_agent:
+                agent_threads = rng.sample(
+                    threads, min(n_threads_for_agent, len(threads))
+                )
+            else:
+                agent_threads = list(threads)
+            agent_plan.append((agent, agent_threads, turn_idx))
+            turn_idx += len(agent_threads)
 
-            # Sample which threads this agent engages with this round
-            agent_threads = rng.sample(
-                threads, min(n_threads_for_agent, len(threads))
-            ) if len(threads) > n_threads_for_agent else threads
-
+        # Phase 2 (concurrent): one coroutine per agent, gathered. Each agent
+        # runs its OWN threads sequentially → no two concurrent turns for the
+        # same agent (avoids racing its memory / state). Different agents run
+        # concurrently, gated per-turn by ``semaphore``. Cross-agent shared
+        # state (thread.add_message, other.observe, list appends) is mutated
+        # only via synchronous ops between awaits — atomic in the
+        # single-threaded event loop — so concurrent turns are safe; only
+        # their interleaving order is non-deterministic (acceptable: real
+        # interaction is concurrent, and the aggregate metrics are computed
+        # from the parent_msg_id graph / message corpus, which are
+        # order-independent). asyncio.gather returns results in submission
+        # (agent) order, so the merged ``messages`` list stays agent-major,
+        # matching the legacy serial loop's ordering.
+        async def _run_agent_turns(agent, agent_threads, base_turn_idx):
+            local_messages = []
+            local_violations = 0
+            local_total = 0
+            turn_idx = base_turn_idx
             for thread in agent_threads:
                 async with semaphore:
                     try:
-                        available = self.platform.get_valid_actions(thread, agent.agent_id)
+                        available = self.platform.get_valid_actions(
+                            thread, agent.agent_id
+                        )
                         if not available:
                             continue
 
@@ -300,7 +325,7 @@ class SimulationSandbox:
                             "parent_msg_id": msg.parent_msg_id,
                             "metadata": dict(msg.metadata) if msg.metadata else {},
                         }
-                        messages.append(msg_dict)
+                        local_messages.append(msg_dict)
 
                         # Issue 2: append a turn record to the JSONL so
                         # the next resume picks up at this exact turn.
@@ -321,8 +346,8 @@ class SimulationSandbox:
 
                         # Track enforcement
                         if enf_log:
-                            total_checks += enf_log.total_violations + 1
-                            violations += enf_log.total_violations
+                            local_total += enf_log.total_violations + 1
+                            local_violations += enf_log.total_violations
 
                     except Exception as e:
                         import traceback
@@ -343,8 +368,20 @@ class SimulationSandbox:
                                 status="failed",
                                 error=repr(e),
                             )
-
                 turn_idx += 1
+            return local_messages, local_violations, local_total
+
+        results = await asyncio.gather(
+            *[_run_agent_turns(a, t, i) for a, t, i in agent_plan]
+        )
+
+        messages = []
+        violations = 0
+        total_checks = 0
+        for local_messages, local_violations, local_total in results:
+            messages.extend(local_messages)
+            violations += local_violations
+            total_checks += local_total
 
         return messages, violations, total_checks
 

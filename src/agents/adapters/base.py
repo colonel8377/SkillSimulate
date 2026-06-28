@@ -78,11 +78,8 @@ class BaseCADPAdapter(SkillAdapter):
             if show_expression_dna:
                 edna = self.skill.capability.expression_dna
                 desc += "Your communication style:\n"
-                desc += f"- Average sentence length: {edna.avg_sentence_length:.1f} words\n"
-                desc += f"- Formal/casual: {edna.style_formal_casual:.2f}\n"
-                desc += f"- Cautious/assertive: {edna.style_cautious_assertive:.2f}\n"
-                if edna.high_freq_words:
-                    desc += f"- Frequently uses: {', '.join(edna.high_freq_words[:10])}\n"
+                for line in self._qualitative_expression_dna(edna):
+                    desc += f"{line}\n"
                 desc += "\n"
 
             if show_mind_models and self.skill.capability.mind_models:
@@ -92,6 +89,60 @@ class BaseCADPAdapter(SkillAdapter):
                     desc += f"  Apply when: {mm.application}\n"
 
         return desc
+
+    @staticmethod
+    def _qualitative_expression_dna(edna) -> list[str]:
+        """Render Expression DNA scalars as qualitative descriptors an LLM can
+        operationalize, plus a concrete style exemplar (outline §4.3 capability
+        track). LLMs inhabit qualitative voice tags far better than raw 0–1
+        scalars; the numeric value is kept in parentheses for traceability and
+        for the §5.8 dissociation analysis. The *hard* style guarantee remains
+        the Tier-1 post-generation embedding filter (§4.4) — this only improves
+        conditioning. Not an anti-circularity risk: outline §5.3 evaluates
+        Linguistics on an orthogonal feature space (discourse markers /
+        sentiment trajectory / speech acts).
+        """
+        def _pole(val: float, low: str, high: str) -> str:
+            if val <= 0.33:
+                return low
+            if val >= 0.67:
+                return high
+            return f"a blend of {low} and {high}"
+
+        lines: list[str] = []
+
+        sents = edna.avg_sentence_length
+        if sents:
+            if sents <= 12:
+                length_word = "short, punchy"
+            elif sents >= 22:
+                length_word = "long, developed"
+            else:
+                length_word = "medium-length"
+            lines.append(f"- Sentence length: {length_word} (avg {sents:.0f} words)")
+
+        lines.append(
+            f"- Register: {_pole(edna.style_formal_casual, 'formal', 'casual')} "
+            f"(formal↔casual {edna.style_formal_casual:.2f})"
+        )
+        lines.append(
+            f"- Stance: {_pole(edna.style_cautious_assertive, 'cautious', 'assertive')} "
+            f"(cautious↔assertive {edna.style_cautious_assertive:.2f})"
+        )
+
+        if edna.high_freq_words:
+            lines.append(f"- Characteristic vocabulary: {', '.join(edna.high_freq_words[:10])}")
+
+        # Concrete exemplar synthesised from the style poles — gives the model
+        # a target voice to inhabit during generation. Phrased without a leading
+        # article so both single-pole ("formal") and blend ("a blend of …")
+        # descriptors read cleanly.
+        fc = _pole(edna.style_formal_casual, "formal", "casual")
+        ca = _pole(edna.style_cautious_assertive, "cautious", "assertive")
+        lines.append(
+            f"- Example voice: aim for {fc}, {ca} phrasing, using the vocabulary above."
+        )
+        return lines
 
     def build_constraint_text(self, show_anti_patterns: bool = True) -> str:
         """Build constraint text from skill's constraint track."""

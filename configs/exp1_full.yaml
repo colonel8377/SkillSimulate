@@ -39,6 +39,13 @@ checkpoint_every: 5
 max_threads: 2000
 max_concurrency: 32
 seed: 42
+# Long-horizon context budget (B3). The defaults (max_context_items=5,
+# max_thread_messages=5) throttle every agent's view of the conversation
+# and are tiny vs deepseek-v4-flash's ~984K input budget. Raising both is
+# applied to ALL conditions → neutral for the CADP-vs-baseline ranking
+# (fair), but improves long-horizon signal retention and metric stability.
+max_context_items: 12
+max_thread_messages: 10
 # Issue 1: token-aware sliding window (default). 50 rounds provides
 # enough headroom for persona collapse to fully develop in baselines
 # (outline §5.6.7). Switching to "rolling_summary" would add ~230K

@@ -16,6 +16,11 @@ def action_matrix_similarity(
 ) -> float:
     """Frobenius norm similarity between agent×action matrices.
 
+    Aligns row counts by sampling/padding and pads columns to the union of
+    actions. Normalization uses the sum of both norms, guaranteeing a score
+    in [0, 1] and avoiding the negative values produced by the old
+    truncation-to-min-size logic.
+
     Args:
         sim_matrix: Simulated agent × action count matrix.
         real_matrix: Real agent × action count matrix.
@@ -23,15 +28,39 @@ def action_matrix_similarity(
     Returns:
         Similarity in [0, 1]. 1 = identical, 0 = maximally different.
     """
+    if sim_matrix.size == 0 or real_matrix.size == 0:
+        return 0.0
+
+    n_sim, m_sim = sim_matrix.shape
+    n_real, m_real = real_matrix.shape
+
+    # Pad columns to the union action set. The matrices are built from the
+    # same sorted action list, so right-padding zeros preserves alignment.
+    max_cols = max(m_sim, m_real)
+    if m_sim < max_cols:
+        sim_matrix = np.pad(sim_matrix, ((0, 0), (0, max_cols - m_sim)))
+    if m_real < max_cols:
+        real_matrix = np.pad(real_matrix, ((0, 0), (0, max_cols - m_real)))
+
+    # Align row counts deterministically. Prefer sampling real rows down to
+    # the simulated population size; if the real matrix is smaller, pad it.
+    target_rows = max(n_sim, n_real)
+    if n_real > n_sim:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(n_real, size=n_sim, replace=False)
+        real_matrix = real_matrix[idx]
+    elif n_real < n_sim:
+        real_matrix = np.pad(real_matrix, ((0, n_sim - n_real), (0, 0)))
+
     if sim_matrix.shape != real_matrix.shape:
-        # Resize to match
+        # Defensive fallback: truncate to common shape if padding failed.
         min_rows = min(sim_matrix.shape[0], real_matrix.shape[0])
         min_cols = min(sim_matrix.shape[1], real_matrix.shape[1])
         sim_matrix = sim_matrix[:min_rows, :min_cols]
         real_matrix = real_matrix[:min_rows, :min_cols]
 
     frob = np.linalg.norm(sim_matrix - real_matrix)
-    max_possible = np.linalg.norm(real_matrix) + 1e-10
+    max_possible = np.linalg.norm(sim_matrix) + np.linalg.norm(real_matrix) + 1e-10
     return float(1.0 - frob / max_possible)
 
 

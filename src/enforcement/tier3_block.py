@@ -165,7 +165,9 @@ class Tier3AntiPatternBlock(EnforcementStrategy):
         if not violations:
             return EnforcementResult(passed=True, tier="tier3", original_text=text)
 
-        violation_descs = "; ".join(v["description"] for v in violations)
+        violation_descs = "; ".join(
+            f"{v['description']} (triggered by: {v['triggered_by']})" for v in violations
+        )
         return EnforcementResult(
             passed=False,
             tier="tier3",
@@ -204,14 +206,29 @@ class Tier3AntiPatternBlock(EnforcementStrategy):
 
             # Category A: Lexical (regex + keyword)
             for pattern in ap.trigger_regex:
-                if re.search(pattern, text_lower, re.IGNORECASE):
+                # Patterns containing "[A-Z]" are deliberately CASE-SENSITIVE
+                # (e.g. ALL-CAPS / shouting detection) and must run against the
+                # ORIGINAL text. Applying them to lowercased text with
+                # re.IGNORECASE makes "[A-Z]" match lowercase letters too,
+                # false-firing on virtually every message (this was the dominant
+                # driver of the inflated safe-template rate).
+                if "[A-Z]" in pattern:
+                    hit = re.search(pattern, text)
+                else:
+                    hit = re.search(pattern, text_lower, re.IGNORECASE)
+                if hit:
                     triggered = True
                     triggered_by = f"lexical/regex: {pattern}"
                     break
 
             if not triggered:
                 for kw in ap.trigger_keywords:
-                    if kw.lower() in text_lower:
+                    # Word-boundary match: a bare substring check would flag
+                    # "edit" inside "edited"/"edition"/"credit", "report"
+                    # inside "reported", "agree" inside "disagree", etc.
+                    # (outline §4.4.1 Category A targets the lexical item,
+                    # not an arbitrary infix).
+                    if re.search(r"\b" + re.escape(kw) + r"\b", text_lower):
                         triggered = True
                         triggered_by = f"lexical/keyword: {kw}"
                         break

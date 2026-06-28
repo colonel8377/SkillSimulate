@@ -76,7 +76,7 @@ class Tier1ExpressionFilter(EnforcementStrategy):
         alpha: float = 1.0,
         llm_client: LLMClient | None = None,
         model_name: str = "gpt-4o",
-        max_retries: int = 3,
+        max_retries: int = 1,
         sigma_threshold: float = 2.0,
         dimension_aware: bool = True,
         rng: random.Random | None = None,
@@ -164,7 +164,19 @@ class Tier1ExpressionFilter(EnforcementStrategy):
         )
 
         centroid = np.array(edna.embedding_centroid)
-        std = np.array(edna.embedding_std) if edna.embedding_std else np.ones_like(centroid)
+        if edna.embedding_std:
+            std = np.array(edna.embedding_std)
+        else:
+            # Tier-1 z-score filter degrades to raw embedding delta (std=1)
+            # when the skill lacks per-dim std. Log loudly so a skill-
+            # compilation regression cannot silently turn this filter into a
+            # near-no-op.
+            logger.warning(
+                "ExpressionDNA.embedding_std is missing for this skill — "
+                "Tier-1 z-score filter degrading to raw embedding delta "
+                "(std=1). Recompile the skill to populate embedding_std."
+            )
+            std = np.ones_like(centroid)
 
         # Compute z-score distance (cosine distance from centroid, normalized)
         diff = text_embedding - centroid

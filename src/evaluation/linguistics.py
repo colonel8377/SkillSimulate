@@ -102,24 +102,45 @@ def discourse_marker_match(
     sim_messages: list[Message],
     real_messages: list[Message],
 ) -> float:
-    """KL-divergence similarity of discourse marker distributions.
+    """Jensen-Shannon similarity of discourse-marker *composition*.
 
-    Returns score in [0, 1]. 1 = perfect match.
+    Both sets' per-category marker rates are normalised over the
+    discourse-marker categories into proper probability distributions, then
+    JS-divergence = 0.5·KL(P‖M) + 0.5·KL(Q‖M) (M = (P+Q)/2) is computed by
+    SUMMING the per-category contributions. The previous implementation
+    averaged half-contributions over un-normalised rates — neither standard
+    JS nor scale-comparable — which compressed absolute scores toward 1.
+
+    Returns score in [0, 1]. 1 = identical marker-type composition; 0.0 only
+    when exactly one side has no discourse markers at all.
     """
     sim_dist = discourse_marker_distribution(sim_messages)
     real_dist = discourse_marker_distribution(real_messages)
+    cats = list(DISCOURSE_MARKERS.keys())
 
-    kls = []
-    for cat in DISCOURSE_MARKERS:
-        p = max(sim_dist.get(cat, 0.0), 1e-6)
-        q = max(real_dist.get(cat, 0.0), 1e-6)
-        m = 0.5 * (p + q)
-        kl_pq = 0.5 * (p * np.log(p / m + 1e-10))
-        kl_qp = 0.5 * (q * np.log(q / m + 1e-10))
-        kls.append(kl_pq + kl_qp)
+    p = np.array([sim_dist.get(c, 0.0) for c in cats], dtype=float)
+    q = np.array([real_dist.get(c, 0.0) for c in cats], dtype=float)
+    p_sum = float(p.sum())
+    q_sum = float(q.sum())
 
-    avg_kl = float(np.mean(kls)) if kls else 1.0
-    return float(1.0 / (1.0 + avg_kl))
+    # Both marker-free → compositions trivially identical.
+    if p_sum <= 0.0 and q_sum <= 0.0:
+        return 1.0
+    # One marker-free, the other not → no compositional overlap.
+    if p_sum <= 0.0 or q_sum <= 0.0:
+        return 0.0
+
+    p = p / p_sum
+    q = q / q_sum
+    m = 0.5 * (p + q)
+
+    def _kl(a, b):
+        mask = a > 0.0
+        return float(np.sum(a[mask] * np.log(a[mask] / b[mask])))
+
+    js = 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
+    js = max(js, 0.0)  # guard tiny-negative float error
+    return float(1.0 / (1.0 + js))
 
 
 def _per_message_sentiment(text: str) -> float:

@@ -90,7 +90,43 @@ class AntiPatternDetector:
 
         # Merge and deduplicate
         all_patterns = gap_patterns + llm_patterns
-        return self._deduplicate(all_patterns)
+        unique = self._deduplicate(all_patterns)
+
+        # Fallback: every cluster should have at least one basic anti-pattern
+        # so the constraint track is not empty and Tier-3 has something to enforce.
+        if not unique:
+            logger.warning(
+                "AntiPattern detection produced zero patterns; injecting a generic "
+                "civility anti-pattern as fallback."
+            )
+            unique = [self._generic_civility_pattern()]
+
+        return unique
+
+    def _generic_civility_pattern(self) -> AntiPattern:
+        """Generic fallback anti-pattern: no personal attacks or harassment."""
+        return AntiPattern(
+            description="Avoid personal attacks, insults, or harassment toward other users.",
+            trigger_conditions=[
+                "When responding to a user you disagree with",
+                "When frustrated by another user's actions",
+            ],
+            trigger_keywords=[
+                "idiot", "stupid", "moron", "loser", "jerk", "asshole",
+                "damn you", "shut up", "fuck", "shit", "bitch",
+            ],
+            trigger_regex=[
+                r"\b(you\s+(are|re)\s+)?(stupid|idiot|moron|loser)\b",
+                r"\b(shut\s+up|get\s+lost)\b",
+            ],
+            trigger_semantic_phrases=[
+                "you are an idiot",
+                "personal insult",
+                "hostile attack",
+            ],
+            trigger_action_patterns=[],
+            reason="Basic civility baseline that applies to every community participant.",
+        )
 
     def _quantitative_gap_analysis(
         self,
@@ -163,11 +199,13 @@ class AntiPatternDetector:
         )
 
         # _llm_detect returns the array wrapped in {"patterns": [...]}
-        data = response
-        if isinstance(data, dict):
-            data = data.get("patterns", [])
-        if not isinstance(data, list):
-            return []
+        items = self._parse_pattern_response(response)
+        if not items:
+            logger.warning(
+                f"AntiPattern _llm_detect returned no patterns. "
+                f"Response type={type(response).__name__}, "
+                f"preview={str(response)[:500]!r}"
+            )
 
         return [
             AntiPattern(
@@ -179,17 +217,39 @@ class AntiPatternDetector:
                 trigger_action_patterns=item.get("trigger_action_patterns", []) or [],
                 reason=item.get("reason", ""),
             )
-            for item in data
+            for item in items
         ]
 
-    def _format_threads(self, threads: list[Thread], max_chars: int = 6000) -> str:
-        """Format threads for LLM input."""
+    @staticmethod
+    def _parse_pattern_response(response: Any) -> list[dict]:
+        """Extract pattern list from various possible LLM return shapes."""
+        if isinstance(response, list):
+            return [p for p in response if isinstance(p, dict) and p.get("description")]
+
+        if isinstance(response, dict):
+            for key in ("patterns", "anti_patterns", "results"):
+                arr = response.get(key)
+                if isinstance(arr, list):
+                    return [p for p in arr if isinstance(p, dict) and p.get("description")]
+
+            if response.get("description"):
+                return [response]
+
+        return []
+
+    def _format_threads(self, threads: list[Thread], max_chars: int = 20000) -> str:
+        """Format threads for LLM input.
+
+        max_chars raised from 6000 to 20000 — reasoning models with 984K
+        input budget can accommodate more context for richer anti-pattern
+        detection.
+        """
         lines = []
         total = 0
         for i, thread in enumerate(threads):
             lines.append(f"\n--- Thread {i+1}: {thread.topic} ---")
-            for msg in thread.messages[:10]:
-                line = f"[{msg.user_id}] ({msg.action_type.value}): {msg.text[:150]}"
+            for msg in thread.messages[:20]:
+                line = f"[{msg.user_id}] ({msg.action_type.value}): {msg.text[:300]}"
                 total += len(line)
                 if total > max_chars:
                     return "\n".join(lines)

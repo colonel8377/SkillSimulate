@@ -22,19 +22,21 @@
 
 ### 1.3 Root Cause: The Ceiling of Persona Prompting
 - Descriptive persona 只传递身份标签而非行为规则
-- "Average Persona Problem" (Li & Cheng 2026)
-- Persona collapse 根因：RLHF 压缩行为多样性 + 描述性 prompt 缺乏行为约束 ("The Chameleon's Limit")
+- "Average Persona Problem" (Qin et al. 2026)
+- Persona collapse 根因：RLHF 压缩行为多样性 + 描述性 prompt 缺乏行为约束 ("The Chameleon's Limit", arXiv:2604.24698)。该论文原文指出 collapse **"resides in the weights, not the reasoning chain"**——即 RLHF 优化几何产生 "Helpful Assistant" 吸引子驻留于权重，prompt-time 描述无法对抗
 - 引用 Cognitive Heuristics 论证 (Zhu & Heydari 2026)
 
-### 1.4 Our Approach: CADP
-- 三维蒸馏：Expression DNA / Mind Models / Anti-patterns
-- 基于 nuwa-skill 框架编译
-- 硬约束挂载
+### 1.4 Our Approach: CADP — Pulling the Second Lever
+**核心论点（central thesis）**：缩小 sim-to-real gap 有两个正交杠杆——(1) 说什么（**description / persona 内容**）；（2）怎么强制执行（**generation-time constraint 机制**）。现有工作（descriptive → segmentation → pop-aligned → 更丰富叙事 persona → 迭代改写 persona）全部挤在杠杆 1 上；CADP **第一次拉动杠杆 2**。
+- 三维蒸馏（Expression DNA / Mind Models / Anti-patterns）为行为规则提供 granularity，基于 nuwa-skill 框架编译
+- **三层硬强制执行**（post-gen embedding filter / pre-gen retrieval 注入 / forced-reformulation block）是 CADP 的 headline contribution——这是 category-novel 的机制（详见 §2.2.5：无竞品使用生成时行为硬约束）
+- **可证伪的 "so what" 预测**：CADP 相对杠杆-1 强基线（含 Rich-Narrative persona）的增益，应集中在 held-out 事件预测（Predictive Fidelity）层
 
 ### 1.5 Contributions
-1. 方法贡献: CADP 管线（dual-track compilation + three-tier enforcement）
-2. 实证贡献 (Exp 1): 13 conditions × 3 datasets × 4 models 系统对比（含 COLLEAGUE.SKILL 链式消融 + Clustering-Only 贡献隔离 + Constraint-Only mirror 消融 + Pop-Aligned 叠加测试）
-3. 发现贡献 (Exp 2): 三真实社区的涌现动态
+1. **方法贡献（headline）**：首次提出 **generation-time hard behavioral enforcement**（三层强制执行机制）作为补救 sim-to-real gap 的第二个杠杆。dual-track `.skill` 结构继承自 COLLEAGUE.SKILL / nuwa-skill（非 novelty），CADP 的真正创新是 Constraint Track 的**可执行硬约束**（区别于 COLLEAGUE 的 advisory behavior track，见 §2.4/§4.3）
+2. **实证贡献 (Exp 1)**：条件网格系统对比，**关键对比为 CADP vs 杠杆-1 强基线（含 Rich-Narrative persona，复现 Scaling-Law arXiv:2510.11734）在 Predictive Fidelity 层**（含 COLLEAGUE capability-only 链式消融 + Clustering-Only 贡献隔离 + Constraint-Only mirror 消融 + Pop-Aligned 叠加测试 + caricature 指标）
+3. **发现贡献 (Exp 2)**：三真实社区的涌现动态
+4. **理论贡献**：Bourdieu habitus 三维结构作为**设计蓝图**（非分析透镜），并检验其启发的三维分解是否经得起消融解离检验（§5.8）
 
 > Figure 1: 概览图
 
@@ -47,12 +49,27 @@
 - Gap: 无人系统验证 persona vs 数据驱动方法的行为保真度
 
 ### 2.2 The Homogenization Problem
-- Wu et al. (2025) — 诊断平均人格问题，无解决方案
-- Li & Cheng (2026) — audience segmentation，top-down 描述性方法
-- "The Chameleon's Limit" (arXiv:2604.24698) — 独立实证证据：persona collapse（agent 行为收敛到 modal pattern）是结构性失效模式
+- **"LLM-Based Social Simulations Require a Boundary" (Wu et al. 2025, arXiv:2506.19806)** — 诊断平均人格问题并划定 LLM 社会模拟的有效性边界，无解决方案。**勘误**：outline 早期版本曾将 "Wu et al. 2025" 与 arXiv:2506.19806 当作两篇独立工作，实为同一篇（经 arXiv:2509.10127 参考文献表确认）
+- Qin et al. (2026, arXiv:2604.06663) — audience segmentation，top-down 描述性方法。**勘误**：第一作者为 Qin，非早期版本的 "Li & Cheng"
+- **"The Chameleon's Limit" (arXiv:2604.24698, Xiao et al., CMU/UChicago/MIT/RIKEN/JHU, 2026-04)** — 独立实证证据：**全部 10 个测试 LLM 均出现结构性 persona collapse**（BFI-44），归因于 RLHF 优化几何产生 "Helpful Assistant" 吸引子，且 collapse **"resides in the weights, not the reasoning chain"**。该论文仅提出诊断框架（Coverage/Uniformity/Complexity），把 "reward within-group behavioral variance 的训练目标" 明确列为未提出的 future work → **CADP 要补的"补救空间"真实存在且空缺**
 - "What Limits LLM-based Human Simulation: LLMs or Our Design?" (arXiv:2501.08579) — 系统拆解 LLM 模拟偏差来源（模型能力 vs prompting 设计），结论指向设计缺陷为主因；本文进一步将"设计缺陷"定位到 persona prompting 的结构性局限并提出 CADP 作为改进方案
-- "LLM-Based Social Simulations Require a Boundary" (arXiv:2506.19806) — 提出 LLM 社会模拟的有效性边界问题；本文在 §7.4 Threats to Validity 中讨论 CADP 的适用边界
-- Gap: segmentation 不保证个体级行为保真度；persona collapse 的根因（RLHF 压缩 + 描述性 prompt 缺乏行为规则）未被解决；现有 gap 诊断缺乏可操作的结构性解决方案
+- Gap: segmentation 不保证个体级行为保真度；persona collapse 的根因（RLHF 压缩驻留权重 + 描述性 prompt 缺乏行为规则）未被解决；现有 gap 诊断缺乏可操作的结构性解决方案
+
+### 2.2.5 Two Remediation Levers: Description vs Constraint（新增 — 核心定位框架）
+
+本文用**两个正交杠杆**组织整个补救方法谱系，这是 CADP 定位的主轴：
+
+- **杠杆 1 — Description（说什么）**：调整 persona 的内容丰富度。所有现有竞品都在此杠杆上：
+  - Descriptive persona（身份/属性标签）
+  - Segmentation（Qin et al. 2026，描述性分割标识符）
+  - Population-Aligned Persona（arXiv:2509.10127，Importance Sampling + Optimal Transport 分布重采样）
+  - **PersonaEvolve / PEvo（arXiv:2509.16457）** — 迭代改写 persona 的描述性特质（KL 向 SME 分布靠拢）；**该论文明确把"显式行为指令 / constraint injection"当成 failure mode**，与 CADP 的硬约束理念正面冲突
+  - **PEP — Persona Ecosystem Playground（arXiv:2603.03140）** — RAG 生成描述性对话 persona + 软 RQE 阈值修订
+  - **"Scaling Law in LLM Simulated Personality"（arXiv:2510.11734）** ⚠️ **最强威胁**：随 persona 细节增加，到人类 Big Five 年龄曲线的欧氏距离 70.25→63.45→51.21→23.75 单调下降，主张 "more detailed persona profile is all you need，无需 task-specific intervention"。（注：仅基于单模型自报问卷，且被 Zierahn et al. 2026, arXiv:2603.19030 反驳）
+  - **"LLM Generated Persona is a Promise with a Catch"（NeurIPS 2025 Position, arXiv:2503.16527）** — Meta Personas（无 LLM 生成内容）对齐最好；Descriptive/Generative Personas（LLM 内容越多）偏差越大，跨 6 个 LLM、3 个选举周期普适。**此结果动摇"内容越丰富越真实"的前提** → CADP 必须论证 enforcement ≠ 再加 LLM 内容，而是截断生成分布（见 §3.2）
+- **杠杆 2 — Constraint（怎么强制执行）**：generation-time 行为硬约束。**据文献检索（截至 2026-06），CADP 是此杠杆上的第一个工作**——所有竞品（含 PEvo / PEP / Pop-Aligned / Scaling-Law）均通过描述性条件、分布重采样或迭代改写实现异质性，无一注入蒸馏出的、可强制执行的行为约束 track
+
+**Gap**：杠杆 1 已被充分探索甚至饱和（Scaling-Law 主张其已足够），杠杆 2 完全空缺。CADP 占据杠杆 2，并在 Predictive Fidelity 层验证"杠杆 1 不够、需上杠杆 2"。**这要求 CADP 必须在实验中正面击败 Scaling-Law 的 Rich-Narrative 强基线（§5.2 条件 15），否则论点失败**（§5.1 framing pilot 的 kill condition）
 
 ### 2.3 Population-Aligned Persona Generation（新增 — 最直接竞争者）
 
@@ -80,10 +97,10 @@
 - **与本文的关系**：该论文在分析层面使用 habitus 概念（解读 AI 输出中的阶层偏好）；本文在方法设计层面将 habitus 三维结构作为 **设计蓝图（design blueprint）**，并检验其启发的三维分解是否经得起消融解离检验（§5.8），但**不声称验证 Bourdieu 理论本身**。两篇论文的 habitus 使用层次不同：analytic lens vs design blueprint
 
 ### 2.4 Behavioral Distillation & Cognitive Cloning
-- COLLEAGUE.SKILL (Zhou et al. 2026) — 面向个人工具，不声称行为保真度；single-track compilation
-- nuwa-skill 框架
+- COLLEAGUE.SKILL (Zhou et al. 2026, arXiv:2605.31264) — 面向个人工具，不声称行为保真度。**勘误**：经文献核实，COLLEAGUE.SKILL **本身是 dual-track**（capability track: practices / mental models / decision heuristics + bounded behavior track: communication style / interaction rules / correction history），早期版本"single-track"表述有误。CADP 的 Expression DNA / Mind Models / Anti-patterns 几乎逐项映射到这两个 track 的内容。**CADP 与 COLLEAGUE 的真正区别不在 track 结构（dual-track 是继承的），而在 Constraint Track 的执行机制**：COLLEAGUE 的 behavior track 是 **advisory**（软建议 + negative examples，无 enforcement），CADP 的 Constraint Track 是 **hard-enforced**（三层强制执行）。故本文 baseline 5（`colleague_skill`）实现为 **capability-only 消融**（无 Constraint Track、无 enforcement），用于隔离 enforcement 贡献，**不声称是 COLLEAGUE 的忠实复现**
+- nuwa-skill 框架（github.com/alchaincyf/nuwa-skill）— 人格/技能蒸馏的工程基座（编码 mental models / decision heuristics / expression patterns 进 `.skill`），非模拟方法
 - Zhu & Heydari (2026) — 理论推导，无实证
-- Gap: 无工作将行为蒸馏应用于社会模拟并验证群体级保真度
+- Gap: 无工作将行为蒸馏 + 生成时硬强制执行应用于社会模拟并验证群体级保真度
 
 ### 2.5 Positioning Summary Table
 
@@ -97,7 +114,8 @@
 | RLHF override | ✗ | ✗ | ✗ | 部分（negative examples 可部分抵消） | ✓ (Anti-patterns 硬约束) |
 | 保真度验证 | 无 | 分布级 | 分布级 | 无 | 五层级系统验证 |
 
-> **Table 说明**：✗/✓/部分 的区分旨在反映 continuum 而非 binary。COLLEAGUE.SKILL 中若包含 negative examples 则具有部分行为约束能力，但其约束为 advisory（无 enforcement mechanism），与 CADP 的三层硬约束在执行层面有结构性差异。
+> **Table 说明**：✗/✓/部分 的区分旨在反映 continuum 而非 binary。COLLEAGUE.SKILL 的 behavior track 为 **advisory**（含 negative examples，无 enforcement mechanism），与 CADP 的三层硬约束在执行层面有结构性差异——这是表中最关键的区分列（"约束机制"）。
+> **杠杆归位（配合 §2.2.5 阅读）**：Descriptive / Segmentation / Pop-Aligned / COLLEAGUE 均属杠杆 1（description）；CADP 是唯一占据杠杆 2（generation-time hard enforcement）的方法。表外补充一个杠杆-1 强基线 **Rich-Narrative persona（复现 Scaling-Law arXiv:2510.11734）** 作为 §5.2 条件 15，是 CADP 必须正面击败的对象。投稿前 Table 3 应增加 Rich-Narrative 行。
 
 ---
 
@@ -118,6 +136,7 @@
 - **Persona collapse 的机制分析**：RLHF 通过偏好优化压缩输出分布（"Alignment Tax"），使 agent 在冲突场景中趋向妥协/回避。描述性 persona 无法对抗这一倾向，因为身份标签不影响生成时的 token 分布偏移。
 - Anti-patterns 作为硬约束，通过 pre-generation block（Tier 3）和 post-generation filter（Tier 1）直接干预 token 级行为分布，结构性绕过 RLHF 的妥协压缩
 - "The Chameleon's Limit" 的实证发现为这一机制分析提供数据支撑：persona collapse 的速率与 RLHF 强度正相关，验证了 anti-patterns 干预的必要性
+- **对 caricature 陷阱的防御论证（回应 §2.2.5 的 Scaling-Law / Promise-with-a-Catch）**：Chameleon's Limit §3.3 "fidelity breeds caricature" 显示高保真模型组间 Cohen's d>6，且 Promise-with-a-Catch 证明 LLM 生成内容越多偏差越大——两者都指向"杠杆 1（加 description）会恶化脸谱化"。CADP 的三层 enforcement **不是**再注入 LLM 生成内容，而是**截断/约束**生成分布，因此理论预期可在**不增加 caricature** 的前提下提升 fidelity（§5.3 的 caricature 指标直接检验此预测）
 
 ---
 
@@ -139,14 +158,15 @@
 
 ### 4.3 Step 2: nuwa-skill Compilation (Dual-Track)
 - Top-N 最具代表性交互（N≈20 对话线程）
-- 输出**双轨 .skill 文件** (与 COLLEAGUE.SKILL 的关键结构性区别)：
-  - COLLEAGUE.SKILL 是 single-track（仅 capability）；CADP 新增 Constraint Track，为硬约束操作化提供结构基础
+- 输出**双轨 .skill 文件**。**勘误（与 §2.4 一致）**：dual-track 结构**不是**与 COLLEAGUE.SKILL 的区别（COLLEAGUE 本身就是 dual-track：capability + advisory behavior）。CADP 的真正创新是 Constraint Track 的**可执行硬约束**：
+  - COLLEAGUE.SKILL: dual-track，但 behavior track 为 advisory（软建议，无 enforcement）
+  - CADP: dual-track，Constraint Track 为 hard-enforced（三层强制执行，见 §4.4），为硬约束操作化提供结构基础
   - **Capability Track** (agent 能做什么):
     - Expression DNA: 允许的语言模式、词汇范围、句法倾向
     - Mind Models: 推理模板、立场框架、评估标准
   - **Constraint Track** (agent 不能做什么):
     - Anti-patterns: 显式禁止列表 + 触发条件
-    - 可强制执行的硬约束（COLLEAGUE.SKILL 的约束仅为软建议）
+    - 可强制执行的硬约束（这是相对 COLLEAGUE advisory track 的结构性创新）
 - **Compilation 流程区别**：
   - COLLEAGUE.SKILL: few-shot pattern extraction（ground-truth traces → capability rules），single-pass
   - CADP: dual-pass compilation — Pass 1 (positive case mining → capability rules) + Pass 2 (negative case mining → anti-pattern rules with trigger conditions)
@@ -224,9 +244,9 @@
 ### 4.7 Baselines (扩展为 13 条件)
 1. Vanilla LLM
 2. Descriptive Persona
-3. Segmentation Persona (复现 Li & Cheng 2026)
+3. Segmentation Persona (复现 Qin et al. 2026)
 4. **Population-Aligned Persona (复现 arXiv:2509.10127)** — 最直接竞争者，属性分布匹配
-5. **COLLEAGUE.SKILL (single-track, no enforcement)** — 直接前驱方法，隔离 dual-track + enforcement 的增量贡献
+5. **COLLEAGUE capability-only (no Constraint Track, no enforcement)** — 直接前驱方法（注：真实 COLLEAGUE.SKILL 为 dual-track advisory，见 §2.4；此处为 capability-only 消融），隔离 enforcement 的增量贡献
 6. **Clustering-Only Descriptive Persona** — 共享 CADP 的 Step 1 聚类，但每聚类使用 descriptive persona 而非 .skill；隔离聚类贡献 vs 行为规则蒸馏贡献
 7. CADP (Full)
 8. CADP (Shuffled) — 置换检验（shuffle agent→skill assignment）
@@ -242,7 +262,7 @@
 > **条件 14 (Length-Matched Control) 定位**：本条件**不**进入主 13×3×4 factorial，作为 anti-circularity robustness check 在 reduced grid (1 dataset × 1-2 models, ≥5 repeats) 上运行，直接回应 Devil's Advocate CRITICAL C-C（训练/测试循环性）。其结果作为 §5.7.5 Ceiling Analysis 与 §7.4 Threats to Validity 的输入，不参与 §5.7 主结果表的 13-条件对比。
 
 > **实验设计原则**：所有条件共享 Step 1 聚类结果（相同的 agent 分组结构），差异仅在于每组 agent 接收的 persona/skill 内容和 enforcement 机制。这隔离了"聚类结构"与"行为规则蒸馏"的贡献，避免混淆。
-> **消融逻辑链**：COLLEAGUE.SKILL (single-track, no enforcement) → CADP minus Anti-patterns enforcement (dual-track, no enforcement) → CADP Full (dual-track + three-tier enforcement)，逐层隔离 structural contribution
+> **消融逻辑链**：COLLEAGUE capability-only (no Constraint Track, no enforcement) → CADP minus Anti-patterns enforcement (Constraint Track 存在但不执行, no enforcement) → CADP Full (Constraint Track + three-tier enforcement)，逐层隔离 enforcement 的 structural contribution
 > Figure 2: CADP Pipeline 流程图 (含 dual-track skill + three-tier enforcement)
 
 ---
@@ -250,22 +270,23 @@
 ## Chapter 5: Experiment 1 — Method Validation (~3 pages)
 ### 5.1 Setup
 - 数据集: Wikipedia Talk Pages / Reddit r/changemyview / GitHub Issues
-- 模型: GPT-4o / Claude 3.5 Sonnet / Llama-3-70B / Qwen-2.5-72B
-- 总条件数: 13 × 3 × 4 = 156
-- 重复: 每条件 5-10 次
-- **样本量与可行性说明**：156 cells × 10 repeats = 1,560 simulation runs per metric；API 成本估算（GPT-4o + Claude 3.5）约 $3,000–7,000；开源模型推理（Llama-3-70B, Qwen-2.5-72B）需 4× A100 80GB，估算 300–500 GPU-hours。条件 10-13（Clustering-Only, COLLEAGUE.SKILL, Constraint-Only, Pop-Aligned+CADP）可在单数据集（Wikipedia）+ 双模型（GPT-4o + Llama-3-70B）上运行作为 reduced factorial，降低成本
+- 模型: DeepSeek-V4-Flash（v1 single-model；cross-model generality deferred to future work — see §7.1）
+- 总条件数: 13 × 3 × 1 = 39 cells × 5 repeats = 195 simulation runs
+- 重复: 每条件 5 次（framing-pilot effect-size dependent；d ≥ 0.5 → 5 repeats sufficient for 80% power at α=0.05）
+- **样本量与可行性说明**：195 cells × 50 rounds × 30 agents per cell；API 成本估算（DeepSeek-V4-Flash @ $0.10/1K input + $0.40/1K output）约 $2,000–4,000。DeepSeek-V4-Pro 保留用于 skill compilation。Cross-model analysis (§7.1) deferred to v2 — single-model ≠ negative finding, mirroring the §4.4.4 deferred-work caveat
 - **Power analysis**：基于 pilot data（Wikipedia 单数据集）的 effect size 估计，Cohen's d ≥ 0.5 时 5 次重复即可达到 80% power (α=0.05)；若 pilot 显示 d < 0.5，则增加至 10 次重复
-- **Framing pilot（review-driven, ARS 2026-06-19）**：在主实验之前运行 `configs/exp1_framing_pilot.yaml`——3 条件 (descriptive / pop_aligned / cadp_full) × 10 repeats × Wikipedia × 单模型，仅测 Micro Behavior + Predictive Fidelity 两层。**Pre-registered 决策规则**（unblinding 前冻结，不可事后调整）：d ≥ 0.5 on ≥2 layers → method 主导 framing 可行；d ≈ 0.3 或单层 → benchmark 主导 framing；d < 0.3 → CADP 路线重构；CADP 输给 Pop-Aligned → benchmark framing + 重写 §2.3。Framing pilot 与 §5.1 Power analysis 共享 effect-size 估计但作用不同：前者决定 paper framing，后者决定主实验 repeat 数
+- **Framing pilot（review-driven, ARS 2026-06-19）**：在主实验之前运行 `configs/exp1_framing_pilot.yaml`——**4 条件 (descriptive / pop_aligned / rich_narrative / cadp_full)** × 10 repeats × Wikipedia × 单模型，仅测 Micro Behavior + Predictive Fidelity 两层。**Pre-registered 决策规则**（unblinding 前冻结，不可事后调整）：d ≥ 0.5 on ≥2 layers → method 主导 framing 可行；d ≈ 0.3 或单层 → benchmark 主导 framing；d < 0.3 → CADP 路线重构；CADP 输给 Pop-Aligned → benchmark framing + 重写 §2.3；**CADP 在 Predictive Fidelity 输给 Rich-Narrative（条件 15）→ 核心论点（杠杆 2 必要性）失败，转 benchmark framing + 重写 §1.4/§2.2.5**。Framing pilot 与 §5.1 Power analysis 共享 effect-size 估计但作用不同：前者决定 paper framing，后者决定主实验 repeat 数
+- **base-model 机制对照（review-driven, 2026-06-23，reduced grid）**：回应 Chameleon's Limit "collapse resides in the weights, not the reasoning chain" 的根本质疑。同一套 CADP + baseline 分别跑在 (a) base/弱对齐模型 与 (b) 强 RLHF 模型 上，比较 CADP 相对 baseline 的边际增益：增益在 RLHF 模型上显著更大 → 证明 enforcement 确实对抗 RLHF 吸引子（机制验证）；两者相等 → enforcement 为通用约束效果（故事变弱但成立）；RLHF 模型上更小 → 权重主导、prompt 时间管不住（kill condition）。**前置可行性**：需在 `configs/models.yaml` 配置一个 base/弱对齐模型端点；若无法获取，降级为 §7.4 limitation（机制假设未独立验证）。此对照为 optional，视 framing pilot 结果决定是否投入
 - **聚类共享原则**：所有 13 个条件使用相同的 Step 1 聚类结果（相同 agent 分组），差异仅在 persona/skill 内容和 enforcement 机制。这隔离聚类结构贡献与行为规则蒸馏贡献
 - **Statistical analysis（确认性 vs 探索性声明）**：Confirmatory comparisons = CADP (Full) vs 每个 baseline 在 5 个 metric layer 上的逐层检验，层内 Bonferroni 校正；报告 effect size (Cohen's d) + 95% CI，不仅 p 值。消融（条件 9-12）、α-sweep（§5.6.5）、迁移测试（§5.5）、trigger calibration（§5.3.5）归为 exploratory，描述性报告、不做 family-wise 校正，结论措辞相应弱化（"suggest"/"indicate" 而非 "prove"）
-- **可复现性 (Reproducibility)**：发布 (a) 完整 pipeline 代码 + nuwa-skill 编译器，(b) 化名（anonymized）聚合级 .skill 文件（不发布个体级，见 §7.5 dual-use），(c) 全部随机种子，(d) API 模型快照日期（GPT-4o / Claude 3.5 Sonnet 具体版本）与开源模型 commit hash（Llama-3-70B / Qwen-2.5-72B），(e) 标注协议 + 标注数据。数据集来自公开平台 API（CC-BY-SA / 平台 ToS 研究用途）
+- **可复现性 (Reproducibility)**：发布 (a) 完整 pipeline 代码 + nuwa-skill 编译器，(b) 化名（anonymized）聚合级 .skill 文件（不发布个体级，见 §7.5 dual-use），(c) 全部随机种子，(d) API 模型快照日期（DeepSeek-V4-Flash / DeepSeek-V4-Pro 具体版本）+ 开源模型 commit hash（预留 future-work slots），(e) 标注协议 + 标注数据。数据集来自公开平台 API（CC-BY-SA / 平台 ToS 研究用途）
 
 ### 5.2 Baselines (扩展为 13 条件)
 1. Vanilla LLM (无 persona)
 2. Descriptive Persona (标准 system prompt)
-3. Segmentation Persona (复现 Li & Cheng 2026)
+3. Segmentation Persona (复现 Qin et al. 2026)
 4. **Population-Aligned Persona (复现 arXiv:2509.10127)** — 最直接竞争者，测试"属性分布匹配"能否达到"行为规则蒸馏"的保真度
-5. **COLLEAGUE.SKILL (single-track, no enforcement)** — 直接前驱方法。在同一 sandbox 中用 nuwa-skill 框架编译 single-track .skill（仅 Capability Track），无三层 enforcement。隔离 dual-track + enforcement 的增量贡献
+5. **COLLEAGUE capability-only (no Constraint Track, no enforcement)** — 直接前驱方法。在同一 sandbox 中用 nuwa-skill 框架编译 capability-only .skill（仅 Capability Track；**注**：真实 COLLEAGUE.SKILL 为 dual-track advisory，见 §2.4，此处为 capability-only 消融），无三层 enforcement。隔离 enforcement 的增量贡献
 6. **Clustering-Only Descriptive Persona** — 共享 Step 1 聚类结果，每聚类使用描述性 persona（如"你是 Wikipedia 编辑者，属于 cluster A"）而非 .skill。隔离聚类结构贡献 vs 行为规则蒸馏贡献。若此条件已接近 CADP Full，则说明优势主要来自聚类而非 .skill
 7. CADP (Full) — 三维完整 + three-tier enforcement
 8. **CADP (Shuffled)** — 置换检验。**Shuffle 定义**：保持 agent 分组结构不变，但随机重分配 .skill 到错误聚类（将 cluster A 的 .skill 分配给 cluster B 的 agent）。测试"正确匹配"的重要性——若 shuffled 性能 ≈ random baseline，则说明正确 .skill 分配是关键；若 shuffled 仍优于 baseline，则说明 .skill 本身有 generic 价值
@@ -275,10 +296,11 @@
 12. **CADP Constraint-Only** — mirror 消融：仅保留 Constraint Track（Tier 3 ON，Capability Track 关闭）。与条件 11 互补：11 测试移除 Constraint Track 的损失，12 测试 Constraint Track 单独是否足够。两者共同构成 dual-track 必要性的双向证据
 13. **Pop-Aligned + CADP** — 叠加条件：Pop-Aligned 人口属性选人 + CADP 行为规则蒸馏。测试可叠加性——若叠加显著优于纯 CADP，说明属性维度与行为维度互补；若无显著差异，说明行为规则已隐含属性信息
 14. **Length-Matched Control** *(robustness check, ARS 2026-06-19 DA-E1, reduced grid)* — 等长随机描述：与 Descriptive Persona 相同模板和 token 预算，但描述基于**随机其他 cluster** 的行为统计（破坏语义对应）。对比逻辑：Descriptive Persona 显著优于本控制 → "descriptive persona effect" 不能归因于 token 预算；Length-Matched ≈ Descriptive Persona → descriptive 提升部分是 token-mass artifact；CADP 显著优于本控制 → CADP 提升不依赖于 "更多 context tokens"
+15. **Rich-Narrative Persona** *(新增 — 杠杆-1 强基线，复现 Scaling-Law arXiv:2510.11734)* — 用 Scaling-Law 的方法生成**尽可能丰富的叙事 persona**（多段、含背景/动机/偏好细节），token 预算与 CADP 持平。**这是 CADP 核心论点（杠杆 2 必要性，§1.4/§2.2.5）的存亡对照**：必须在 **Predictive Fidelity 层**显著超过 Rich-Narrative。若两者在 Predictive Fidelity 打平 → 杠杆 1 已足够，CADP 核心论点失败，触发 §5.1 framing pilot 的 kill condition。**此条件需新增代码**（新 agent adapter，经 `src/agents/registry.py` 注册）
 
 > 消融实验目的：隔离三维各自贡献，回应"维度选择是否arbitrary"的审稿质疑
 > **消融逻辑链**（逐层隔离结构贡献）：
-> - COLLEAGUE.SKILL (single-track) → CADP minus Anti-patterns enforcement → CADP Full：隔离 dual-track + enforcement 的增量
+> - COLLEAGUE capability-only → CADP minus Anti-patterns enforcement → CADP Full：隔离 enforcement 的增量（dual-track 结构为 COLLEAGUE 已有，见 §2.4）
 > - Clustering-Only → Descriptive Persona：隔离聚类贡献
 > - Length-Matched Control → Descriptive Persona → CADP Full：隔离 token 预算贡献（DA-E1 反循环性辩护）
 > - CADP (Full) vs CADP (Shuffled)：验证正确 .skill 分配的必要性
@@ -289,14 +311,15 @@
 ### 5.3 Five-Layer Evaluation Metrics
 - **Macro Topology**: ΔQ Modularity, E-I Polarization Index, NED, **Coverage** (行为空间覆盖率, from Xiao et al. 2026)
   - Ground truth: 从真实社区同期交互日志中提取的网络结构（同一时间窗口的交互图）
-- **Meso Dynamics**: Cascade Length Fit (KS-test), DTW, **Structural Fidelity** (交互网络结构相关, from Li & Cheng 2026)
+- **Meso Dynamics**: Cascade Length Fit (KS-test), DTW, **Structural Fidelity** (交互网络结构相关, from Qin et al. 2026)
   - Ground truth: 真实社区中已发生争议事件的 cascade 长度分布、时间序列
 - **Micro Behavior**: Action Matrix Similarity (Frobenius), RSA, **Uniformity** (行为分布熵, 检测同质化), **Complexity** (跨agent行为方差)
+  - **Caricature Index（新增，回应 Chameleon's Limit §3.3 + Promise-with-a-Catch）**：cluster 间行为分布的 Cohen's d（组间区分度）。Chameleon's Limit 报告高保真模型组间 Cohen's d>6（"fidelity breeds caricature"）；本指标直接检验 CADP 是否在**不增加 caricature** 的前提下提升 fidelity（验证 §3.2 "enforcement 截断分布而非加内容" 的论证）。**此指标需在 `src/evaluation/aggregator.py` 新增 `_compute_caricature`**。预期：CADP 的 Caricature Index 不显著高于 baseline，甚至更低（enforcement 约束而非脸谱化）；若 CADP 的 Cohen's d 反而显著更大 → 它只是更高效地制造脸谱化，核心卖点受挫
   - Ground truth: 独立于 CADP 聚类的真实用户行为分布。**优先使用外部标注的行为类型分类**（Wu et al. 2025 audience segmentation 标签或人工标注的用户角色：moderator / provocateur / peacemaker / lurker）——`MetricsAggregator(role_labels_dir=...)` 检测 `data/role_labels/{dataset}.jsonl` 文件，存在时使用外部角色标签作为 ground truth，避免用 CADP 自己的聚类结果（循环依赖）。
   - **Fallback 路径（已实现）**：当外部标签文件不存在时，aggregator 退化为 Louvain 社区发现（从真实交互图推断）作为 ground-truth proxy，并记录到 `datasets_using_role_label_proxy`，供 §7.4 报告 per-dataset validity 差异。Louvain proxy 仍然独立于 CADP 的聚类（不存在循环依赖），但弱于外部角色标签——这是一个 acknowledged limitation 而非 spec 违反。Micro 层的 Frobenius / RSA / Uniformity / Complexity 度量直接比较 agent-by-action matrix，不强依赖 cluster 标签，因此 proxy fallback 的影响主要在 Macro E-I polarization 层
 - **Linguistics**: LSM (KL-divergence), SIP (Sentence-BERT cosine)
   - ⚠️ **Feature Leakage 注意**：Expression DNA 的蒸馏特征包含用词分布、句法模式。为避免自证循环，Linguistics 层评估使用**独立特征空间**——采用 Expression DNA 蒸馏时未使用的 NLP 特征（如 discourse marker 分布、sentiment trajectory shape、speech act ratio）作为评估特征，与蒸馏特征空间正交
-- **Predictive Fidelity** (新增第五层, from Li & Cheng 2026):
+- **Predictive Fidelity** (新增第五层, from Qin et al. 2026):
   - 用仿真预测 held-out 真实交互结果 (谁会冲突、说服是否成功、冲突是否升级)
   - Ground truth 编码协议：2 名标注者独立编码 held-out 事件结果，Cohen's κ ≥ 0.7 后取共识标签
   - 这是最强的 "so what" 指标 — 仿真能否预测未见过的事件
@@ -358,10 +381,12 @@
 ### 5.7 Results
 - CADP (Full) 全面显著优于所有 baseline (13 条件对比)
 - **Safe-template 分层报告**：所有 Linguistic 层指标按 `metadata.constraint_forced` 分层统计——safe-template 输出（Forced Reformulation Protocol fallback，§4.4.2 step 4）单独报告，不混入主指标均值。这对 `cadp_constraint_only`（条件 12）尤其关键：该条件 Tier 3 触发率高，safe-template 频率显著高于其他条件，若不分层会人为拉低 Linguistic 数字
-- **COLLEAGUE.SKILL vs CADP 链式对比**：COLLEAGUE.SKILL (single-track) < CADP minus Anti-patterns enforcement < CADP Full，逐层隔离结构贡献
+- **COLLEAGUE capability-only vs CADP 链式对比**：COLLEAGUE capability-only < CADP minus Anti-patterns enforcement < CADP Full，逐层隔离 enforcement 的结构贡献
 - **Clustering-Only vs Descriptive Persona vs CADP**：隔离聚类贡献——若 Clustering-Only 显著优于 Descriptive Persona，需报告聚类占 CADP 优势的比例
 - 消融分析: 各维度独立贡献量化
 - 关键对比: CADP vs Segmentation Persona 逐维度差异；CADP vs Population-Aligned Persona 的行为保真度差异
+- **CADP vs Rich-Narrative（核心论点验证，§1.4/§2.2.5）**：在 Predictive Fidelity 层 CADP 是否显著超过 Scaling-Law 的"更丰富叙事"基线——这是杠杆 2 必要性的直接证据。预期：差距集中在 Predictive Fidelity + Micro Behavior，Macro Topology 可能接近
+- **Caricature Index 结果**：CADP 的 cluster 间 Cohen's d 是否显著低于/不高于杠杆-1 方法——验证"enforcement 截断分布而非脸谱化"
 - **Pop-Aligned + CADP 叠加效果**：是否显著优于纯 CADP（属性/行为互补性）
 - 置换检验: Shuffled（agent→skill 重新分配）显著弱于 Full
 - **Length-Matched Control 结果**：CADP / Descriptive Persona 是否显著优于等长随机描述（DA-E1 反循环性辩护）。若 Length-Matched ≈ Descriptive Persona → descriptive 提升部分是 token-mass artifact，需在 §5.8 / §7.4 讨论
@@ -385,9 +410,9 @@
 
 **方法族定义**（`src/analysis/ceiling.py::DEFAULT_METHOD_FAMILIES`）：
 - `none`：vanilla（无 persona）—— 地板参考
-- `persona_prompting`：descriptive / segmentation / pop_aligned / clustering_only / length_matched_control —— 身份/属性注入无 enforcement
+- `persona_prompting`：descriptive / segmentation / pop_aligned / clustering_only / length_matched_control / **rich_narrative** —— 杠杆 1（身份/属性/叙事注入，无 enforcement）。rich_narrative 为此族的 ceiling（Scaling-Law 主张的"足够"方案）
 - `distillation_advisory`：colleague_skill —— 规则蒸馏无硬约束
-- `distillation_enforced`：cadp_full / cadp_shuffled / cadp_minus_* / cadp_constraint_only / pop_aligned_cadp —— 规则蒸馏 + 三层 enforcement
+- `distillation_enforced`：cadp_full / cadp_shuffled / cadp_minus_* / cadp_constraint_only / pop_aligned_cadp —— 规则蒸馏 + 三层 enforcement（杠杆 2）
 - `perfect_reference`：real_history（§6.2 Exp2 replay arm）—— 自相似 ceiling，定义 "zero gap"
 
 **计算**：对每个 (family, layer) cell，取该 family 在该 layer 上的最佳 condition 的归一化 fidelity，与 `perfect_reference` 的 fidelity 之差即 "remaining gap"。Per-metric direction（higher-better vs lower-better）按 `DEFAULT_METRIC_DIRECTION` 处理。Bootstrap 95% CI（n_resamples=1000）。
@@ -405,7 +430,9 @@
 - **Tier 2 独立贡献检验**：CADP minus Mind Models 的下降幅度——若不显著，讨论 Tier 2 的 retrieval-augmented conditioning 是否主要为 Tier 1/3 提供 context（辅助角色）
 - Descriptive Persona 在哪些指标上最接近 CADP
 - **CADP vs Pop-Aligned 深入对比**：在哪些 metric layer 差距最大/最小？Pop-Aligned 在 Macro Topology（分布级）可能接近，但在 Micro Behavior 和 Predictive Fidelity（行为级）预期显著落后——量化"属性匹配 ≠ 行为匹配"
-- **COLLEAGUE.SKILL → CADP 的增量来源**：single-track vs dual-track 的差距来自 Capability+Constraint 结构（dual-track 本身）还是 enforcement 机制（three-tier）？通过 COLLEAGUE.SKILL vs CADP-minus-Anti-patterns-enforcement vs CADP Full 三点对比拆解
+- **杠杆 1 vs 杠杆 2 的边际增益分解（§1.4/§2.2.5 核心分析）**：沿杠杆 1 从 descriptive → segmentation → pop_aligned → rich_narrative 的 fidelity 增益曲线是否已饱和（plateau）？CADP（杠杆 2）相对 rich_narrative（杠杆 1 ceiling）的增益集中在哪一层？若杠杆 1 已 plateau 而 CADP 仍能提升 → 证明杠杆 2 是新方向；若杠杆 1 仍在上升 → CADP 须论证 enforcement 带来 description 无法触及的增益（如 Predictive Fidelity）
+- **Caricature 分析**：CADP 的 cluster 间 Cohen's d 随 fidelity 提升如何变化？若 fidelity 提升但 caricature 不增 → §3.2 "截断而非加内容" 论证成立；若 caricature 同步上升 → 如实承认 CADP 未逃脱 caricature 陷阱
+- **COLLEAGUE → CADP 的增量来源**：增量来自 enforcement 机制（three-tier）还是 Constraint Track 内容本身？通过 COLLEAGUE capability-only vs CADP-minus-Anti-patterns-enforcement vs CADP Full 三点对比拆解（dual-track 结构为 COLLEAGUE 已有，见 §2.4，故非增量来源）
 - **Pop-Aligned + CADP 叠加效果解读**：若叠加无显著增益，说明 CADP 的行为规则已隐含人口属性信息；若有增益，说明两维度正交互补
 - **回应 "What Limits LLM Simulation" (arXiv:2501.08579)**：跨模型对比分析——若 CADP 在不同模型上的提升幅度一致，说明 design fix（CADP）的效果不依赖模型能力；若在更强模型上提升幅度递减，则支持"LLMs and Design 共同限制"的交互效应假设
 - Anti-patterns 作为 RLHF override 的作用机制
@@ -482,12 +509,17 @@ Exp 1 证明 CADP 可信 → Exp 2 模拟真实社区
 - 对 ICWSM 社区的方法论建议
 
 ### 7.3 Relationship to Competing Methods
-- vs COLLEAGUE.SKILL: 不同目标（个人工具 vs 群体模拟）+ 结构性区别（single-track vs dual-track + constraint enforcement）
+- vs COLLEAGUE.SKILL: 不同目标（个人工具 vs 群体模拟）+ 执行机制区别（**advisory behavior track vs hard-enforced Constraint Track**；dual-track 结构为共有，非差异点，见 §2.4/§4.3）
+- vs nuwa-skill: 继承其 `.skill` 蒸馏基座，CADP 的增量是 social-simulation 应用域 + 三层 enforcement + habitus 三维分类
 - vs Population-Aligned Persona Generation: 不同层级（属性分布匹配 vs 行为规则蒸馏）；非替代关系，可叠加
-- vs Restoring Heterogeneity (Wu et al. 2025): 补充而非替代（诊断 vs 解决方案）
+- vs Restoring Heterogeneity / Simulation Boundary (Wu et al. 2025, arXiv:2506.19806): 补充而非替代（诊断 + 边界 vs 解决方案）
 - vs Cognitive Heuristics (Zhu & Heydari 2026): 实证验证（理论推导 vs 可操作 pipeline）
-- vs The Chameleon's Limit: 共同问题诊断，CADP 提供结构性解决方案
+- vs The Chameleon's Limit: 共同问题诊断，CADP 提供结构性解决方案；但需注意该论文指出 collapse "resides in the weights"——CADP 的 prompt/filter-time enforcement 能否对抗权重级吸引子是核心经验风险（base-model 对照 §5.1 检验）
 - vs "What Limits LLM Simulation" (arXiv:2501.08579): CADP 是该论文提出问题（LLMs or Design?）的 design-side 回答；跨模型分析（§5.8）量化 design fix 相对于 model capability 的边际贡献
+- vs **Scaling-Law (arXiv:2510.11734)** ⚠️: 该论文主张"更丰富 persona 就够了，无需 task-specific intervention"。CADP 的反驳 = enforcement 是正交的杠杆 2，不是杠杆 1 的变体；§5.2 条件 15 直接对比，CADP 须在 Predictive Fidelity 层胜出才能立论
+- vs **Promise-with-a-Catch (NeurIPS 2025)**: 该论文证明"LLM 生成内容越多偏差越大"。CADP 的回应 = enforcement **不加** LLM 内容，而是**截断**生成分布（§3.2）；§5.3 Caricature Index 直接检验
+- vs **PersonaEvolve / PEvo (arXiv:2509.16457)**: 该论文把显式行为指令当 failure mode（主张 implicit editing）。CADP 主张恰恰相反——generation-time 硬约束是必要的；§5.2 结果判定孰是
+- vs **PEP (arXiv:2603.03140)**: 两者均用 RAG/检索，但 PEP 检索描述性对话 persona（杠杆 1），CADP 检索可执行行为规则并强制执行（杠杆 2）
 - vs Park et al. (2024, arXiv:2411.10109, *preprint*, 1,052 individuals): interview-based vs behavioral-trace-based distillation；interview 依赖主动参与，CADP 可大规模从被动数据蒸馏
 - vs "Habitus of GenAI" (Sage, 2025): 分析层面 vs 方法设计层面使用 habitus 概念
 
@@ -500,6 +532,10 @@ Exp 1 证明 CADP 可信 → Exp 2 模拟真实社区
 - **Anti-pattern trigger 校准依赖**：trigger 阈值需 per-dataset 校准（§4.4.1），跨域迁移时 Precision/Recall 会下降——§5.5 报告具体下降程度。
 - **Anti-patterns 编码社区偏见的风险**：CADP 从真实社区行为中蒸馏 anti-patterns，可能忠实地再现社区中的偏见性规范（如隐性歧视行为模式）。这是 "fidelity vs. ethics" 的结构性张力。**当前 release 不实现自动化 bias audit**（留作 future work，见 §7.5），所有 fidelity 数字均为 unaudited——即包含社区偏见的忠实再现，本文如实报告而非掩盖。
 - **Bourdieu 框架的可证伪性**：本文不验证 habitus 社会学构念本身，但 §3.1 提出一个 *可证伪的设计预测*——三维消融应在不同 metric layer 上解离（而非加载到单一因子）。该预测在 §5.8 检验：若三组损失高度相关则如实承认分解解释力削弱。这是对"三维分解非任意"的检验，**不**构成对 Bourdieu 理论本身的验证。
+- **权重级 vs 推理链级 collapse（核心经验风险，2026-06-23 新增）**：Chameleon's Limit (arXiv:2604.24698) 原文指出 persona collapse "resides in the weights, not the reasoning chain"。CADP 的三层 enforcement 全部是 prompt/filter-time 干预，**不触碰权重**——若 RLHF 吸引子确实驻留权重，CADP 的机制可能压不住。§5.1 base-model 机制对照直接检验：若 CADP 增益在 RLHF 模型上不大于 base 模型，则 enforcement 未能对抗权重级吸引子，需如实报告为 limitation。
+- **Caricature 陷阱（2026-06-23 新增）**：Chameleon's Limit §3.3 "fidelity breeds caricature"（高保真 → Cohen's d>6）+ Promise-with-a-Catch（LLM 内容越多偏差越大）共同质疑"保真度提升必然改善真实感"。CADP 的论点是 enforcement 截断分布而非加内容，但此论点本身未经证实——§5.3 Caricature Index 检验：若 CADP 的 Cohen's d 反而更大，说明它只是更高效地脸谱化。
+- **Habitus 三维映射的保真度（2026-06-23 新增）**：CADP 将 habitus 映射为"语言/认知/禁忌"三维，但社会学上 Bourdieu 的 habitus 通常分解为 dispositions(hexis) / tastes(aesthetics) / capital(resources)。CADP 的映射是**启发式**，非忠实社会学转译——本文将其作为 design blueprint（§3.1 已声明不验证构念本身），但需承认映射的正当性建立在 §5.8 消融解离的经验检验上，而非 Bourdieu 权威。
+- **杠杆-2 新颖性的时效性（2026-06-23 新增）**："generation-time 行为硬约束在 LLM 社会模拟中尚无先例"的判断基于 2025-2026 文献检索（截至 2026-06）；极新 preprint 或非英文/非索引工作（尤其 nuwa-skill / COLLEAGUE 来源的中文圈工作）可能被遗漏。投稿前需复查。
 - **模型依赖**：4 模型验证覆盖主流 API + 开源，但未测试 smaller models (<7B)。
 - **平台覆盖**：仅英文平台，跨语言行为模式差异未验证。
 - **时间窗口**：训练数据为特定时间段的交互快照，行为模式的时间漂移未建模。
@@ -527,7 +563,7 @@ Exp 1 证明 CADP 可信 → Exp 2 模拟真实社区
 | # | Content | Section |
 |---|---------|---------|
 | Table 1 | 13 conditions × 5 metric layers main results | 5.7 |
-| Table 2 | Ablation + COLLEAGUE.SKILL chain comparison (3 dimensions + single-track baseline × 5 metric layers) | 5.7 |
+| Table 2 | Ablation + COLLEAGUE capability-only chain comparison (3 dimensions + capability-only baseline × 5 metric layers) | 5.7 |
 | Table 2b | Clustering contribution isolation (Descriptive vs Clustering-Only vs CADP) | 5.7 |
 | Table 2c | Token-budget contribution isolation — Length-Matched Control vs Descriptive vs CADP (DA-E1) | 5.7 |
 | Table 2d | Ceiling Analysis — remaining sim-to-real gap per method family × metric layer (review-driven, ARS 2026-06-19) | 5.7.5 |

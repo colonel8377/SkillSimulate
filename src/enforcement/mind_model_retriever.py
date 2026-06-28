@@ -14,6 +14,7 @@ keyword-overlap bonus for stance/conflict alignment.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -89,10 +90,13 @@ class MindModelRetriever:
         """Infer stance / conflict intensity / topic from recent messages."""
         recent = [m for m in messages if m.get("content", "").strip()][-_CONTEXT_WINDOW:]
         text = " ".join(m.get("content", "") for m in recent).lower()
-        tokens = set(text.split())
+        # Word-level token set (punctuation-stripped) so the lexicon checks
+        # below are whole-word membership, not substring — otherwise
+        # "support" matches "supportive", "agree" matches "disagree", etc.
+        tokens = set(re.findall(r"\w+", text))
 
-        n_support = sum(1 for w in _SUPPORTIVE_WORDS if w in text)
-        n_oppose = sum(1 for w in _OPPOSITIONAL_WORDS if w in text)
+        n_support = sum(1 for w in _SUPPORTIVE_WORDS if w in tokens)
+        n_oppose = sum(1 for w in _OPPOSITIONAL_WORDS if w in tokens)
 
         if n_support > n_oppose and n_support > 0:
             stance = "supportive"
@@ -102,11 +106,11 @@ class MindModelRetriever:
             stance = "neutral"
 
         # Conflict intensity: density of conflict + oppositional markers
-        n_conflict = sum(1 for w in _CONFLICT_WORDS if w in text)
+        n_conflict = sum(1 for w in _CONFLICT_WORDS if w in tokens)
         token_count = max(len(text.split()), 1)
         conflict_intensity = min(1.0, (n_conflict * 3 + n_oppose) / (token_count * 0.1 + 1))
 
-        is_consensus_seeking = any(w in text for w in _CONSENSUS_WORDS)
+        is_consensus_seeking = any(w in tokens for w in _CONSENSUS_WORDS)
 
         topic = self._extract_topic(messages)
 

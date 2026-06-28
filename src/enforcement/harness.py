@@ -151,8 +151,11 @@ class EnforcementHarness:
                 messages = result.modified_messages
             if result.injection_text:
                 enforcement_context += result.injection_text + "\n\n"
-            if not result.passed:
-                log.total_violations += 1
+            # Pre-gen Tier-3 is advisory (reformulation injection into the
+            # planner context), NOT a real output violation — do not count it
+            # in total_violations (would inflate the violation-rate metric
+            # used in §5.8/§7.1). The advisory event is still recorded in
+            # log.tier3_pre.passed for diagnostics.
 
         # Tier 2: Mind model injection (pre-generation)
         if self.enable_tier2:
@@ -191,6 +194,19 @@ class EnforcementHarness:
         ctx = self._build_context()
         log = EnforcementLog()
         replan_feedback: str | None = None
+
+        # Non-text actions legitimately have empty text (the planner prompt
+        # allows "empty for non-text actions": REVERT, REPORT, AWARD_DELTA,
+        # LABEL, CLOSE, ...). There is no text to filter, so skip BOTH
+        # Tier-3 (anti-pattern text match) and Tier-1 (Expression-DNA
+        # embedding filter). An empty-input embedding sits ~6σ off the
+        # expression centroid (empirically measured on bge-large), which
+        # would otherwise falsely trigger regeneration + a safe-template
+        # fallback — wasting calls AND inflating the constraint-forced /
+        # safe-template count that §5.7 stratifies. Tier-2 (Mind Models)
+        # already ran in pre-generation, so the agent remains conditioned.
+        if not text or not text.strip():
+            return text, log, replan_feedback
 
         # Tier 3 post-gen safety check (outline §4.4.2 — Forced Reformulation
         # Protocol entry point). A `passed=False` here signals the agent loop

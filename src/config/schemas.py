@@ -68,15 +68,29 @@ class ExperimentConfig:
     alpha_tier2: float | None = None
     alpha_tier3: float | None = None
     num_clusters: int = 4        # K for clustering
-    cluster_method: str = "kmeans"  # "kmeans" or "hdbscan"
+    cluster_method: str = "kmeans"  # "kmeans" or "hdbscan" or "two_stage"
+    # Two-stage HDBSCAN tuning (NEW)
+    role_min_cluster_size: int | None = None
+    role_min_samples: int | None = None
+    style_min_cluster_size: int | None = None
+    style_min_samples: int | None = None
+    target_min_leaves: int = 30
+    target_max_leaves: int = 80
+    scaler: str = "robust"       # "standard" | "robust"
+    impute_orphans: bool = False
+    cluster_selection_method: str = "eom"  # "eom" | "leaf"
+    min_style_silhouette: float = 0.10
+    style_umap_dim: int = 15
     top_n_threads: int = 20      # representative threads for skill compilation
     max_threads: int | None = None  # cap on threads loaded per dataset (None = no cap)
+    max_sim_threads: int = 5     # cap on threads used per simulation cell
     checkpoint_every: int = 5    # save state every N rounds
     max_concurrency: int = 4     # parallel LLM calls
     max_context_items: int = 5       # memory items shown per turn (to planner)
     per_msg_token_ratio: int = 10    # per-msg budget = max_memory_tokens // ratio
     per_msg_token_floor: int = 60    # per-msg token floor (legacy fallback)
     max_thread_messages: int = 5     # recent thread messages shown in prompt
+    reflection_interval: int = 10    # periodic reflection every N rounds
     seed: int = 42
     backend: str = "base"
     # Exp 2 scale test

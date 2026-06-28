@@ -57,24 +57,38 @@ def structural_fidelity(
 ) -> float:
     """Correlation of network structural features.
 
-    Compares degree distribution, clustering coefficient, etc.
+    Compares a richer set of graph descriptors (degree moments, clustering,
+    size, density) on a log scale. This avoids the saturation problem of the
+    previous unit-vector normalization, which produced ~0.934 for all
+    conditions regardless of absolute graph scale.
 
     Returns:
-        Correlation coefficient in [-1, 1]. Higher = better fidelity.
+        Similarity score in [0, 1]. Higher = better fidelity.
     """
     def _graph_features(g: nx.Graph) -> np.ndarray:
-        degrees = sorted([d for _, d in g.degree()])
-        if not degrees:
-            return np.zeros(5)
+        degrees = np.array(sorted((d for _, d in g.degree()), reverse=True))
+        if degrees.size == 0:
+            return np.zeros(11)
 
         clustering = list(nx.clustering(g).values())
-        return np.array([
-            np.mean(degrees),
-            np.std(degrees),
-            np.mean(clustering) if clustering else 0,
+        clust = np.array(clustering) if clustering else np.zeros(1)
+
+        # Rich feature vector; log1p stabilizes across huge scale differences
+        # (real graph ~38k nodes vs. sim graph ~30 nodes).
+        feats = np.array([
+            g.number_of_nodes(),
             g.number_of_edges(),
             nx.density(g),
+            float(np.mean(degrees)),
+            float(np.std(degrees)),
+            float(np.median(degrees)),
+            float(np.max(degrees)),
+            float(np.percentile(degrees, 75)),
+            float(np.percentile(degrees, 25)),
+            float(np.mean(clust)),
+            float(np.std(clust)),
         ])
+        return np.log1p(feats)
 
     sim_feat = _graph_features(sim_graph)
     real_feat = _graph_features(real_graph)
@@ -82,13 +96,14 @@ def structural_fidelity(
     if np.all(sim_feat == 0) or np.all(real_feat == 0):
         return 0.0
 
-    # Normalize features
-    norm_factor = np.linalg.norm(real_feat)
-    if norm_factor > 0:
-        real_feat = real_feat / norm_factor
-        sim_feat = sim_feat / (np.linalg.norm(sim_feat) or 1)
+    # Pearson correlation on log-scaled features; mapped to [0, 1].
+    if np.std(sim_feat) == 0 or np.std(real_feat) == 0:
+        return 0.0
 
-    return float(1.0 - np.linalg.norm(sim_feat - real_feat))
+    corr = float(np.corrcoef(sim_feat, real_feat)[0, 1])
+    if np.isnan(corr):
+        return 0.0
+    return float((corr + 1.0) / 2.0)
 
 
 class MesoMetrics:

@@ -1,183 +1,159 @@
-"""Multi-endpoint pool with health tracking and automatic failover.
+"""Multi-endpoint pool with round-robin, failure tracking, dead-endpoint
+detection, and cooldown-based revival.
 
-Each model in ``models.yaml`` can list multiple endpoints (base_url +
-api_key + model-name override). :class:`EndpointPool` maintains a
-round-robin cursor over alive endpoints, tracks consecutive failures per
-endpoint, and marks endpoints dead when they cross a configurable
-threshold.
-
-When all endpoints are dead, callers should raise
-:class:`AllEndpointsExhausted`.
+Each model can be backed by multiple endpoints (proxies / API keys). The pool
+round-robins across alive endpoints; after ``failure_threshold`` consecutive
+failures an endpoint is marked dead and skipped.  Dead endpoints are
+automatically revived after ``cooldown_seconds`` so that transient network
+outages do not permanently exhaust the pool during long experiments.
+When all endpoints are dead AND none have expired their cooldown,
+:class:`AllEndpointsExhausted` is raised.
 """
 
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass, field
-from typing import Any
 
 from loguru import logger
-from openai import AsyncOpenAI
+
+from src.llm.exceptions import AllEndpointsExhausted
 
 
 @dataclass
 class EndpointConfig:
-    """User-facing endpoint definition from models.yaml."""
-    base_url: str = ""
-    api_key: str = ""
-    model: str = ""  # per-endpoint model-name override (empty = use parent)
+    """Static configuration for one endpoint."""
+    base_url: str
+    api_key: str
+    model: str = ""  # per-endpoint model-id override
 
 
 @dataclass
 class EndpointState:
-    """Runtime state for a single endpoint."""
+    """Runtime state for one endpoint."""
     config: EndpointConfig
-    client: AsyncOpenAI
-    model: str          # resolved model name (endpoint override or parent)
+    client: object  # AsyncOpenAI
+    model: str
+    idx: int
+    alive: bool = True
     consecutive_failures: int = 0
-    dead: bool = False
-    # Opaque identifier for logging (index in the pool).
-    idx: int = 0
+    total_successes: int = 0
+    total_failures: int = 0
+    # Monotonic timestamp when the endpoint was marked dead.
+    # 0.0 means never marked dead (or has been revived).
+    dead_since: float = 0.0
 
 
 class EndpointPool:
-    """Round-robin pool of endpoints with health-based eviction.
+    """Round-robin pool of endpoints with automatic dead-endpoint fencing
+    and cooldown-based revival.
 
-    Usage::
-
-        pool = EndpointPool(model_name="deepseek-v4-flash", endpoints=[...],
-                            failure_threshold=10)
-        # ... on each call:
-        ep = await pool.pick_alive()           # raises AllEndpointsExhausted if none
-        try:
-            content = await do_call(ep)
-            pool.record_success(ep)
-        except Exception:
-            pool.record_failure(ep, exc)
-            raise
+    Dead endpoints are revived after ``cooldown_seconds`` (default 30 min).
+    This prevents permanent pool exhaustion during long experiment runs
+    where transient network issues may mark endpoints dead temporarily.
     """
 
     def __init__(
         self,
         model_name: str,
         endpoints: list[EndpointState],
-        failure_threshold: int = 10,
+        failure_threshold: int = 15,
+        cooldown_seconds: float = 1800.0,
     ):
         self.model_name = model_name
-        self._endpoints = endpoints
+        self._endpoints: list[EndpointState] = list(endpoints)
         self.failure_threshold = failure_threshold
-        self._cursor = 0
-        self._rounds = 0
-
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
-
-    @property
-    def alive(self) -> list[EndpointState]:
-        return [ep for ep in self._endpoints if not ep.dead]
-
-    @property
-    def alive_count(self) -> int:
-        return sum(1 for ep in self._endpoints if not ep.dead)
-
-    @property
-    def dead_count(self) -> int:
-        return sum(1 for ep in self._endpoints if ep.dead)
-
-    @property
-    def all_dead(self) -> bool:
-        return self.alive_count == 0
+        self.cooldown_seconds = cooldown_seconds
+        self._cursor: int = 0
+        self._lock = asyncio.Lock()
 
     @property
     def total_endpoints(self) -> int:
         return len(self._endpoints)
 
-    # ------------------------------------------------------------------
-    # Core operations
-    # ------------------------------------------------------------------
+    @property
+    def alive_count(self) -> int:
+        return sum(1 for ep in self._endpoints if ep.alive)
+
+    @property
+    def all_dead(self) -> bool:
+        return self.alive_count == 0 and self.total_endpoints > 0
+
+    def _revive_cooled_endpoints(self) -> None:
+        """Check dead endpoints and revive those whose cooldown has expired.
+
+        Must be called while holding ``self._lock``.
+        """
+        now = time.monotonic()
+        for ep in self._endpoints:
+            if not ep.alive and ep.dead_since > 0:
+                elapsed = now - ep.dead_since
+                if elapsed >= self.cooldown_seconds:
+                    ep.alive = True
+                    ep.consecutive_failures = 0
+                    ep.dead_since = 0.0
+                    logger.info(
+                        f"EndpointPool[{self.model_name}]#{ep.idx} REVIVED "
+                        f"after {elapsed:.0f}s cooldown "
+                        f"(total_successes={ep.total_successes}, "
+                        f"total_failures={ep.total_failures})"
+                    )
 
     async def pick_alive(self) -> EndpointState:
-        """Return the next alive endpoint (round-robin).
+        """Round-robin to the next alive endpoint.
+
+        When all endpoints are dead, attempts to revive any whose cooldown
+        has expired before raising :class:`AllEndpointsExhausted`.
 
         Raises:
-            AllEndpointsExhausted: when no alive endpoint remains.
+            AllEndpointsExhausted: when all endpoints are dead and none
+                have expired their cooldown.
         """
-        from src.llm.exceptions import AllEndpointsExhausted
-
-        if self.all_dead:
+        async with self._lock:
+            # Attempt revival before checking all_dead
+            if self.all_dead:
+                self._revive_cooled_endpoints()
+            if self.all_dead:
+                raise AllEndpointsExhausted(
+                    self.model_name, self.total_endpoints
+                )
+            for _ in range(self.total_endpoints):
+                self._cursor = (self._cursor + 1) % self.total_endpoints
+                ep = self._endpoints[self._cursor]
+                if ep.alive:
+                    return ep
+            # One more revival attempt in case cursor skipped a just-revived ep
+            self._revive_cooled_endpoints()
+            for _ in range(self.total_endpoints):
+                self._cursor = (self._cursor + 1) % self.total_endpoints
+                ep = self._endpoints[self._cursor]
+                if ep.alive:
+                    return ep
             raise AllEndpointsExhausted(self.model_name, self.total_endpoints)
 
-        alive = self.alive
-        # Advance cursor and wrap.  Use a simple round-robin so load is
-        # spread evenly across alive endpoints; when one endpoint is
-        # performing worse than others its failure counter will catch up
-        # and evict it.
-        self._cursor = (self._cursor + 1) % len(alive)
-        self._rounds += 1
-        return alive[self._cursor]
+    def record_success(self, ep_state: EndpointState) -> None:
+        """Reset the consecutive-failure counter on success."""
+        ep_state.consecutive_failures = 0
+        ep_state.total_successes += 1
 
-    def record_success(self, endpoint: EndpointState) -> None:
-        """Reset the consecutive-failure counter for *endpoint*.
+    def record_failure(self, ep_state: EndpointState, error: str = "") -> None:
+        """Increment failure counters; mark dead at threshold.
 
-        Also resurrects a previously-dead endpoint (manual reset scenario).
+        When an endpoint hits the consecutive-failure threshold it is
+        fenced (``alive=False``) and its ``dead_since`` timestamp is
+        recorded.  :meth:`pick_alive` will auto-revive it after the
+        cooldown period expires.
         """
-        if endpoint.consecutive_failures > 0:
-            logger.info(
-                f"EndpointPool[{self.model_name}]#{endpoint.idx}: "
-                f"reset failure counter (was {endpoint.consecutive_failures})"
-            )
-        endpoint.consecutive_failures = 0
-        if endpoint.dead:
-            logger.warning(
-                f"EndpointPool[{self.model_name}]#{endpoint.idx}: "
-                f"resurrected (previously dead)"
-            )
-            endpoint.dead = False
-
-    def record_failure(self, endpoint: EndpointState, error: str = "") -> None:
-        """Increment failure counter; mark dead if threshold crossed."""
-        endpoint.consecutive_failures += 1
-        failures = endpoint.consecutive_failures
-        logger.warning(
-            f"EndpointPool[{self.model_name}]#{endpoint.idx}: "
-            f"failure {failures}/{self.failure_threshold}: {error}"
-        )
-        if failures >= self.failure_threshold and not endpoint.dead:
-            endpoint.dead = True
+        ep_state.consecutive_failures += 1
+        ep_state.total_failures += 1
+        if ep_state.consecutive_failures >= self.failure_threshold:
+            ep_state.alive = False
+            ep_state.dead_since = time.monotonic()
             logger.error(
-                f"EndpointPool[{self.model_name}]#{endpoint.idx}: "
-                f"MARKED DEAD after {failures} consecutive failures "
-                f"(base_url={endpoint.config.base_url})"
+                f"EndpointPool[{self.model_name}]#{ep_state.idx} marked DEAD "
+                f"after {ep_state.consecutive_failures} consecutive failures "
+                f"(threshold={self.failure_threshold}, "
+                f"cooldown={self.cooldown_seconds:.0f}s). "
+                f"Last error: {error[:200]}"
             )
-
-    # ------------------------------------------------------------------
-    # Admin
-    # ------------------------------------------------------------------
-
-    def reset_all(self) -> None:
-        """Reset all endpoints to alive with zero failures."""
-        for ep in self._endpoints:
-            ep.consecutive_failures = 0
-            ep.dead = False
-        logger.info(
-            f"EndpointPool[{self.model_name}]: reset all {len(self._endpoints)} endpoints"
-        )
-
-    def status(self) -> dict[str, Any]:
-        """Return a human-readable status dict for logging/debugging."""
-        return {
-            "model": self.model_name,
-            "total": self.total_endpoints,
-            "alive": self.alive_count,
-            "dead": self.dead_count,
-            "endpoints": [
-                {
-                    "idx": ep.idx,
-                    "base_url": ep.config.base_url,
-                    "model": ep.model,
-                    "consecutive_failures": ep.consecutive_failures,
-                    "dead": ep.dead,
-                }
-                for ep in self._endpoints
-            ],
-        }

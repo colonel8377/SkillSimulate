@@ -134,8 +134,8 @@ models:
     max_thinking_tokens: 32768   # reserved reasoning budget
     cost_per_1k_input: 0.10
     cost_per_1k_output: 0.40
-    snapshot_date: ""
-    commit_hash: ""
+    snapshot_date: "2025-06-26"   # DeepSeek-V4-Flash public release date
+    commit_hash: "DeepSeek-V4-Flash"  # proprietary API — model id as provenance
 
   - name: deepseek-v4-pro
     model: DeepSeek-V4-Pro
@@ -149,5 +149,5 @@ models:
     max_thinking_tokens: 32768
     cost_per_1k_input: 0.55
     cost_per_1k_output: 2.19
-    snapshot_date: ""
-    commit_hash: ""
+    snapshot_date: "2025-06-26"   # DeepSeek-V4-Pro public release date
+    commit_hash: "DeepSeek-V4-Pro"  # proprietary API — model id as provenance

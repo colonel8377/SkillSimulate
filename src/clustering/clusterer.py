@@ -1,8 +1,9 @@
-"""Behavioral clustering with two-stage feature extraction.
+"""Two-stage archetype clustering.
 
-Stage 1: behavioral signals (reply depth, edit freq, stance shift, conflict ratio)
-Stage 2: language embeddings (Sentence-BERT)
-Combined via adaptive weight concatenation.
+Stage 1 (role): cluster users by their action-policy behaviour vector (HDBSCAN).
+Stage 2 (style): within each role, sub-cluster by language embedding when the
+role is linguistically separable. A leaf = role × style = the distillation unit.
+HDBSCAN noise from stage 1 is kept as label -1 (out-of-archetype long tail).
 """
 
 from __future__ import annotations
@@ -10,9 +11,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
+from loguru import logger
 from sklearn.cluster import KMeans
 from sklearn.metrics import davies_bouldin_score, silhouette_score
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler, StandardScaler
 
 from src.clustering.embeddings import EmbeddingExtractor
 from src.clustering.features import FeatureExtractor, UserFeatures
@@ -30,6 +32,11 @@ class ClusterResult:
     behavioral_weight: float
     language_weight: float
     user_features: dict[str, UserFeatures]
+    # Per-leaf centroids in both spaces (downstream skill compile / repr selection).
+    leaf_behavior_centroids: dict = field(default_factory=dict)
+    leaf_language_centroids: dict = field(default_factory=dict)
+    pre_impute_orphans: int = 0           # HDBSCAN noise count before imputation
+    n_orphans_kept: int = 0               # -1 users left un-imputed
 
     def get_cluster_members(self, cluster_id: int) -> list[str]:
         return [uid for uid, cid in self.labels.items() if cid == cluster_id]
@@ -39,186 +46,346 @@ class ClusterResult:
 
 
 class BehavioralClusterer:
-    """Two-stage behavioral + language clustering."""
+    """Two-stage archetype clustering: role (behaviour) → style (language).
+
+    Stage 1 partitions users by their *action policy* (the behavioural feature
+    vector) into interpretable role groups. Stage 2 sub-divides each role by
+    language style, but only when the role is linguistically separable. A leaf
+    = (role × style) and is the distillation unit. HDBSCAN noise from stage 1
+    is kept as label ``-1`` (out-of-archetype long-tail) — never force-merged.
+    """
 
     def __init__(
         self,
-        method: str = "kmeans",
-        n_clusters: int = 4,
-        behavioral_weight: float | None = None,
-        language_weight: float | None = None,
+        method: str = "two_stage",
+        n_clusters: int = -1,                 # back-compat single-stage only
+        role_min_cluster_size: int | None = None,
+        role_min_samples: int | None = None,
+        style_min_cluster_size: int | None = None,
+        style_min_samples: int | None = None,
+        min_style_silhouette: float = 0.10,   # gate for accepting a style split
+        target_min_leaves: int = 30,
+        target_max_leaves: int = 80,
+        scaler: str = "robust",               # "standard" | "robust"
+        impute_orphans: bool = False,         # keep -1 by default
+        cluster_selection_method: str = "eom",  # "eom" | "leaf"
         max_k: int = 8,
         min_k: int = 2,
         random_state: int = 42,
+        max_msgs_per_user: int | None = 25,   # cap per-user msgs for embedding
+        metric_sample: int = 10_000,          # silhouette/DB subsample cap
+        style_method: str = "umap",           # umap (no PCA — loses too much variance)
+        style_umap_dim: int = 15,             # UMAP output dim for style clustering
+        # back-compat (single-stage concat weights); unused by two_stage
+        behavioral_weight: float | None = None,
+        language_weight: float | None = None,
     ):
         self.method = method
         self.n_clusters = n_clusters
-        # None = adaptive (data-driven); explicit values = fixed weights
-        self.behavioral_weight = behavioral_weight
-        self.language_weight = language_weight
-        self._adaptive = behavioral_weight is None or language_weight is None
+        self.role_min_cluster_size = role_min_cluster_size
+        self.role_min_samples = role_min_samples
+        self.style_min_cluster_size = style_min_cluster_size
+        self.style_min_samples = style_min_samples
+        self.min_style_silhouette = min_style_silhouette
+        self.target_min_leaves = target_min_leaves
+        self.target_max_leaves = target_max_leaves
+        self.scaler = scaler
+        self.impute_orphans = impute_orphans
+        self.cluster_selection_method = cluster_selection_method
         self.max_k = max_k
         self.min_k = min_k
         self.random_state = random_state
+        self.max_msgs_per_user = max_msgs_per_user
+        self.metric_sample = metric_sample
+        self.style_method = style_method
+        self.style_umap_dim = style_umap_dim
+        self.behavioral_weight = behavioral_weight
+        self.language_weight = language_weight
 
         self.feature_extractor = FeatureExtractor()
         self.embedding_extractor = EmbeddingExtractor()
 
     def fit(self, threads: list[Thread]) -> ClusterResult:
-        """Cluster all users from threads.
-
-        Args:
-            threads: List of conversation threads.
-
-        Returns:
-            ClusterResult with assignments and quality metrics.
-        """
-        # Stage 1: behavioral features
+        # ---- features (behaviour) + language embeddings ----
         user_features = self.feature_extractor.extract_all(threads)
 
-        # Stage 2: language embeddings
-        user_messages = self._group_messages_by_user(threads)
-        user_embeddings = self.embedding_extractor.embed_all_users(user_messages)
+        user_msgs = self._group_messages_by_user(threads)
+        logger.info(f"Clustering {len(user_features)} users")
+        user_embeddings = self.embedding_extractor.embed_all_users(user_msgs)
 
-        # Combine features
-        user_ids = list(user_features.keys())
-        behavioral_matrix = np.stack([
-            user_features[uid].to_vector() for uid in user_ids
-        ])
-        language_matrix = np.stack([
-            user_embeddings[uid] for uid in user_ids
-        ])
+        return self._finish(user_features, user_embeddings)
 
-        # Normalize
-        behavioral_scaler = StandardScaler()
-        language_scaler = StandardScaler()
-        behavioral_normed = behavioral_scaler.fit_transform(behavioral_matrix)
-        language_normed = language_scaler.fit_transform(language_matrix)
-
-        # Adaptive weight concatenation
-        if self._adaptive:
-            bw, lw = self._compute_adaptive_weights(behavioral_normed, language_normed)
-        else:
-            bw = self.behavioral_weight
-            lw = self.language_weight
-
-        combined = np.hstack([
-            bw * behavioral_normed,
-            lw * language_normed,
-        ])
-
-        # Cluster
-        if self.method == "hdbscan":
-            labels, centroids, k = self._cluster_hdbscan(combined)
-        else:
-            k, labels, centroids = self._select_k_and_cluster(combined)
-
-        # Quality metrics
-        sil = silhouette_score(combined, labels) if len(set(labels)) > 1 else 0.0
-        db = davies_bouldin_score(combined, labels) if len(set(labels)) > 1 else 0.0
-
-        label_dict = {uid: int(lbl) for uid, lbl in zip(user_ids, labels)}
-
-        return ClusterResult(
-            labels=label_dict,
-            n_clusters=k,
-            centroids=centroids,
-            silhouette_score=sil,
-            davies_bouldin_score=db,
-            behavioral_weight=bw,
-            language_weight=lw,
-            user_features=user_features,
-        )
-
-    def _compute_adaptive_weights(
+    def fit_from_vectors(
         self,
-        behavioral: np.ndarray,
-        language: np.ndarray,
-    ) -> tuple[float, float]:
-        """Compute data-driven weights based on feature variance ratio.
+        user_features: dict,
+        user_embeddings: dict,
+    ) -> ClusterResult:
+        """Cluster from pre-computed features + embeddings (streaming path).
 
-        Higher-variance feature space gets proportionally more weight,
-        capturing which modality carries more discriminative signal.
+        ``user_features`` / ``user_embeddings`` share the same user-id keys.
         """
-        # Mean per-feature variance (averaged across dimensions)
-        beh_var = float(np.mean(np.var(behavioral, axis=0)))
-        lang_var = float(np.mean(np.var(language, axis=0)))
+        return self._finish(user_features, user_embeddings)
 
-        if beh_var + lang_var == 0:
-            raise ValueError(
-                "Behavioral and language feature variances are both zero; "
-                "cannot compute adaptive clustering weights."
+    def _finish(self, user_features: dict, user_embeddings: dict) -> ClusterResult:
+        user_ids = [u for u in user_features if u in user_embeddings]
+        if len(user_ids) < self.min_k:
+            labels = {u: 0 for u in user_features}
+            return ClusterResult(
+                labels=labels, n_clusters=1,
+                centroids=np.zeros((1, 1)), silhouette_score=0.0,
+                davies_bouldin_score=0.0, behavioral_weight=0.0,
+                language_weight=0.0, user_features=user_features,
             )
 
-        # Weight proportional to variance contribution
-        bw = beh_var / (beh_var + lang_var)
-        lw = 1.0 - bw
+        behavioral = self._get_scaler().fit_transform(
+            np.stack([user_features[u].to_vector() for u in user_ids])
+        )
+        language = np.stack([user_embeddings[u] for u in user_ids])
 
-        # Clamp to reasonable range [0.2, 0.8] to avoid one modality dominating
-        bw = max(0.2, min(0.8, bw))
-        lw = 1.0 - bw
+        # One global UMAP fit (cosine → style_umap_dim) over all users. This is
+        # cheaper than per-role fits, gives a consistent style space for both
+        # stage-2 sub-clustering and orphan assignment, and is the standard
+        # embedding-clustering pipeline. No PCA (loses too much variance here).
+        logger.info(f"UMAP-reducing {language.shape[0]}×{language.shape[1]} language vectors → {self.style_umap_dim}-D ...")
+        lang_red = self._reduce_language(language)
+        lang_red = self._get_scaler().fit_transform(lang_red)
 
-        return bw, lw
+        if self.method in ("kmeans", "hdbscan"):
+            leaf_labels = self._single_stage(behavioral, lang_red)
+        else:
+            leaf_labels = self._two_stage(behavioral, lang_red)
 
-    def _select_k_and_cluster(self, X: np.ndarray) -> tuple[int, np.ndarray, np.ndarray]:
-        """Select optimal K via silhouette + Davies-Bouldin, then cluster."""
-        if self.n_clusters > 0:
-            k = min(self.n_clusters, len(X) - 1)
-            labels, centroids = self._kmeans(X, k)
-            return k, labels, centroids
+        n_pre_noise = int((leaf_labels == -1).sum())
+        logger.info(
+            f"HDBSCAN: {(leaf_labels >= 0).sum()} assigned, "
+            f"{n_pre_noise} orphans ({n_pre_noise/len(user_ids):.1%}) before imputation"
+        )
 
-        best_k = self.min_k
-        best_score = -1.0
-        for k in range(self.min_k, min(self.max_k + 1, len(X))):
-            labels, _ = self._kmeans(X, k)
-            if len(set(labels)) < 2:
-                continue
-            sil = silhouette_score(X, labels)
-            db = davies_bouldin_score(X, labels)
-            # Combined score: maximize silhouette, minimize DB
-            score = sil - 0.5 * db
-            if score > best_score:
-                best_score = score
-                best_k = k
+        # Orphan handling: keep -1 by default; only impute when explicitly asked.
+        leaf_ids = sorted(set(leaf_labels.tolist()) - {-1})
+        n_orphans_kept = n_pre_noise
+        if self.impute_orphans and leaf_ids:
+            leaf_labels = self._impute_orphans(leaf_labels, behavioral, lang_red, leaf_ids)
+            n_orphans_kept = 0
 
-        labels, centroids = self._kmeans(X, best_k)
-        return best_k, labels, centroids
+        # combined space for sanity metrics (both low-dim now — no PCA)
+        combined = np.hstack([behavioral, lang_red])
+        mask = leaf_labels >= 0
+        uniq = set(leaf_labels[mask].tolist())
+        sil = db = 0.0
+        if len(uniq) > 1 and mask.sum() > len(uniq):
+            idx = np.where(mask)[0]
+            if len(idx) > self.metric_sample:
+                rng = np.random.default_rng(self.random_state)
+                idx = rng.choice(idx, self.metric_sample, replace=False)
+            Xs, ys = combined[idx], leaf_labels[idx]
+            if len(set(ys.tolist())) > 1:
+                sil = float(silhouette_score(Xs, ys))
+                db = float(davies_bouldin_score(Xs, ys))
+
+        # per-leaf centroids in BOTH spaces (kept for downstream skill compile /
+        # representative selection). language centroids use the raw embedding.
+        beh_centroids = {
+            int(lid): behavioral[leaf_labels == lid].mean(axis=0) for lid in leaf_ids
+        }
+        lang_centroids = {
+            int(lid): language[leaf_labels == lid].mean(axis=0) for lid in leaf_ids
+        }
+        centroids = (np.stack([lang_centroids[l] for l in leaf_ids])
+                     if leaf_ids else np.zeros((0, language.shape[1])))
+
+        label_dict = {u: int(lbl) for u, lbl in zip(user_ids, leaf_labels)}
+        for u in user_features:
+            label_dict.setdefault(u, leaf_ids[0] if leaf_ids else 0)
+
+        logger.info(
+            f"Two-stage: {len(leaf_ids)} leaves, "
+            f"{n_pre_noise} pre-impute orphans ({n_pre_noise/len(user_ids):.1%}), "
+            f"silhouette={sil:.3f}, db={db:.3f}"
+        )
+
+        cr = ClusterResult(
+            labels=label_dict,
+            n_clusters=len(leaf_ids),
+            centroids=centroids,
+            silhouette_score=float(sil),
+            davies_bouldin_score=float(db),
+            behavioral_weight=1.0,
+            language_weight=1.0,
+            user_features=user_features,
+        )
+        cr.leaf_behavior_centroids = beh_centroids
+        cr.leaf_language_centroids = lang_centroids
+        cr.pre_impute_orphans = n_pre_noise
+        cr.n_orphans_kept = n_orphans_kept
+        return cr
+
+    def _impute_orphans(
+        self, leaf_labels: np.ndarray, behavioral: np.ndarray,
+        lang_red: np.ndarray, leaf_ids: list[int],
+    ) -> np.ndarray:
+        """Assign every -1 user to its nearest leaf (combined behavior+style)."""
+        noise_idx = np.where(leaf_labels == -1)[0]
+        if len(noise_idx) == 0 or not leaf_ids:
+            return leaf_labels
+        combined = np.hstack([behavioral, lang_red])
+        leaf_centroids = np.stack([combined[leaf_labels == lid].mean(axis=0) for lid in leaf_ids])
+        from scipy.spatial.distance import cdist
+        # cdist keeps memory O(n_orphans × n_leaves) instead of a 3-D broadcast
+        dists = cdist(combined[noise_idx], leaf_centroids)
+        nearest = dists.argmin(axis=1)
+        for i, oidx in enumerate(noise_idx):
+            leaf_labels[oidx] = leaf_ids[int(nearest[i])]
+        logger.info(f"Imputed {len(noise_idx)} orphans → nearest leaf")
+        return leaf_labels
+
+    def _get_scaler(self):
+        if self.scaler == "robust":
+            return RobustScaler(quantile_range=(5.0, 95.0))
+        return StandardScaler()
+
+    def _compute_role_mcs(self, n: int) -> int:
+        """Auto-tune role min_cluster_size to hit the target leaf range."""
+        if self.role_min_cluster_size is not None:
+            return self.role_min_cluster_size
+        # Sub-linear growth so huge corpora don't force mega-clusters.
+        mcs = max(200, int(n ** 0.65))
+        min_mcs = n // (self.target_max_leaves * 2)
+        max_mcs = n // self.target_min_leaves
+        return int(np.clip(mcs, min_mcs, max_mcs))
+
+    def _compute_style_mcs(self, role_size: int) -> int:
+        if self.style_min_cluster_size is not None:
+            return self.style_min_cluster_size
+        return max(50, role_size // 20)
+
+    # ------------------------------------------------------------------
+    def _two_stage(self, behavioral: np.ndarray, lang_red: np.ndarray) -> np.ndarray:
+        """Stage 1 role (behaviour) → stage 2 style (reduced language). Leaf ids."""
+        n = behavioral.shape[0]
+        role_mcs = self._compute_role_mcs(n)
+        role_min_samples = self.role_min_samples or max(1, role_mcs // 5)
+        logger.info(f"Stage 1 roles: n={n}, min_cluster_size={role_mcs}, min_samples={role_min_samples}")
+        roles = self._hdbscan(behavioral, role_mcs, role_min_samples)
+
+        leaf = np.full(n, -1, dtype=int)
+        next_leaf = 0
+        for r in sorted(set(roles.tolist())):
+            if r == -1:
+                continue  # out-of-cluster long tail stays -1
+            idx = np.where(roles == r)[0]
+            sub_lang = lang_red[idx]
+            styles = self._maybe_split_styles(sub_lang, len(idx))
+            if styles is None:
+                # role not linguistically separable → one leaf
+                leaf[idx] = next_leaf
+                next_leaf += 1
+            else:
+                # map each style (incl. its -1 noise) to leaf ids; style-noise
+                # joins the role's default (first) leaf rather than dropping out
+                default_leaf = next_leaf
+                style_to_leaf: dict[int, int] = {}
+                for s in sorted(set(styles.tolist())):
+                    if s == -1:
+                        continue
+                    style_to_leaf[s] = next_leaf
+                    next_leaf += 1
+                for j, s in zip(idx, styles):
+                    leaf[j] = style_to_leaf.get(int(s), default_leaf)
+        return leaf
+
+    def _reduce_language(self, lang: np.ndarray) -> np.ndarray:
+        """Global UMAP reduction of language embeddings (cosine → umap_dim).
+
+        UMAP preserves neighborhood structure (not variance) and lands in low-D
+        where HDBSCAN's kNN is fast — the standard embedding-clustering pipeline.
+        No PCA: on this data PCA-50 retains only ~46% variance (too lossy).
+        """
+        if lang.shape[1] <= self.style_umap_dim:
+            return lang
+        import umap  # umap-learn is a hard dependency for the two-stage path
+        return umap.UMAP(
+            n_components=self.style_umap_dim,
+            metric="cosine",
+            random_state=self.random_state,
+            low_memory=True,
+            transform_seed=self.random_state,
+        ).fit_transform(lang)
+
+    def _maybe_split_styles(self, lang_red: np.ndarray, role_size: int) -> np.ndarray | None:
+        """Sub-cluster a role on the pre-reduced style space; real split only.
+
+        ``lang_red`` is already UMAP-reduced (low-D), so this is just a cheap
+        HDBSCAN + silhouette gate — no further dimensionality reduction here.
+        """
+        mcs = self._compute_style_mcs(role_size)
+        min_samples = self.style_min_samples or max(10, mcs // 5)
+        if role_size < max(2 * mcs, 20):
+            return None
+        X = self._get_scaler().fit_transform(lang_red)
+        styles = self._hdbscan(X, mcs, min_samples)
+        mask = styles >= 0
+        uniq = set(styles[mask].tolist())
+        if len(uniq) < 2 or mask.sum() <= len(uniq):
+            return None
+        idx = np.where(mask)[0]
+        if len(idx) > self.metric_sample:
+            rng = np.random.default_rng(self.random_state)
+            idx = rng.choice(idx, self.metric_sample, replace=False)
+        sil = silhouette_score(X[idx], styles[idx]) if len(set(styles[idx].tolist())) > 1 else 0.0
+        if sil < self.min_style_silhouette:
+            return None
+        logger.info(f"  Style split: role_size={role_size}, mcs={mcs}, styles={len(uniq)}, silhouette={sil:.3f}")
+        return styles
+
+    def _hdbscan(self, X: np.ndarray, min_cluster_size: int,
+                 min_samples: int | None = None) -> np.ndarray:
+        import hdbscan
+        mcs = max(2, int(min_cluster_size))
+        ms = max(1, int(min_samples)) if min_samples is not None else mcs
+        if X.shape[0] <= mcs:
+            return np.zeros(X.shape[0], dtype=int)
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=mcs,
+            min_samples=ms,
+            cluster_selection_method=self.cluster_selection_method,
+        )
+        return clusterer.fit_predict(X)
+
+    def _single_stage(self, behavioral: np.ndarray, language: np.ndarray) -> np.ndarray:
+        """Back-compat single-stage path (kmeans / hdbscan) on concatenated space."""
+        bw = self.behavioral_weight if self.behavioral_weight is not None else 0.5
+        lw = self.language_weight if self.language_weight is not None else 0.5
+        combined = np.hstack([bw * behavioral, lw * self._get_scaler().fit_transform(language)])
+        if self.method == "hdbscan":
+            mcs = self.role_min_cluster_size or max(5, combined.shape[0] // 20)
+            min_samples = self.role_min_samples or max(1, mcs // 5)
+            return self._hdbscan(combined, mcs, min_samples)
+        # kmeans with fixed or auto k
+        k = self.n_clusters if self.n_clusters and self.n_clusters > 0 else self.min_k
+        k = min(k, combined.shape[0] - 1)
+        return KMeans(n_clusters=k, random_state=self.random_state, n_init=10).fit_predict(combined)
 
     def _kmeans(self, X: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
         km = KMeans(n_clusters=k, random_state=self.random_state, n_init=10)
         labels = km.fit_predict(X)
         return labels, km.cluster_centers_
 
-    def _cluster_hdbscan(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
-        import hdbscan
-        clusterer = hdbscan.HDBSCAN(min_cluster_size=max(3, len(X) // 10))
-        labels = clusterer.fit_predict(X)
-        # HDBSCAN may produce noise (-1); assign noise to nearest cluster
-        unique_labels = set(labels) - {-1}
-        if not unique_labels:
-            # All noise — fall back to KMeans
-            return self._kmeans(X, self.min_k)
-        k = len(unique_labels)
-        # Compute centroids
-        centroids = np.zeros((k, X.shape[1]))
-        for i, lbl in enumerate(sorted(unique_labels)):
-            centroids[i] = X[labels == lbl].mean(axis=0)
-        # Assign noise points to nearest centroid
-        noise_mask = labels == -1
-        if noise_mask.any():
-            from scipy.spatial.distance import cdist
-            dists = cdist(X[noise_mask], centroids)
-            nearest = dists.argmin(axis=1)
-            labels[noise_mask] = nearest
-        return labels, centroids, k
-
     def _group_messages_by_user(self, threads: list[Thread]) -> dict[str, list[Message]]:
-        """Group all messages by user across threads."""
+        """Group messages by user, capping per-user to bound embedding cost.
+
+        Encoding every message of a multi-million-message corpus is the dominant
+        cost; a per-user sample of ``max_msgs_per_user`` messages yields a stable
+        mean embedding at a fraction of the cost.
+        """
         from collections import defaultdict
         user_msgs: dict[str, list[Message]] = defaultdict(list)
+        cap = self.max_msgs_per_user
         for thread in threads:
             for msg in thread.messages:
-                user_msgs[msg.user_id].append(msg)
+                lst = user_msgs[msg.user_id]
+                if cap is None or len(lst) < cap:
+                    lst.append(msg)
         return user_msgs
 
 

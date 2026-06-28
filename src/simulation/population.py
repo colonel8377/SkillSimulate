@@ -39,6 +39,7 @@ class PopulationBuilder:
         per_msg_token_ratio: int = 10,
         per_msg_token_floor: int = 60,
         max_thread_messages: int = 5,
+        reflection_interval: int = 10,
     ):
         """Initialize population builder.
 
@@ -60,6 +61,7 @@ class PopulationBuilder:
             per_msg_token_ratio: per-msg budget = max_memory_tokens // ratio.
             per_msg_token_floor: per-msg token floor.
             max_thread_messages: recent thread messages in planner prompt.
+            reflection_interval: periodic reflection every N rounds.
         """
         self.llm = llm_client
         self.model_name = model_name
@@ -75,6 +77,7 @@ class PopulationBuilder:
         self.per_msg_token_ratio = per_msg_token_ratio
         self.per_msg_token_floor = per_msg_token_floor
         self.max_thread_messages = max_thread_messages
+        self.reflection_interval = reflection_interval
         # Issue 1: derive the per-agent memory token budget from the
         # model endpoint's input-token cap. We reserve ~30% of the
         # input budget for system prompt + thread context + planner
@@ -274,6 +277,7 @@ class PopulationBuilder:
             per_msg_token_ratio=self.per_msg_token_ratio,
             per_msg_token_floor=self.per_msg_token_floor,
             max_thread_messages=self.max_thread_messages,
+            reflection_interval=self.reflection_interval,
         )
 
         # Per-tier alpha + backend kwargs for CADP agents

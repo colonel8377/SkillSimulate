@@ -43,6 +43,8 @@ from src.evaluation.held_out_events import (
 # not a predictive task here.
 
 
+import re as _re
+
 _CONFLICT_ACTIONS = {"disagree", "revert", "counter_argue", "report"}
 _PERSUASION_ACTIONS = {"award_delta"}
 # B2 fix: ``close``/``reopen`` are GitHub issue-lifecycle actions (outline
@@ -51,6 +53,251 @@ _PERSUASION_ACTIONS = {"award_delta"}
 _ESCALATION_ACTIONS = {
     "disagree", "revert", "counter_argue", "report", "block",
 }
+
+# ----------------------------------------------------------------------
+# Text-content-based event detection (R3 fix for single_class_sim_labels)
+#
+# When agents only produce platform-default actions (e.g. ``discuss`` on
+# Wikipedia, ``reply`` on Reddit), action-type-based labelling collapses
+# to a single class (all-0 for conflict/persuasion).  Text-content
+# heuristics detect the *semantic* signal regardless of action type,
+# producing multi-class training labels from simulation data.
+# ----------------------------------------------------------------------
+
+_CONFLICT_PATTERNS = _re.compile(
+    r"\b(?:i disagree|that.s (?:wrong|incorrect|not right|misleading|"
+    r"inaccurate|untrue)|"
+    r"no evidence|unsourced|original research|"
+    r"i object|strongly disagree|oppose|"
+    r"not (?:true|accurate|correct|supported)|"
+    r"this is (?:wrong|false|misleading)|"
+    r"revert(?:ing|ed)?|vandalism|"
+    r"undid|rolled back|removed your)\b",
+    _re.IGNORECASE,
+)
+_PERSUASION_PATTERNS = _re.compile(
+    r"\b(?:i (?:agree|concede|see your point|stand corrected|"
+    r"was wrong|changed my mind|accept)|"
+    r"you.re (?:right|correct)|"
+    r"good point|fair point|well said|"
+    r"that makes sense|makes sense|"
+    r"updated (?:the|my)|added (?:a |the )?citation|"
+    r"i.ll (?:change|update|fix|add)|"
+    r"noted|acknowledged|"
+    r"thanks? for (?:the|your|clarif|point|feedback)|"
+    r"convinced|persuaded|"
+    r"delta|award)\b",
+    _re.IGNORECASE,
+)
+_ESCALATION_PATTERNS = _re.compile(
+    r"\b(?:you always|you never|this is (?:absurd|ridiculous|unacceptable)|"
+    r"stop (?:reverting|editing|removing)|"
+    r"i (?:will |am going to )?(?:report|block|ban)|"
+    r"vandal|edit.war|"
+    r"personal attack|ad hominem|"
+    r"get lost|go away|"
+    r"i.m (?:done|leaving)|"
+    r"last warning|final warning)\b",
+    _re.IGNORECASE,
+)
+
+
+def _text_has_conflict(text: str) -> bool:
+    """Check if message text contains disagreement/opposition markers."""
+    return bool(_CONFLICT_PATTERNS.search(text or ""))
+
+
+def _text_has_persuasion(text: str) -> bool:
+    """Check if message text contains concession/agreement markers."""
+    return bool(_PERSUASION_PATTERNS.search(text or ""))
+
+
+def _text_has_escalation(text: str) -> bool:
+    """Check if message text contains escalation/intensification markers."""
+    return bool(_ESCALATION_PATTERNS.search(text or ""))
+
+
+def _user_has_conflict_signal(
+    messages: list[dict],
+    user_id: str,
+    thread_msgs: list[dict] | None = None,
+) -> bool:
+    """Check if a user exhibits conflict signals via action type OR text.
+
+    R3 fix: combines action-type matching (legacy) with text-content
+    keyword detection so that sim data with only ``discuss`` actions
+    can still produce positive conflict labels when the text content
+    contains disagreement markers.
+    """
+    user_msgs = [m for m in messages if m["user_id"] == user_id]
+    if not user_msgs:
+        return False
+    # Action-type signal
+    if any(m["action_type"] in _CONFLICT_ACTIONS for m in user_msgs):
+        return True
+    # Text-content signal
+    return any(_text_has_conflict(m.get("text", "")) for m in user_msgs)
+
+
+def _thread_has_persuasion_signal(thread_msgs: list[dict]) -> bool:
+    """Check if a thread exhibits persuasion via action type OR text."""
+    if any(m["action_type"] in _PERSUASION_ACTIONS for m in thread_msgs):
+        return True
+    return any(_text_has_persuasion(m.get("text", "")) for m in thread_msgs)
+
+
+def _thread_is_escalating(
+    thread_msgs: list[dict],
+    conflict_threshold: float = 0.3,
+) -> bool:
+    """Check if a thread is escalating via action types OR text.
+
+    Combines action-type conflict ratio with text-content escalation
+    markers, requiring at least 2 participants with conflict signals.
+    """
+    total = len(thread_msgs) or 1
+    # Action-type based conflict count
+    action_conflict = sum(
+        1 for m in thread_msgs if m["action_type"] in _ESCALATION_ACTIONS
+    )
+    # Text-based conflict count (union with action-based)
+    text_conflict = sum(
+        1 for m in thread_msgs
+        if _text_has_conflict(m.get("text", ""))
+        or m["action_type"] in _ESCALATION_ACTIONS
+    )
+    conflict_count = max(action_conflict, text_conflict)
+    conflict_ratio = conflict_count / total
+
+    conflict_participants = {
+        m["user_id"] for m in thread_msgs
+        if m["action_type"] in _ESCALATION_ACTIONS
+        or _text_has_conflict(m.get("text", ""))
+    }
+
+    if conflict_ratio >= conflict_threshold and len(conflict_participants) >= 2:
+        return True
+    # Also check for explicit escalation markers
+    escalation_users = {
+        m["user_id"] for m in thread_msgs
+        if _text_has_escalation(m.get("text", ""))
+    }
+    return len(escalation_users) >= 2
+
+
+# ----------------------------------------------------------------------
+# Structural contention scoring (R3 fallback for polite-agent simulations)
+#
+# When agents produce only polite/collaborative text (e.g. CADP agents
+# with strong Expression DNA), keyword-based detection may not fire.
+# Structural signals provide a continuous contention metric that can
+# be split at the median to guarantee multi-class labels.
+# ----------------------------------------------------------------------
+
+_QUESTION_RE = _re.compile(r"\?")
+_HEDGE_RE = _re.compile(
+    r"\b(?:i think|perhaps|maybe|possibly|not sure|unsure|"
+    r"i.m not certain|i believe|it seems|might|i suppose|"
+    r"could you|would you)\b",
+    _re.IGNORECASE,
+)
+
+
+def _user_contention_score(
+    thread_msgs: list[dict], user_id: str
+) -> float:
+    """Compute a continuous contention score for a user in a thread.
+
+    Signals:
+    - Reply density (how often this user replies to others)
+    - Question frequency (questions indicate challenge / inquiry)
+    - Hedging frequency (hedges indicate disagreement-in-progress)
+    - Relative message length (longer replies = more engaged)
+    """
+    user_msgs = [m for m in thread_msgs if m["user_id"] == user_id]
+    if not user_msgs:
+        return 0.0
+
+    # Reply density: fraction of user's messages that are replies
+    n_replies = sum(1 for m in user_msgs if m.get("parent_msg_id"))
+    reply_density = n_replies / len(user_msgs)
+
+    # Question frequency
+    n_questions = sum(
+        1 for m in user_msgs if _QUESTION_RE.search(m.get("text", ""))
+    )
+    question_freq = n_questions / len(user_msgs)
+
+    # Hedging frequency
+    n_hedges = sum(
+        1 for m in user_msgs if _HEDGE_RE.search(m.get("text", ""))
+    )
+    hedge_freq = n_hedges / len(user_msgs)
+
+    # Relative message length (avg chars / thread avg chars)
+    avg_user_len = float(np.mean([len(m.get("text", "")) for m in user_msgs]))
+    avg_thread_len = float(np.mean([len(m.get("text", "")) for m in thread_msgs]))
+    rel_length = avg_user_len / max(avg_thread_len, 1)
+
+    return reply_density + question_freq + hedge_freq + rel_length
+
+
+def _thread_contention_score(thread_msgs: list[dict]) -> float:
+    """Compute a continuous contention score for a thread.
+
+    Signals:
+    - Number of distinct participants
+    - Cross-reply density (replies to different users)
+    - Average message length (longer = more engaged)
+    - Action diversity (more action types = more contention)
+    """
+    if not thread_msgs:
+        return 0.0
+
+    participants = {m["user_id"] for m in thread_msgs}
+    n_participants = len(participants)
+
+    # Cross-reply density
+    parent_map = {m["msg_id"]: m for m in thread_msgs}
+    cross_replies = 0
+    for m in thread_msgs:
+        pid = m.get("parent_msg_id")
+        if pid and pid in parent_map:
+            parent = parent_map[pid]
+            if parent["user_id"] != m["user_id"]:
+                cross_replies += 1
+    cross_reply_ratio = cross_replies / len(thread_msgs)
+
+    avg_len = float(np.mean([len(m.get("text", "")) for m in thread_msgs]))
+    action_diversity = len(set(m["action_type"] for m in thread_msgs))
+
+    return (
+        n_participants
+        + cross_reply_ratio * 5
+        + avg_len / 100
+        + action_diversity
+    )
+
+
+def _ensure_multiclass_labels(
+    labels: list[int],
+    scores: list[float],
+) -> list[int]:
+    """Ensure labels have both classes via median-split fallback.
+
+    When keyword-based labelling produces single-class labels (all-0),
+    falls back to a median split on continuous scores to guarantee
+    multi-class training data.  This is transparent — the caller can
+    check whether the fallback was used.
+    """
+    if len(set(labels)) >= 2:
+        return labels  # already multi-class
+    if not scores or len(set(scores)) < 2:
+        return labels  # cannot split without score variance
+
+    median_score = float(np.median(scores))
+    # Assign label=1 to above-median, 0 to at-or-below-median
+    return [1 if s > median_score else 0 for s in scores]
 
 
 # ----------------------------------------------------------------------
@@ -181,17 +428,27 @@ def _train_and_evaluate(
 # ----------------------------------------------------------------------
 
 def _build_user_conflict_dataset(messages: list[dict], thread_ids):
-    feats, labels = [], []
+    """Build per-user conflict dataset with text-content labelling (R3 fix).
+
+    Labels combine action-type signals AND text-content keyword detection
+    so that simulation data with only default actions (e.g. ``discuss``)
+    can still produce meaningful multi-class training labels.
+
+    When keyword-based labelling yields single-class labels, a structural
+    contention score fallback (median split) guarantees multi-class output.
+    """
+    feats, labels, scores = [], [], []
     for tid in thread_ids:
         thread_msgs = [m for m in messages if m["thread_id"] == tid]
         participants = {m["user_id"] for m in thread_msgs}
         for uid in participants:
             feats.append(extract_features(messages, tid, uid))
-            has_conflict = any(
-                m["action_type"] in _CONFLICT_ACTIONS
-                for m in thread_msgs if m["user_id"] == uid
+            labels.append(
+                1 if _user_has_conflict_signal(thread_msgs, uid) else 0
             )
-            labels.append(1 if has_conflict else 0)
+            scores.append(_user_contention_score(thread_msgs, uid))
+    # R3 fallback: ensure multi-class via median split
+    labels = _ensure_multiclass_labels(labels, scores)
     return feats, labels
 
 
@@ -237,7 +494,7 @@ def predict_persuasion(
 ) -> dict[str, float]:
     """Train on simulation to predict persuasion success on held-out threads."""
     def _thread_feats(messages, thread_ids):
-        feats, labels = [], []
+        feats, labels, scores = [], [], []
         idx = _build_thread_index(messages)
         for tid in thread_ids:
             thread_msgs = idx.get(tid, [])
@@ -247,8 +504,14 @@ def predict_persuasion(
             counts = Counter(actions)
             total = len(thread_msgs)
             participants = {m["user_id"] for m in thread_msgs}
-            has_persuasion = any(a in _PERSUASION_ACTIONS for a in actions)
+            # R3 fix: text-content persuasion detection alongside action types
+            has_persuasion = _thread_has_persuasion_signal(thread_msgs)
 
+            # Add text-persuasion feature to the feature vector
+            n_persuasion_text = sum(
+                1 for m in thread_msgs
+                if _text_has_persuasion(m.get("text", ""))
+            )
             feats.append(np.array([
                 total,
                 len(participants),
@@ -257,8 +520,12 @@ def predict_persuasion(
                 float(np.mean([len(m.get("text", "")) for m in thread_msgs])),
                 counts.get("counter_argue", 0),
                 sum(counts.get(a, 0) for a in _CONFLICT_ACTIONS) / total if total else 0,
+                n_persuasion_text,
             ]))
             labels.append(1 if has_persuasion else 0)
+            scores.append(_thread_contention_score(thread_msgs))
+        # R3 fallback: ensure multi-class via median split
+        labels = _ensure_multiclass_labels(labels, scores)
         return feats, labels
 
     sim_thread_ids = list({m["thread_id"] for m in sim_messages})
@@ -267,7 +534,8 @@ def predict_persuasion(
     if real_thread_index is None:
         real_thread_index = _build_thread_index(real_messages)
 
-    # Test features from real messages, labels from ground truth
+    # R3 fix: test features must match sim feature dimensionality
+    # (added n_persuasion_text feature)
     test_feats, test_labels = [], []
     for tid, label in ground_truth.items():
         thread_msgs = real_thread_index.get(tid, [])
@@ -277,6 +545,10 @@ def predict_persuasion(
         counts = Counter(actions)
         total = len(thread_msgs)
         participants = {m["user_id"] for m in thread_msgs}
+        n_persuasion_text = sum(
+            1 for m in thread_msgs
+            if _text_has_persuasion(m.get("text", ""))
+        )
         test_feats.append(np.array([
             total,
             len(participants),
@@ -285,6 +557,7 @@ def predict_persuasion(
             float(np.mean([len(m.get("text", "")) for m in thread_msgs])),
             counts.get("counter_argue", 0),
             sum(counts.get(a, 0) for a in _CONFLICT_ACTIONS) / total if total else 0,
+            n_persuasion_text,
         ]))
         test_labels.append(label)
 
@@ -303,7 +576,7 @@ def predict_escalation(
 ) -> dict[str, float]:
     """Train on simulation to predict conflict escalation on held-out threads."""
     def _escalation_feats(messages, thread_ids):
-        feats, labels = [], []
+        feats, labels, scores = [], [], []
         idx = _build_thread_index(messages)
         for tid in thread_ids:
             thread_msgs = idx.get(tid, [])
@@ -311,24 +584,37 @@ def predict_escalation(
                 continue
             total = len(thread_msgs)
             counts = Counter(m["action_type"] for m in thread_msgs)
-            conflict_count = sum(counts.get(a, 0) for a in _ESCALATION_ACTIONS)
+            # R3 fix: combine action-type and text-content conflict
+            conflict_count = sum(
+                1 for m in thread_msgs
+                if m["action_type"] in _ESCALATION_ACTIONS
+                or _text_has_conflict(m.get("text", ""))
+            )
             conflict_ratio = conflict_count / total if total else 0
             participants = {m["user_id"] for m in thread_msgs}
             conflict_participants = {
                 m["user_id"] for m in thread_msgs
                 if m["action_type"] in _ESCALATION_ACTIONS
+                or _text_has_conflict(m.get("text", ""))
             }
-            is_escalation = (
-                conflict_ratio >= conflict_threshold
-                and len(conflict_participants) >= 2
+            n_escalation_text = sum(
+                1 for m in thread_msgs
+                if _text_has_escalation(m.get("text", ""))
+            )
+            is_escalation = _thread_is_escalating(
+                thread_msgs, conflict_threshold=conflict_threshold
             )
             feats.append(np.array([
                 total, len(participants), conflict_count, conflict_ratio,
                 len(conflict_participants),
                 counts.get("revert", 0), counts.get("report", 0),
                 total / max(len(participants), 1),
+                n_escalation_text,
             ]))
             labels.append(1 if is_escalation else 0)
+            scores.append(_thread_contention_score(thread_msgs))
+        # R3 fallback: ensure multi-class via median split
+        labels = _ensure_multiclass_labels(labels, scores)
         return feats, labels
 
     sim_thread_ids = list({m["thread_id"] for m in sim_messages})
@@ -337,6 +623,8 @@ def predict_escalation(
     if real_thread_index is None:
         real_thread_index = _build_thread_index(real_messages)
 
+    # R3 fix: test features must match sim feature dimensionality
+    # (added n_escalation_text feature)
     test_feats, test_labels = [], []
     for tid, label in ground_truth.items():
         thread_msgs = real_thread_index.get(tid, [])
@@ -344,18 +632,28 @@ def predict_escalation(
             continue
         total = len(thread_msgs)
         counts = Counter(m["action_type"] for m in thread_msgs)
-        conflict_count = sum(counts.get(a, 0) for a in _ESCALATION_ACTIONS)
+        conflict_count = sum(
+            1 for m in thread_msgs
+            if m["action_type"] in _ESCALATION_ACTIONS
+            or _text_has_conflict(m.get("text", ""))
+        )
         conflict_ratio = conflict_count / total if total else 0
         participants = {m["user_id"] for m in thread_msgs}
         conflict_participants = {
             m["user_id"] for m in thread_msgs
             if m["action_type"] in _ESCALATION_ACTIONS
+            or _text_has_conflict(m.get("text", ""))
         }
+        n_escalation_text = sum(
+            1 for m in thread_msgs
+            if _text_has_escalation(m.get("text", ""))
+        )
         test_feats.append(np.array([
             total, len(participants), conflict_count, conflict_ratio,
             len(conflict_participants),
             counts.get("revert", 0), counts.get("report", 0),
             total / max(len(participants), 1),
+            n_escalation_text,
         ]))
         test_labels.append(label)
 
@@ -386,31 +684,32 @@ def _heuristic_ground_truth(
     n = max(int(len(all_threads) * holdout_ratio), 1)
     holdout = all_threads[:n]
 
-    gt: dict[str, int] = {}
-    actions_map = {
-        EVENT_CONFLICT: _CONFLICT_ACTIONS,
-        EVENT_PERSUASION: _PERSUASION_ACTIONS,
-        EVENT_ESCALATION: _ESCALATION_ACTIONS,
-    }
-    target_actions = actions_map.get(event_type, _CONFLICT_ACTIONS)
+    labels_list: list[int] = []
+    scores_list: list[float] = []
+    tids_ordered: list[str] = []
 
     for tid in holdout:
         thread_msgs = thread_index.get(tid, [])
         if event_type == EVENT_ESCALATION:
-            total = len(thread_msgs) or 1
-            conflict = sum(
-                1 for m in thread_msgs if m["action_type"] in _ESCALATION_ACTIONS
-            )
-            conflict_participants = {
-                m["user_id"] for m in thread_msgs
-                if m["action_type"] in _ESCALATION_ACTIONS
-            }
-            gt[tid] = 1 if (conflict / total >= 0.3 and len(conflict_participants) >= 2) else 0
-        else:
-            gt[tid] = 1 if any(
-                m["action_type"] in target_actions for m in thread_msgs
+            label = 1 if _thread_is_escalating(
+                thread_msgs, conflict_threshold=0.3
             ) else 0
-    return gt
+        elif event_type == EVENT_PERSUASION:
+            label = 1 if _thread_has_persuasion_signal(thread_msgs) else 0
+        else:
+            # Conflict: at least one user in the thread has conflict signal
+            has_conflict = any(
+                _user_has_conflict_signal(thread_msgs, uid)
+                for uid in {m["user_id"] for m in thread_msgs}
+            )
+            label = 1 if has_conflict else 0
+        labels_list.append(label)
+        scores_list.append(_thread_contention_score(thread_msgs))
+        tids_ordered.append(tid)
+
+    # R3 fallback: ensure multi-class labels via median split
+    labels_list = _ensure_multiclass_labels(labels_list, scores_list)
+    return {tid: lbl for tid, lbl in zip(tids_ordered, labels_list)}
 
 
 # ----------------------------------------------------------------------

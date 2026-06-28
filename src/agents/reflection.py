@@ -15,7 +15,7 @@ Your recent messages:
 
 Community context:
 {context}
-
+{reinforcement_block}
 Summarize your key beliefs and stances after these interactions.
 Focus on:
 1. What positions have you taken?
@@ -52,6 +52,7 @@ class ReflectionModule:
         recent_messages: list[Message],
         context: str = "",
         current_round: int = 0,
+        reinforcement_directive: str | None = None,
     ) -> ReflectionState:
         """Run reflection on recent interactions.
 
@@ -59,6 +60,11 @@ class ReflectionModule:
             recent_messages: Messages since last reflection.
             context: Community context for reflection.
             current_round: Current simulation round.
+            reinforcement_directive: Optional outline §4.6 directive that asks
+                the agent to consolidate its stances *through* its Mind Models
+                (CADP only). When ``None`` the prompt is unchanged, so every
+                non-CADP condition and every Mind-Models-disabled ablation
+                behaves byte-for-byte as before.
 
         Returns:
             Updated ReflectionState.
@@ -72,9 +78,14 @@ class ReflectionModule:
             for m in recent_messages[:10]
         )
 
+        # When a reinforcement directive is present it is inserted between the
+        # community context and the consolidation instructions, framed with
+        # surrounding blank lines. Absent → empty string → identical prompt.
+        reinforcement_block = f"\n{reinforcement_directive}\n" if reinforcement_directive else ""
         prompt = REFLECTION_PROMPT.format(
             recent_messages=msgs_text,
             context=context or "(no additional context)",
+            reinforcement_block=reinforcement_block,
         )
 
         messages = [

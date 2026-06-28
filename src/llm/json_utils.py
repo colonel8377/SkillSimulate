@@ -27,12 +27,21 @@ _FENCE_RE = re.compile(r"^\s*```(?:json|JSON)?\s*\n?", re.MULTILINE)
 _TRAILING_FENCE_RE = re.compile(r"\n?```\s*$", re.MULTILINE)
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 
+# Reasoning models (DeepSeek-V4, QwQ, etc.) may emit their chain-of-thought
+# inside <think>...</think> tags before the actual JSON response.  The tag content
+# often contains unbalanced brackets / braces that break bracket-matching
+# JSON extraction.  Strip it as a pre-processing step.
+_THINKING_RE = re.compile(r"<think>[\s\S]*?</think>", re.DOTALL)
+
 
 def _strip_contaminants(text: str) -> str:
-    """Remove markdown fences and trailing commas from a JSON-like string."""
+    """Remove markdown fences, trailing commas, and thinking tags from a JSON-like string."""
     text = _FENCE_RE.sub("", text)
     text = _TRAILING_FENCE_RE.sub("", text)
     text = _TRAILING_COMMA_RE.sub(r"\1", text)
+    # Strip reasoning-model thinking blocks — they contain unbalanced
+    # brackets that confuse bracket-matching JSON finders.
+    text = _THINKING_RE.sub("", text)
     return text
 
 
@@ -89,6 +98,10 @@ def extract_json(text: str, default: Any = None) -> Any:
     """
     if not text or not text.strip():
         return default
+
+    # Pre-processing: strip <think>...</think> blocks from reasoning models.
+    # These contain unbalanced brackets that break _find_json_span.
+    text = _THINKING_RE.sub("", text).strip()
 
     # Attempt 1: direct parse.
     try:

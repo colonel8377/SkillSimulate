@@ -39,6 +39,10 @@ class ExpressionDNA:
     taboo_words: list[str] = field(default_factory=list)
     vocab_richness: float = 0.0  # type-token ratio
 
+    # Narrative style rules parsed from the distiller's Expression-DNA section
+    # (nuwa 表达DNA / colleague Layer-2). Injected into the prompt verbatim.
+    expression_rules: list[str] = field(default_factory=list)
+
     # Embedding centroid for Tier-1 filter
     embedding_centroid: list[float] | None = None
     embedding_std: list[float] | None = None
@@ -46,7 +50,7 @@ class ExpressionDNA:
 
 @dataclass
 class MindModel:
-    """A triple-verified reasoning template.
+    """A reasoning template distilled from the cluster corpus.
 
     Adapted from nuwa-skill extraction-framework.md §1.
     """
@@ -60,6 +64,20 @@ class MindModel:
     cross_domain_verified: bool = False     # appears in 2+ different threads
     predictive_verified: bool = False        # can predict stance on new issues
     exclusive_verified: bool = False         # not something all clusters do
+
+
+@dataclass
+class DecisionHeuristic:
+    """An if-X-then-Y decision rule (nuwa 决策启发式 / colleague Layer-3).
+
+    Distinct from a MindModel: a heuristic is an actionable decision rule, a
+    mind model is a reasoning lens. The outline's capability track = mind
+    models + decision heuristics.
+    """
+    name: str
+    rule: str                           # the if-X-then-Y rule
+    scenario: str = ""                  # when it applies
+    case: str = ""                      # supporting case / evidence
 
 
 @dataclass
@@ -81,6 +99,10 @@ class AntiPattern:
     # to the global default (G7).
     trigger_behavioral_threshold: float | None = None
     reason: str = ""                    # why this is prohibited
+    # Grounding (both reference repos carry these): evidence from the corpus
+    # and the correct behaviour to do instead.
+    evidence: list[str] = field(default_factory=list)
+    correct_alternative: str = ""
 
 
 @dataclass
@@ -88,6 +110,7 @@ class CapabilityTrack:
     """What the agent CAN do."""
     expression_dna: ExpressionDNA
     mind_models: list[MindModel]
+    decision_heuristics: list[DecisionHeuristic] = field(default_factory=list)
 
 
 @dataclass
@@ -111,6 +134,10 @@ class SkillFile:
     # Provenance
     source_thread_ids: list[str] = field(default_factory=list)
     source_user_count: int = 0
+    # Which third-party distiller produced this skill ("colleague" | "nuwa").
+    distiller: str = ""
+    # One-line holistic archetype identity (LLM-assigned, once per leaf).
+    archetype_label: str = ""
 
     def __post_init__(self):
         if not self.compiled_at:
@@ -148,12 +175,16 @@ class SkillFile:
         mm_list = data["capability"]["mind_models"]
         mind_models = [MindModel(**mm) for mm in mm_list]
 
+        dh_list = data["capability"].get("decision_heuristics", [])
+        decision_heuristics = [DecisionHeuristic(**dh) for dh in dh_list]
+
         ap_list = data.get("constraint", {}).get("anti_patterns", [])
         anti_patterns = [AntiPattern(**ap) for ap in ap_list]
 
         capability = CapabilityTrack(
             expression_dna=expression_dna,
             mind_models=mind_models,
+            decision_heuristics=decision_heuristics,
         )
         constraint = ConstraintTrack(anti_patterns=anti_patterns)
 
@@ -165,4 +196,6 @@ class SkillFile:
             constraint=constraint,
             source_thread_ids=data["source_thread_ids"],
             source_user_count=data["source_user_count"],
+            distiller=data.get("distiller", ""),
+            archetype_label=data.get("archetype_label", ""),
         )

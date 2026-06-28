@@ -74,6 +74,7 @@ class Experiment1Runner(ExperimentRunner):
             per_msg_token_ratio=self.config.per_msg_token_ratio,
             per_msg_token_floor=self.config.per_msg_token_floor,
             max_thread_messages=self.config.max_thread_messages,
+            reflection_interval=self.config.reflection_interval,
         )
         agents = pop_builder.build_population(
             cluster_result=cluster_result,
@@ -127,14 +128,30 @@ class Experiment1Runner(ExperimentRunner):
             logger.info(f"Loaded {len(threads)} threads from {dataset}")
         return self._data_cache[dataset]
 
+    def _make_clusterer(self) -> BehavioralClusterer:
+        """Build a BehavioralClusterer from the experiment config."""
+        from src.clustering.clusterer import BehavioralClusterer
+        return BehavioralClusterer(
+            method=self.config.cluster_method,
+            n_clusters=self.config.num_clusters,
+            role_min_cluster_size=self.config.role_min_cluster_size,
+            role_min_samples=self.config.role_min_samples,
+            style_min_cluster_size=self.config.style_min_cluster_size,
+            style_min_samples=self.config.style_min_samples,
+            target_min_leaves=self.config.target_min_leaves,
+            target_max_leaves=self.config.target_max_leaves,
+            scaler=self.config.scaler,
+            impute_orphans=self.config.impute_orphans,
+            cluster_selection_method=self.config.cluster_selection_method,
+            min_style_silhouette=self.config.min_style_silhouette,
+            style_umap_dim=self.config.style_umap_dim,
+            random_state=self.config.seed,
+        )
+
     def _get_or_compute_clusters(self, dataset: str, threads: list):
         """Get cached clustering result or compute new one (outline §4.2)."""
         if dataset not in self._cluster_cache:
-            clusterer = BehavioralClusterer(
-                method=self.config.cluster_method,
-                n_clusters=self.config.num_clusters,
-                random_state=self.config.seed,
-            )
+            clusterer = self._make_clusterer()
             cluster_result = clusterer.fit(threads)
             self._cluster_cache[dataset] = cluster_result
             logger.info(
@@ -172,11 +189,7 @@ class Experiment1Runner(ExperimentRunner):
             else:
                 eval_threads = threads
 
-            clusterer = BehavioralClusterer(
-                method=self.config.cluster_method,
-                n_clusters=self.config.num_clusters,
-                random_state=self.config.seed,
-            )
+            clusterer = self._make_clusterer()
             validator = ClusterStabilityValidator(
                 n_iterations=min(50, len(eval_threads)),  # scale down for large datasets
                 random_state=self.config.seed,
@@ -275,7 +288,7 @@ class Experiment1Runner(ExperimentRunner):
                     platform=thread.platform,
                     topic=thread.topic,
                 ))
-            if len(sim_threads) >= 5:  # limit topics per cell
+            if len(sim_threads) >= self.config.max_sim_threads:
                 break
 
         # Ensure at least one thread

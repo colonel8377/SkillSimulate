@@ -27,6 +27,13 @@ Your role: {role_description}
 
 Available actions: {available_actions}
 
+Choose an action that fits the current situation and your role. Do not
+automatically default to the safest action. For example, if you strongly
+disagree with another user's contribution or want to correct content, use
+an adversarial or corrective action when it is available. If you observe a
+policy violation, report it. Only use a bland, neutral response when the
+situation genuinely calls for it.
+
 Current thread state:
 {thread_state}
 

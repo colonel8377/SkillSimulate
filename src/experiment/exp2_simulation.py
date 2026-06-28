@@ -221,14 +221,29 @@ class Experiment2Runner(ExperimentRunner):
         top_k = max(len(scored) // 5, 5)
         return scored[:top_k]
 
+    def _make_clusterer(self) -> BehavioralClusterer:
+        """Build a BehavioralClusterer from the experiment config."""
+        return BehavioralClusterer(
+            method=self.config.cluster_method,
+            n_clusters=self.config.num_clusters,
+            role_min_cluster_size=self.config.role_min_cluster_size,
+            role_min_samples=self.config.role_min_samples,
+            style_min_cluster_size=self.config.style_min_cluster_size,
+            style_min_samples=self.config.style_min_samples,
+            target_min_leaves=self.config.target_min_leaves,
+            target_max_leaves=self.config.target_max_leaves,
+            scaler=self.config.scaler,
+            impute_orphans=self.config.impute_orphans,
+            cluster_selection_method=self.config.cluster_selection_method,
+            min_style_silhouette=self.config.min_style_silhouette,
+            style_umap_dim=self.config.style_umap_dim,
+            random_state=self.config.seed,
+        )
+
     def _get_or_compute_clusters(self, dataset: str, threads: list):
         """Get cached clustering result or compute new one."""
         if dataset not in self._cluster_cache:
-            clusterer = BehavioralClusterer(
-                method=self.config.cluster_method,
-                n_clusters=self.config.num_clusters,
-                random_state=self.config.seed,
-            )
+            clusterer = self._make_clusterer()
             self._cluster_cache[dataset] = clusterer.fit(threads)
             logger.info(
                 f"Clustering {dataset}: "

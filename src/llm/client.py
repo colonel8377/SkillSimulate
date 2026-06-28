@@ -333,12 +333,16 @@ class LLMClient:
                         idx=i,
                     ))
                 failure_threshold = int(os.getenv(
-                    "CADP_ENDPOINT_FAILURE_THRESHOLD", "10"
+                    "CADP_ENDPOINT_FAILURE_THRESHOLD", "15"
+                ))
+                cooldown_seconds = float(os.getenv(
+                    "CADP_ENDPOINT_COOLDOWN_SECONDS", "1800"
                 ))
                 pool = EndpointPool(
                     model_name=name,
                     endpoints=pool_states,
                     failure_threshold=failure_threshold,
+                    cooldown_seconds=cooldown_seconds,
                 )
                 self.endpoint_pools[name] = pool
                 logger.info(
@@ -531,19 +535,13 @@ class LLMClient:
                 )
 
         # --- thinking-budget passthrough (Issue 1) --------------------
-        # DeepSeek-V4 reasoning models accept ``reasoning_effort`` /
-        # ``thinking_budget`` style kwargs depending on the proxy. We only
-        # add the kwarg when the endpoint has a non-zero thinking budget
-        # AND the caller hasn't already supplied one.
-        if ep.max_thinking_tokens > 0 and "reasoning_effort" not in kwargs \
-                and "thinking_budget" not in kwargs:
-            # Most OpenAI-compatible proxies for DeepSeek-V4 use
-            # ``reasoning_effort`` as a low/medium/high enum. We pass the
-            # raw token count via ``thinking_budget`` for proxies that
-            # support it; for enum-style proxies, the caller should
-            # override via kwargs. The kwarg is silently ignored by
-            # strict OpenAI endpoints.
-            kwargs.setdefault("thinking_budget", ep.max_thinking_tokens)
+        # DeepSeek-V4 reasoning models use a separate ``reasoning_content``
+        # field for chain-of-thought output. The thinking budget is controlled
+        # by the endpoint's ``max_thinking_tokens`` setting, which is used
+        # by the pre-flight token budget guard (above) but NOT passed as an
+        # API kwarg — the DeepSeek OpenAI-compatible API does not accept
+        # ``thinking_budget`` or ``reasoning_effort`` kwargs. Thinking is
+        # automatic and the endpoint manages the token split internally.
 
         # ---- route by api_type ----
         if ep.api_type == "completions":
@@ -582,6 +580,18 @@ class LLMClient:
             )
 
         content = response.choices[0].message.content
+
+        # Defensive guard: reasoning models (DeepSeek-V4, QwQ, etc.) may
+        # leak their chain-of-thought <think>...</think> tags into the ``content``
+        # field instead of the separate ``reasoning_content`` field,
+        # depending on the proxy implementation.  Strip any <think> blocks
+        # from the returned content so downstream agents receive clean text.
+        if content and "<think>" in content:
+            import re as _re
+            content = _re.sub(
+                r"<think>[\s\S]*?</think>", "", content
+            ).strip()
+
         # Defensive guard: DeepSeek / HKUST proxies occasionally return
         # a valid response structure but with empty or None content.
         # Raising TransientResponseError here triggers the @retry backoff.

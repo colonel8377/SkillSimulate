@@ -114,8 +114,14 @@ class CircuitBreaker:
 _GLOBAL_BREAKER: Optional[CircuitBreaker] = None
 
 
-def get_breaker(threshold: int = 3) -> CircuitBreaker:
-    """Return the process-global CircuitBreaker, creating it on first call."""
+def get_breaker(threshold: int = 20) -> CircuitBreaker:
+    """Return the process-global CircuitBreaker, creating it on first call.
+
+    Default threshold=20: each tenacity-exhausted failure counts as one
+    strike. 20 strikes = ~100 raw API attempts (20 × 5 tenacity retries)
+    have failed — strong evidence the endpoint is genuinely down, not
+    just experiencing transient blips (e.g. HKUST proxy empty-choices).
+    """
     global _GLOBAL_BREAKER
     if _GLOBAL_BREAKER is None:
         _GLOBAL_BREAKER = CircuitBreaker(threshold=threshold)

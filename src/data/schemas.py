@@ -20,6 +20,9 @@ class ActionType(str, Enum):
     REVERT = "revert"
     DISCUSS = "discuss"
     REPORT = "report"
+    # Wikipedia / WikiConv comment-level moderation actions
+    DELETE = "delete"      # a comment was removed (deletion event)
+    RESTORE = "restore"    # a removed comment was restored (restoration event)
     # Reddit
     REPLY = "reply"
     AWARD_DELTA = "award_delta"
@@ -38,7 +41,7 @@ class ActionType(str, Enum):
 
     @classmethod
     def for_platform(cls, platform: Platform) -> list["ActionType"]:
-        wiki = {cls.EDIT, cls.REVERT, cls.DISCUSS, cls.REPORT}
+        wiki = {cls.EDIT, cls.REVERT, cls.DISCUSS, cls.REPORT, cls.DELETE, cls.RESTORE}
         reddit = {cls.REPLY, cls.AWARD_DELTA, cls.COUNTER_ARGUE, cls.BLOCK}
         github = {cls.COMMENT, cls.LABEL, cls.CLOSE, cls.REOPEN, cls.ASSIGN}
         mapping = {

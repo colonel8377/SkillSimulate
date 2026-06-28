@@ -66,3 +66,30 @@ class CADPAgent(BaseAgent):
         return self.adapter.build_constraint_text(
             show_anti_patterns=self.show_anti_patterns,
         )
+
+    def get_reflection_directive(self) -> str | None:
+        """Outline §4.6: reflection must reinforce (not just summarize) the
+        agent's Mind Models. CADP is the only condition carrying verified Mind
+        Models, so this is a CADP-specific long-horizon advantage — it keeps a
+        consistent reasoning frame across the 50-round horizon where plain
+        descriptive personas drift (the Chameleon's-Limit failure mode).
+
+        Returns ``None`` when Mind Models are hidden (``cadp_minus_mm``,
+        ``cadp_constraint_only`` set ``show_mind_models = False``) or absent, so
+        those ablations fall back to plain belief consolidation. Computed at
+        call time (not ``__init__``) so it respects the ablations' post-init
+        flag changes without each ablation needing to refresh it.
+        """
+        if not self.show_mind_models:
+            return None
+        cap = self.skill.capability
+        if not cap or not cap.mind_models:
+            return None
+        names = ", ".join(mm.name for mm in cap.mind_models)
+        return (
+            "Reinforce your reasoning frameworks (Mind Models): "
+            f"{names}. When consolidating your stances, explicitly apply these "
+            "frameworks to the recent interactions — note which framework you "
+            "used to form or shift each stance, and whether any interaction "
+            "updated your view on a framework."
+        )

@@ -39,7 +39,7 @@ class BaseAgent(ABC):
         cluster_id: str = "",
         max_context_items: int = 20,
         reflection_interval: int = 10,
-        max_reformulation_retries: int = 3,
+        max_reformulation_retries: int = 1,
         max_memory_tokens: int = 0,
         memory_strategy: str = "sliding",
         compaction_interval: int = 5,
@@ -100,6 +100,17 @@ class BaseAgent(ABC):
     @abstractmethod
     def get_constraints_text(self) -> str:
         """Return constraint instructions for the planner."""
+
+    def get_reflection_directive(self) -> str | None:
+        """Optional outline §4.6 reinforcement directive for periodic reflection.
+
+        Base behaviour returns ``None`` — plain belief consolidation. CADP
+        overrides this to drive reflection *through* its verified Mind Models
+        (a CADP-specific long-horizon advantage). Returning ``None`` here keeps
+        every non-CADP condition and every Mind-Models-disabled ablation
+        unchanged.
+        """
+        return None
 
     async def take_turn(
         self,
@@ -174,9 +185,18 @@ class BaseAgent(ABC):
             )
             final_text = plan.text
             if not final_text.strip():
-                raise RuntimeError(
-                    f"Planner produced empty output for agent {self.agent_id}"
+                # Empty text is legitimate for non-text actions — the planner
+                # prompt explicitly allows "empty for non-text actions"
+                # (REVERT, REPORT, AWARD_DELTA, LABEL, CLOSE, ...). Proceed
+                # with empty text so the action is recorded rather than
+                # dropping the turn. (Previously this raised, silently
+                # dropping non-text-action turns and under-counting them in
+                # the action distribution.)
+                logger.debug(
+                    f"Agent {self.agent_id}: empty planner text for "
+                    f"{plan.action_type.value} (allowed for non-text actions)"
                 )
+                final_text = ""
 
             # Step 4: Post-generation enforcement
             # Pass a per-turn safe template so Tier 1 has a §4.4.2-compliant
@@ -197,6 +217,10 @@ class BaseAgent(ABC):
             # would be silently accepted.
             if replan_feedback is not None:
                 violations_persisted = True
+                logger.debug(
+                    f"Agent {self.agent_id}: Tier-3 post-gen violation → reformulation "
+                    f"(max {self.max_reformulation_retries} attempts). initial reason: {replan_feedback}"
+                )
 
                 for attempt in range(self.max_reformulation_retries):
                     replan = await self.planner.replan(
@@ -239,20 +263,33 @@ class BaseAgent(ABC):
                     final_text = rechecked_text
 
                     if new_feedback is None:
+                        logger.debug(
+                            f"Agent {self.agent_id}: reformulation attempt {attempt+1} "
+                            f"CLEARED the violation"
+                        )
                         violations_persisted = False
                         break
                     # Tier 3 still failed — feed its latest reason into the next replan.
+                    logger.debug(
+                        f"Agent {self.agent_id}: reformulation attempt {attempt+1} "
+                        f"still violating: {new_feedback}"
+                    )
                     replan_feedback = new_feedback
 
                 if violations_persisted:
-                    # Fallback (outline §4.4.2 step 4): safe-template response
+                    # Fallback (outline §4.4.2 step 4): safe-template response.
+                    # Log the persistently-violating text + reason BEFORE the
+                    # safe-template overwrites it — diagnostic for §5.3.5 trigger
+                    # calibration (which anti-patterns / trigger types dominate).
+                    logger.warning(
+                        f"Agent {self.agent_id}: Tier-3 violation persisted after "
+                        f"{self.max_reformulation_retries} reformulation attempts → safe-template fallback\n"
+                        f"  violating text: {final_text[:160]!r}\n"
+                        f"  reason: {replan_feedback}"
+                    )
                     final_text = self._safe_template_response(thread, plan.action_type)
                     post_log.safe_template_fallback_used = True
                     constraint_forced = True
-                    logger.warning(
-                        f"Agent {self.agent_id}: Tier-3 violation persisted after "
-                        f"{self.max_reformulation_retries} retries, falling back to safe template"
-                    )
 
             enforcement_log = EnforcementLog(
                 tier3_pre=pre_log.tier3_pre,
@@ -276,9 +313,18 @@ class BaseAgent(ABC):
             )
             final_text = plan.text
             if not final_text.strip():
-                raise RuntimeError(
-                    f"Planner produced empty output for agent {self.agent_id}"
+                # Empty text is legitimate for non-text actions — the planner
+                # prompt explicitly allows "empty for non-text actions"
+                # (REVERT, REPORT, AWARD_DELTA, LABEL, CLOSE, ...). Proceed
+                # with empty text so the action is recorded rather than
+                # dropping the turn. (Previously this raised, silently
+                # dropping non-text-action turns and under-counting them in
+                # the action distribution.)
+                logger.debug(
+                    f"Agent {self.agent_id}: empty planner text for "
+                    f"{plan.action_type.value} (allowed for non-text actions)"
                 )
+                final_text = ""
 
         # Construct message — pick parent via platform topology (outline §6.3)
         # Falls back to legacy "reply to last message" when no topology is
@@ -324,7 +370,12 @@ class BaseAgent(ABC):
         # Periodic reflection
         if self.reflection.should_reflect(current_round):
             recent = self.memory.retrieve(thread_id=None, current_round=current_round)
-            await self.reflection.reflect(recent, context=self.get_role_description(), current_round=current_round)
+            await self.reflection.reflect(
+                recent,
+                context=self.get_role_description(),
+                current_round=current_round,
+                reinforcement_directive=self.get_reflection_directive(),
+            )
 
         # Rolling-summary compaction (R4 path only — Issue 1). Runs every
         # compaction_interval turns, summarizing the oldest raw memory
@@ -367,16 +418,16 @@ class BaseAgent(ABC):
         return "\n".join(parts)
 
     def _safe_template_response(self, thread: Thread, action_type: ActionType) -> str:
-        """Generate a neutral safe-template response (Forced Reformulation fallback).
+        """Generate a neutral but engaged safe-template response.
 
         Used when Tier-3 anti-pattern violations persist after re-planning.
-        The response is deliberately bland to avoid triggering any anti-pattern,
-        and is marked ``constraint-forced`` in the message metadata.
+        The response avoids personal attacks and profanity while still
+        expressing a position, so disagreement language is preserved for
+        downstream evaluation.
         """
         return (
-            f"I'd like to contribute to the discussion on {thread.topic}. "
-            "I have some thoughts on this matter but need to consider "
-            "the perspectives already shared here."
+            f"I see the point about {thread.topic}, but I disagree with that "
+            "conclusion. Could you clarify the reasoning behind it?"
         )
 
     def get_state_summary(self) -> dict:
