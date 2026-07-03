@@ -62,7 +62,7 @@ CONV_BUFFER_CAP = 200_000
 
 # Bump whenever the UserAccum schema OR the accum->feature derivation changes,
 # to invalidate old detail caches and the feature-keyed clustering cache.
-_DETAIL_CACHE_VERSION = 4
+_DETAIL_CACHE_VERSION = 6
 
 
 @dataclass
@@ -484,7 +484,7 @@ def accum_to_features(uid: str, a: UserAccum) -> "UserFeatures":
     return UserFeatures(
         user_id=uid,
         reply_rate=a.reply_n / n,
-        mean_indentation=a.indent_sum / n,
+        mean_indentation=min(a.indent_sum / n, 20.0),
         verbosity=math.log1p(a.text_len_sum / n),
         activity=activity,
         interlocutor_breadth=len(a.out_targets) / n,
@@ -504,9 +504,11 @@ def accum_to_features(uid: str, a: UserAccum) -> "UserFeatures":
         frac_project=a.ns_project_n / n,
         exclaim_rate=a.exclaim_n / n,
         lexical_ttr=(len(set(toks)) / len(toks)) if toks else 0.0,
-        # Conflict extremes + temporal rhythm (validated additions)
+        # Conflict extremes + temporal rhythm
         tox_max=a.tox_max, sev_max=a.sev_max, burstiness_cv=burstiness_cv,
         activity_density=activity_density,
+        hostility_score=max(a.tox_max, a.sev_max),
+        namespace_focus=(a.ns_content_n / n) - (a.ns_interpersonal_n / n),
         message_count=a.n,
         thread_count=0,
     )
@@ -595,6 +597,119 @@ def collect_member_utterances(
             for u, items in partial.items():
                 merged.setdefault(u, []).extend(items)
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Pass C': per-leaf rejection-evidence collection (anti-pattern grounding)
+# ---------------------------------------------------------------------------
+
+# Evidence semantics are owned by corpus_export; keep them in sync.
+from src.skill.corpus_export import EVIDENCE_BUDGET, EVIDENCE_TOX_THRESHOLD
+
+
+def _evidence_line(label: str, text: str) -> str:
+    return f"- [{label}] {(text or '')[:160]}"
+
+
+def _collect_evidence_year(args) -> dict:
+    """Collect per-leaf rejection-evidence lines from one year.
+
+    Mirrors ``corpus_export._rejected_evidence`` but over the raw ConvoKit stream
+    (no in-memory threads). Per-type budgets keep the abundant high-tox signal
+    from crowding out rarer deletion / attack signals. One bounded pass per year.
+    """
+    cdir, user_to_leaf, budget = args
+    cdir = Path(cdir)
+    out: dict[int, dict[str, list[str]]] = {}
+    counts: dict[int, dict[str, int]] = {}
+    n = 0
+    with open(cdir / "utterances.jsonl", "rb") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            r = _json_loads(line)
+            n += 1
+            m = r.get("meta", {}) or {}
+            text = r.get("text") or ""
+
+            def _room(leaf: int | None, etype: str) -> bool:
+                if leaf is None or leaf < 0:
+                    return False
+                return counts.get(leaf, {}).get(etype, 0) < budget.get(etype, 0)
+
+            # (a) speaker's own genuinely-toxic / personal-attack utterance
+            sp = _speaker(r.get("speaker"))
+            leaf_sp = user_to_leaf.get(sp)
+            if text.strip():
+                attack = m.get("comment_has_personal_attack")
+                tox = _tox(m, "toxicity")
+                if attack and _room(leaf_sp, "attack"):
+                    out.setdefault(leaf_sp, {}).setdefault("attack", []).append(
+                        _evidence_line("personal-attack flagged", text)
+                    )
+                    counts.setdefault(leaf_sp, {})["attack"] = counts.get(leaf_sp, {}).get("attack", 0) + 1
+                elif isinstance(tox, (int, float)) and float(tox) >= EVIDENCE_TOX_THRESHOLD and _room(leaf_sp, "tox"):
+                    label = f"high-conflict/flagged tox={round(float(tox), 2)}"
+                    out.setdefault(leaf_sp, {}).setdefault("tox", []).append(_evidence_line(label, text))
+                    counts.setdefault(leaf_sp, {})["tox"] = counts.get(leaf_sp, {}).get("tox", 0) + 1
+
+            # (b) deletion events this user performed on another's comment.
+            # The event lives in the target comment's meta; its text IS the
+            # moderated comment's text, so no cross-utterance lookup is needed.
+            for ev in m.get("deletion") or []:
+                actor = _speaker(ev.get("speaker"))
+                leaf_ac = user_to_leaf.get(actor)
+                if _room(leaf_ac, "delete"):
+                    out.setdefault(leaf_ac, {}).setdefault("delete", []).append(
+                        _evidence_line("deleted another's comment", text)
+                    )
+                    counts.setdefault(leaf_ac, {})["delete"] = counts.get(leaf_ac, {}).get("delete", 0) + 1
+    return out
+
+
+def collect_rejection_evidence(
+    year_dirs: list[Path],
+    user_to_leaf: dict[str, int],
+    budget: dict[str, int] | None = None,
+    workers: int = 8,
+) -> dict[int, list[str]]:
+    """Stream all years → per-leaf rejection-evidence lines with per-type budgets.
+
+    Grounds anti-patterns in actual in-corpus violations (deletions / high
+    toxicity / personal attacks) for the streaming export path, which cannot
+    materialise full threads. Output format matches
+    ``corpus_export._rejected_evidence``. ``user_to_leaf`` maps only clustered
+    users (leaf ≥ 0); inactive (-1) users are excluded.
+    """
+    if budget is None:
+        budget = EVIDENCE_BUDGET
+    merged: dict[int, dict[str, list[str]]] = {}
+    seen: dict[int, dict[str, int]] = {}
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for partial in ex.map(
+            _collect_evidence_year,
+            [(d, user_to_leaf, budget) for d in year_dirs],
+        ):
+            for leaf, types in partial.items():
+                leaf = int(leaf)
+                for etype, lines in types.items():
+                    cap = budget.get(etype, 0)
+                    if seen.get(leaf, {}).get(etype, 0) >= cap:
+                        continue
+                    room = cap - seen.get(leaf, {}).get(etype, 0)
+                    take = lines[:room]
+                    if take:
+                        merged.setdefault(leaf, {}).setdefault(etype, []).extend(take)
+                        seen.setdefault(leaf, {})[etype] = seen.get(leaf, {}).get(etype, 0) + len(take)
+    # flatten in type order (delete, tox, attack) for readability
+    result: dict[int, list[str]] = {}
+    for leaf in sorted(merged):
+        parts: list[str] = []
+        for etype in ("delete", "tox", "attack"):
+            parts.extend(merged[leaf].get(etype, []))
+        if parts:
+            result[leaf] = parts
+    return result
 
 
 def embed_sample_texts(
@@ -704,29 +819,34 @@ def run_streaming_pipeline(
             pickle.dump(user_embeddings, f)
         logger.info(f"Cached embeddings for {len(user_embeddings)} users → {emb_cache}")
 
-    logger.info(f"Clustering {len(user_features)} users (two-stage UMAP+HDBSCAN)...")
+    logger.info(f"Clustering {len(user_features)} users (behaviour-only roles)...")
     if clusterer is None:
         clusterer = BehavioralClusterer()
-    # Cache the clustering result keyed by params + active-user set identity, so
-    # the expensive UMAP/HDBSCAN is one-time; param changes auto-recompute.
+    # Cache the clustering result keyed by every input that affects the output,
+    # so the (KMeans/HDBSCAN) clustering is one-time and param changes auto-
+    # recompute. cluster_algo tags the algorithm shape: dropping the language
+    # sub-clustering stage (behaviour-only) bumps it and invalidates older caches
+    # even when role_k / features are unchanged.
     import hashlib, pickle as _pk
+    from src.clustering.features import VECTOR_FIELD_NAMES
     key = {
+        "cluster_algo": "behavior_only_v1",
         "feature_version": _DETAIL_CACHE_VERSION,
+        # the actual clustered vector composition, so any feature add/drop
+        # auto-invalidates the clustering cache (independent of detail caches).
+        "vector_fields": list(VECTOR_FIELD_NAMES),
         "n_active": len(user_features),
         "sample_users": sorted(user_features)[:8],
-        "umap_dim": clusterer.style_umap_dim,
-        "method": clusterer.style_method,
         "seed": clusterer.random_state,
+        "role_method": clusterer.role_method,
+        "role_k": clusterer.role_k,
         "role_mcs": clusterer.role_min_cluster_size,
         "role_min_samples": clusterer.role_min_samples,
-        "style_mcs": clusterer.style_min_cluster_size,
-        "style_min_samples": clusterer.style_min_samples,
         "target_min_leaves": clusterer.target_min_leaves,
         "target_max_leaves": clusterer.target_max_leaves,
         "scaler": clusterer.scaler,
         "impute_orphans": clusterer.impute_orphans,
         "cluster_selection_method": clusterer.cluster_selection_method,
-        "min_style_silhouette": clusterer.min_style_silhouette,
     }
     digest = hashlib.md5(_pk.dumps(key, protocol=4)).hexdigest()[:10]
     cr_cache = Path(cache_dir) / f"clustering_{digest}.pkl"
@@ -756,4 +876,4 @@ def run_streaming_pipeline(
         f"(kept={n_orphans_kept}, imputed={n_orphans - n_orphans_kept}); "
         f"activity-filtered (background)={n_activity_filtered}"
     )
-    return cr, accums
+    return cr, accums, user_embeddings

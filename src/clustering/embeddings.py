@@ -40,11 +40,15 @@ class EmbeddingExtractor:
         return self.model.encode(texts, show_progress_bar=False)
 
     def embed_user(self, messages: list[Message]) -> np.ndarray:
-        """Aggregate embedding for a single user via mean pooling."""
+        """Aggregate embedding for a single user via mean+std pooling."""
         vectors = self.embed_messages(messages)
         if vectors.ndim == 1:
-            return vectors
-        return np.mean(vectors, axis=0)
+            # Single vector (or zero fallback): std is zero.
+            return np.concatenate([vectors, np.zeros_like(vectors)])
+        return np.concatenate([
+            np.mean(vectors, axis=0),
+            np.std(vectors, axis=0),
+        ])
 
     def embed_all_users(
         self,
@@ -80,9 +84,13 @@ class EmbeddingExtractor:
         for user_id, (start, end) in user_text_ranges.items():
             if start == end:
                 dim = self.model.get_sentence_embedding_dimension()
-                result[user_id] = np.zeros(dim)
+                result[user_id] = np.zeros(dim * 2)
             else:
-                result[user_id] = np.mean(all_embeddings[start:end], axis=0)
+                block = all_embeddings[start:end]
+                result[user_id] = np.concatenate([
+                    np.mean(block, axis=0),
+                    np.std(block, axis=0),
+                ])
 
         return result
 

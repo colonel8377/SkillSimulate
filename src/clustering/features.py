@@ -88,6 +88,9 @@ class UserFeatures:
     sev_max: float = 0.0                  # peak severe toxicity
     burstiness_cv: float = 0.0           # CV of inter-message time gaps
     activity_density: float = 0.0         # log1p(messages / (tenure_days + 1))
+    # Purified / combined features (added 2026-07-02; see _VECTOR_FIELDS audit)
+    hostility_score: float = 0.0          # max(tox_max, sev_max) — single hostile tail axis
+    namespace_focus: float = 0.0          # frac_content - frac_interpersonal (avoids -0.96 collinearity)
     # Bookkeeping (not part of the clustering vector)
     message_count: int = 0
     thread_count: int = 0
@@ -97,23 +100,50 @@ class UserFeatures:
 
 
 _VECTOR_FIELDS = (
+    # Conversational
     "reply_rate", "mean_indentation", "verbosity", "activity",
-    "interlocutor_breadth", "attention_received", "reciprocity",
+    # Topical / temporal
     "topical_breadth", "tenure",
-    "own_toxicity_mean", "own_severe_toxicity_mean", "reply_to_toxic_rate",
-    "toxicity_received_mean", "conflict_engagement_ratio",
-    "question_rate", "wp_citation_rate",
-    "frac_interpersonal", "frac_content", "frac_project",
+    # Conflict: a single hostile-tail axis. tox_max and sev_max are ~0.92
+    # correlated; keeping both splits the hostile tail randomly. max() preserves
+    # the extreme while removing the collinear axis.
+    "hostility_score",
+    # Inquisitiveness
+    "question_rate",
+    # Namespace focus: content-interpersonal difference. The two fractions sum
+    # to ~1 and correlate at -0.96; using their difference collapses the axis
+    # to one dimension and keeps the direction (positive = content, negative =
+    # interpersonal). frac_project is a sparse residual and stays dropped.
+    "namespace_focus",
+    # Linguistic / affect
     "exclaim_rate", "lexical_ttr",
-    # Conflict extremes + temporal rhythm (validated: ADDS SIGNAL, |r|<0.6 vs existing)
-    "tox_max", "sev_max", "burstiness_cv",
-    # Activity rhythm. Dropped via data-driven audit (2003-2004 sample):
+    # Temporal rhythm
+    "burstiness_cv", "activity_density",
+    # Data-driven audit (full 2001-2018 run, N=593,617 active users, min 5 msgs;
+    # geometry measured by KMeans k=3 silhouette on RobustScaler(5-95)):
+    #   DROPPED — sparse (<21% nonzero). Under RobustScaler they inject distance
+    #   noise and inflate the biggest cluster; binarizing them tested WORSE
+    #   (sil 0.103 vs 0.128), so they are removed, not kept as 0/1:
+    #     - interlocutor_breadth / attention_received / reciprocity
+    #       (16% / 16% / 4% nonzero — most users are drive-by, no reply graph)
+    #     - reply_to_toxic_rate (1%) / toxicity_received_mean (16%)
+    #     - conflict_engagement_ratio (19%) / wp_citation_rate (21%)
+    #     - frac_project (17%; redundant residual of frac_interpersonal+content)
+    #   DROPPED — redundant with the kept extremes (|r| up to 0.96 across the four
+    #   toxicity stats); removing them raised KMeans silhouette 0.113 -> 0.128:
+    #     - own_toxicity_mean / own_severe_toxicity_mean
+    #   DROPPED/COMBINED 2026-07-02 after K=3 single-point artifact:
+    #     - tox_max + sev_max -> hostility_score (max)
+    #     - frac_interpersonal + frac_content -> namespace_focus (difference)
+    #     This removes the -0.96/+0.92 collinear pairs and prevents KMeans from
+    #     splitting on correlated axes / extreme indentation outliers.
+    #
+    # Earlier audit (2003-2004 sample) also dropped, for reference:
     #   - frac_revert/frac_report: substring heuristics, no native WikiConv action
     #   - frac_discuss/frac_edit/frac_delete/frac_restore/frac_moderation/
     #     frac_moderated/action_entropy: moderation actions <1% coverage (DEAD)
     #   - out_degree_log/in_degree_log/attention_per_msg: |r|>0.9 with kept cols
     #   - initiation_rate: exactly 1 - reply_rate (double-weights that axis)
-    "activity_density",
 )
 VECTOR_FIELD_NAMES = _VECTOR_FIELDS
 
@@ -190,7 +220,7 @@ class FeatureExtractor:
 
         # Conversational
         reply_rate = sum(1 for m in msgs if m.parent_msg_id) / total
-        mean_indentation = float(np.mean([_indent_value(m.metadata.get("indentation")) for m in msgs]))
+        mean_indentation = min(float(np.mean([_indent_value(m.metadata.get("indentation")) for m in msgs])), 20.0)
         verbosity = math.log1p(float(np.mean([len(m.text) for m in msgs])))
         activity = math.log1p(total)
 
@@ -277,5 +307,7 @@ class FeatureExtractor:
             # Conflict extremes + temporal rhythm (validated additions)
             tox_max=tox_max, sev_max=sev_max, burstiness_cv=burstiness_cv,
             activity_density=activity_density,
+            hostility_score=max(tox_max, sev_max),
+            namespace_focus=frac_content - frac_interpersonal,
             message_count=total, thread_count=len({t.thread_id for _, t in pairs}),
         )

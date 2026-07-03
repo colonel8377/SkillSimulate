@@ -1,9 +1,18 @@
-"""Two-stage archetype clustering.
+"""Behaviour-only archetype clustering.
 
-Stage 1 (role): cluster users by their action-policy behaviour vector (HDBSCAN).
-Stage 2 (style): within each role, sub-cluster by language embedding when the
-role is linguistically separable. A leaf = role × style = the distillation unit.
-HDBSCAN noise from stage 1 is kept as label -1 (out-of-archetype long tail).
+Users are partitioned by their action-policy behaviour vector into interpretable
+role groups — one role = one distillation unit. KMeans is the default: the
+behavioural space is a near-continuous manifold with no density gaps, so density
+clustering (HDBSCAN) rejects most users as noise, whereas KMeans gives a
+balanced, zero-orphan partition. HDBSCAN stays selectable for corpora with
+density-separated roles.
+
+Language style is deliberately NOT clustered. Averaged per-leaf language
+centroids do not separate (verified at N=593,871: max inter-leaf cosine 0.063
+vs 0.158 for random user pairs — sub-prototypes collapse to their role mean), so
+sub-clustering roles on language only fragments them without recovering real
+structure. Language is captured downstream at compile time by sampling
+representative utterances per leaf (Expression DNA, outline §4.3).
 """
 
 from __future__ import annotations
@@ -12,8 +21,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from loguru import logger
-from sklearn.cluster import KMeans
-from sklearn.metrics import davies_bouldin_score, silhouette_score
+from sklearn.cluster import KMeans, MiniBatchKMeans
+from sklearn.metrics import davies_bouldin_score, silhouette_samples, silhouette_score
 from sklearn.preprocessing import RobustScaler, StandardScaler
 
 from src.clustering.embeddings import EmbeddingExtractor
@@ -37,6 +46,7 @@ class ClusterResult:
     leaf_language_centroids: dict = field(default_factory=dict)
     pre_impute_orphans: int = 0           # HDBSCAN noise count before imputation
     n_orphans_kept: int = 0               # -1 users left un-imputed
+    leaf_silhouette: dict = field(default_factory=dict)  # leaf_id → mean silhouette
 
     def get_cluster_members(self, cluster_id: int) -> list[str]:
         return [uid for uid, cid in self.labels.items() if cid == cluster_id]
@@ -46,24 +56,33 @@ class ClusterResult:
 
 
 class BehavioralClusterer:
-    """Two-stage archetype clustering: role (behaviour) → style (language).
+    """Behaviour-only archetype clustering: users → role leaves.
 
-    Stage 1 partitions users by their *action policy* (the behavioural feature
-    vector) into interpretable role groups. Stage 2 sub-divides each role by
-    language style, but only when the role is linguistically separable. A leaf
-    = (role × style) and is the distillation unit. HDBSCAN noise from stage 1
-    is kept as label ``-1`` (out-of-archetype long-tail) — never force-merged.
+    Partition users by their *action policy* (the behavioural feature vector)
+    into interpretable role groups — KMeans by default (see ``role_method``),
+    HDBSCAN selectable for density-separated corpora. A leaf = one role = one
+    distillation unit.
+
+    Language is not part of the clustering objective (averaged language
+    centroids do not separate — see module docstring); it is captured at
+    skill-compile time. Under HDBSCAN, stage-1 noise is kept as label ``-1``
+    (out-of-archetype long-tail) and never force-merged; under KMeans there is
+    no noise.
     """
 
     def __init__(
         self,
         method: str = "two_stage",
         n_clusters: int = -1,                 # back-compat single-stage only
+        role_method: str = "kmeans",          # stage-1 role: "kmeans" | "hdbscan"
+        role_k: int = 12,                     # number of role clusters when role_method="kmeans"
         role_min_cluster_size: int | None = None,
         role_min_samples: int | None = None,
+        # legacy style-stage params — language is no longer clustered; kept
+        # inert for back-compat with main.py / config / streaming cache callers.
         style_min_cluster_size: int | None = None,
         style_min_samples: int | None = None,
-        min_style_silhouette: float = 0.10,   # gate for accepting a style split
+        min_style_silhouette: float = 0.10,
         target_min_leaves: int = 30,
         target_max_leaves: int = 80,
         scaler: str = "robust",               # "standard" | "robust"
@@ -74,14 +93,16 @@ class BehavioralClusterer:
         random_state: int = 42,
         max_msgs_per_user: int | None = 25,   # cap per-user msgs for embedding
         metric_sample: int = 10_000,          # silhouette/DB subsample cap
-        style_method: str = "umap",           # umap (no PCA — loses too much variance)
-        style_umap_dim: int = 15,             # UMAP output dim for style clustering
+        style_method: str = "umap",           # legacy (inert; was style-stage reduction)
+        style_umap_dim: int = 15,             # legacy (inert; was UMAP output dim)
         # back-compat (single-stage concat weights); unused by two_stage
         behavioral_weight: float | None = None,
         language_weight: float | None = None,
     ):
         self.method = method
         self.n_clusters = n_clusters
+        self.role_method = role_method
+        self.role_k = role_k
         self.role_min_cluster_size = role_min_cluster_size
         self.role_min_samples = role_min_samples
         self.style_min_cluster_size = style_min_cluster_size
@@ -142,22 +163,21 @@ class BehavioralClusterer:
         )
         language = np.stack([user_embeddings[u] for u in user_ids])
 
-        # One global UMAP fit (cosine → style_umap_dim) over all users. This is
-        # cheaper than per-role fits, gives a consistent style space for both
-        # stage-2 sub-clustering and orphan assignment, and is the standard
-        # embedding-clustering pipeline. No PCA (loses too much variance here).
-        logger.info(f"UMAP-reducing {language.shape[0]}×{language.shape[1]} language vectors → {self.style_umap_dim}-D ...")
-        lang_red = self._reduce_language(language)
-        lang_red = self._get_scaler().fit_transform(lang_red)
-
+        # Language is NOT clustered (averaged centroids don't separate — see
+        # module docstring); raw embeddings are kept only for per-leaf language
+        # centroids used in downstream representative-utterance selection at
+        # compile time. No UMAP / dimensionality reduction is needed.
         if self.method in ("kmeans", "hdbscan"):
-            leaf_labels = self._single_stage(behavioral, lang_red)
+            # back-compat single-stage ablation path: clusters on concatenated
+            # behaviour+language (the baseline against which behaviour-only was
+            # shown to win). Receives the raw language embedding.
+            leaf_labels = self._single_stage(behavioral, language)
         else:
-            leaf_labels = self._two_stage(behavioral, lang_red)
+            leaf_labels = self._two_stage(behavioral)
 
         n_pre_noise = int((leaf_labels == -1).sum())
         logger.info(
-            f"HDBSCAN: {(leaf_labels >= 0).sum()} assigned, "
+            f"Leaf labels: {(leaf_labels >= 0).sum()} assigned, "
             f"{n_pre_noise} orphans ({n_pre_noise/len(user_ids):.1%}) before imputation"
         )
 
@@ -165,23 +185,29 @@ class BehavioralClusterer:
         leaf_ids = sorted(set(leaf_labels.tolist()) - {-1})
         n_orphans_kept = n_pre_noise
         if self.impute_orphans and leaf_ids:
-            leaf_labels = self._impute_orphans(leaf_labels, behavioral, lang_red, leaf_ids)
+            leaf_labels = self._impute_orphans(leaf_labels, behavioral, leaf_ids)
             n_orphans_kept = 0
 
-        # combined space for sanity metrics (both low-dim now — no PCA)
-        combined = np.hstack([behavioral, lang_red])
+        # sanity metrics on the behavioural space — the space we actually
+        # clustered on (language is not part of the objective).
         mask = leaf_labels >= 0
         uniq = set(leaf_labels[mask].tolist())
         sil = db = 0.0
+        leaf_sil: dict[int, float] = {}
         if len(uniq) > 1 and mask.sum() > len(uniq):
             idx = np.where(mask)[0]
             if len(idx) > self.metric_sample:
                 rng = np.random.default_rng(self.random_state)
                 idx = rng.choice(idx, self.metric_sample, replace=False)
-            Xs, ys = combined[idx], leaf_labels[idx]
+            Xs, ys = behavioral[idx], leaf_labels[idx]
             if len(set(ys.tolist())) > 1:
                 sil = float(silhouette_score(Xs, ys))
                 db = float(davies_bouldin_score(Xs, ys))
+                # per-leaf breakdown so an overlapping leaf isn't hidden by the
+                # global average (same subsample as the global scores above).
+                per_sample = silhouette_samples(Xs, ys)
+                for lid in set(ys.tolist()):
+                    leaf_sil[int(lid)] = float(per_sample[ys == lid].mean())
 
         # per-leaf centroids in BOTH spaces (kept for downstream skill compile /
         # representative selection). language centroids use the raw embedding.
@@ -199,7 +225,7 @@ class BehavioralClusterer:
             label_dict.setdefault(u, leaf_ids[0] if leaf_ids else 0)
 
         logger.info(
-            f"Two-stage: {len(leaf_ids)} leaves, "
+            f"Behaviour-only roles: {len(leaf_ids)} leaves, "
             f"{n_pre_noise} pre-impute orphans ({n_pre_noise/len(user_ids):.1%}), "
             f"silhouette={sil:.3f}, db={db:.3f}"
         )
@@ -216,23 +242,23 @@ class BehavioralClusterer:
         )
         cr.leaf_behavior_centroids = beh_centroids
         cr.leaf_language_centroids = lang_centroids
+        cr.leaf_silhouette = leaf_sil
         cr.pre_impute_orphans = n_pre_noise
         cr.n_orphans_kept = n_orphans_kept
         return cr
 
     def _impute_orphans(
         self, leaf_labels: np.ndarray, behavioral: np.ndarray,
-        lang_red: np.ndarray, leaf_ids: list[int],
+        leaf_ids: list[int],
     ) -> np.ndarray:
-        """Assign every -1 user to its nearest leaf (combined behavior+style)."""
+        """Assign every -1 user to its nearest leaf on the behavioural space."""
         noise_idx = np.where(leaf_labels == -1)[0]
         if len(noise_idx) == 0 or not leaf_ids:
             return leaf_labels
-        combined = np.hstack([behavioral, lang_red])
-        leaf_centroids = np.stack([combined[leaf_labels == lid].mean(axis=0) for lid in leaf_ids])
+        leaf_centroids = np.stack([behavioral[leaf_labels == lid].mean(axis=0) for lid in leaf_ids])
         from scipy.spatial.distance import cdist
         # cdist keeps memory O(n_orphans × n_leaves) instead of a 3-D broadcast
-        dists = cdist(combined[noise_idx], leaf_centroids)
+        dists = cdist(behavioral[noise_idx], leaf_centroids)
         nearest = dists.argmin(axis=1)
         for i, oidx in enumerate(noise_idx):
             leaf_labels[oidx] = leaf_ids[int(nearest[i])]
@@ -254,89 +280,46 @@ class BehavioralClusterer:
         max_mcs = n // self.target_min_leaves
         return int(np.clip(mcs, min_mcs, max_mcs))
 
-    def _compute_style_mcs(self, role_size: int) -> int:
-        if self.style_min_cluster_size is not None:
-            return self.style_min_cluster_size
-        return max(50, role_size // 20)
-
     # ------------------------------------------------------------------
-    def _two_stage(self, behavioral: np.ndarray, lang_red: np.ndarray) -> np.ndarray:
-        """Stage 1 role (behaviour) → stage 2 style (reduced language). Leaf ids."""
-        n = behavioral.shape[0]
-        role_mcs = self._compute_role_mcs(n)
-        role_min_samples = self.role_min_samples or max(1, role_mcs // 5)
-        logger.info(f"Stage 1 roles: n={n}, min_cluster_size={role_mcs}, min_samples={role_min_samples}")
-        roles = self._hdbscan(behavioral, role_mcs, role_min_samples)
+    def _stage1_roles(self, behavioral: np.ndarray, n: int) -> np.ndarray:
+        """Stage-1 role partition of the behavioural space.
 
-        leaf = np.full(n, -1, dtype=int)
-        next_leaf = 0
-        for r in sorted(set(roles.tolist())):
-            if r == -1:
-                continue  # out-of-cluster long tail stays -1
-            idx = np.where(roles == r)[0]
-            sub_lang = lang_red[idx]
-            styles = self._maybe_split_styles(sub_lang, len(idx))
-            if styles is None:
-                # role not linguistically separable → one leaf
-                leaf[idx] = next_leaf
-                next_leaf += 1
-            else:
-                # map each style (incl. its -1 noise) to leaf ids; style-noise
-                # joins the role's default (first) leaf rather than dropping out
-                default_leaf = next_leaf
-                style_to_leaf: dict[int, int] = {}
-                for s in sorted(set(styles.tolist())):
-                    if s == -1:
-                        continue
-                    style_to_leaf[s] = next_leaf
-                    next_leaf += 1
-                for j, s in zip(idx, styles):
-                    leaf[j] = style_to_leaf.get(int(s), default_leaf)
-        return leaf
-
-    def _reduce_language(self, lang: np.ndarray) -> np.ndarray:
-        """Global UMAP reduction of language embeddings (cosine → umap_dim).
-
-        UMAP preserves neighborhood structure (not variance) and lands in low-D
-        where HDBSCAN's kNN is fast — the standard embedding-clustering pipeline.
-        No PCA: on this data PCA-50 retains only ~46% variance (too lossy).
+        KMeans (default): on full WikiConv the behavioural space is a near-
+        continuous manifold with no density gaps — HDBSCAN rejects ~65% of users
+        as noise at every parameter setting, and GMM components collapse (both
+        verified at N=593,871). KMeans imposes a balanced partition with zero
+        orphans, so every user receives a distillation unit. HDBSCAN is retained
+        as a selectable method for corpora that DO have density-separated roles.
         """
-        if lang.shape[1] <= self.style_umap_dim:
-            return lang
-        import umap  # umap-learn is a hard dependency for the two-stage path
-        return umap.UMAP(
-            n_components=self.style_umap_dim,
-            metric="cosine",
-            random_state=self.random_state,
-            low_memory=True,
-            transform_seed=self.random_state,
-        ).fit_transform(lang)
+        if self.role_method == "hdbscan":
+            role_mcs = self._compute_role_mcs(n)
+            role_min_samples = self.role_min_samples or max(1, role_mcs // 5)
+            logger.info(
+                f"Stage 1 roles (HDBSCAN): n={n}, min_cluster_size={role_mcs}, min_samples={role_min_samples}"
+            )
+            return self._hdbscan(behavioral, role_mcs, role_min_samples)
+        k = max(2, min(int(self.role_k), n))
+        km = MiniBatchKMeans(
+            n_clusters=k, random_state=self.random_state, n_init=5, batch_size=4096,
+        )
+        roles = km.fit_predict(behavioral)
+        logger.info(f"Stage 1 roles (KMeans): n={n}, k={k}")
+        return roles
 
-    def _maybe_split_styles(self, lang_red: np.ndarray, role_size: int) -> np.ndarray | None:
-        """Sub-cluster a role on the pre-reduced style space; real split only.
+    def _two_stage(self, behavioral: np.ndarray) -> np.ndarray:
+        """Behaviour-only role partition; the role id IS the leaf id.
 
-        ``lang_red`` is already UMAP-reduced (low-D), so this is just a cheap
-        HDBSCAN + silhouette gate — no further dimensionality reduction here.
+        Formerly a two-stage role→style split. The language/style stage was
+        removed because averaged per-role language centroids do not separate
+        (verified at N=593,871 — see module docstring): sub-clustering on
+        language only fragments roles without recovering real structure, and
+        language is captured at compile time (outline §4.3) instead. With the
+        style stage gone, a leaf = one role, so this is a single-stage partition.
+
+        ``_stage1_roles`` returns contiguous non-negative ids (with ``-1`` for
+        HDBSCAN noise), which are valid leaf ids as-is.
         """
-        mcs = self._compute_style_mcs(role_size)
-        min_samples = self.style_min_samples or max(10, mcs // 5)
-        if role_size < max(2 * mcs, 20):
-            return None
-        X = self._get_scaler().fit_transform(lang_red)
-        styles = self._hdbscan(X, mcs, min_samples)
-        mask = styles >= 0
-        uniq = set(styles[mask].tolist())
-        if len(uniq) < 2 or mask.sum() <= len(uniq):
-            return None
-        idx = np.where(mask)[0]
-        if len(idx) > self.metric_sample:
-            rng = np.random.default_rng(self.random_state)
-            idx = rng.choice(idx, self.metric_sample, replace=False)
-        sil = silhouette_score(X[idx], styles[idx]) if len(set(styles[idx].tolist())) > 1 else 0.0
-        if sil < self.min_style_silhouette:
-            return None
-        logger.info(f"  Style split: role_size={role_size}, mcs={mcs}, styles={len(uniq)}, silhouette={sil:.3f}")
-        return styles
+        return self._stage1_roles(behavioral, behavioral.shape[0])
 
     def _hdbscan(self, X: np.ndarray, min_cluster_size: int,
                  min_samples: int | None = None) -> np.ndarray:

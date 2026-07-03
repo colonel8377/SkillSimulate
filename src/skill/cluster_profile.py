@@ -1,9 +1,12 @@
 """Archetype profiling: freeze each leaf's typical utterances + behavioral tags.
 
 For every leaf cluster (role × style) this builds:
-- representative members  (top-M users nearest the leaf's language centroid),
-- typical utterances       (their messages, semantically de-duplicated, coverage-
-                            selected, capped, each with light context),
+- representative members  (top-M users closest to this leaf's language centroid
+                            AND farthest from its nearest-neighbour leaf's —
+                            contrastive, not just "most typical", so material
+                            doesn't converge on whatever's generic across leaves),
+- typical utterances       (their messages, ranked by the same contrastive score,
+                            semantically de-duplicated, capped, each with context),
 - behavioral tags          (deterministic: z-score the leaf's mean feature vector
                             against all leaves, emit labels from a fixed lexicon).
 
@@ -28,19 +31,15 @@ from src.data.schemas import Message, Thread
 # (feature, direction, label) — fired when the leaf's z-score on `feature`
 # exceeds +Z_THRESHOLD (direction "high") or below -Z_THRESHOLD ("low").
 TAG_LEXICON: list[tuple[str, str, str]] = [
-    ("own_toxicity_mean", "high", "hostile"),
-    ("own_toxicity_mean", "low", "civil"),
-    ("own_severe_toxicity_mean", "high", "highly-hostile"),
-    ("toxicity_received_mean", "high", "frequently-targeted"),
-    ("reply_to_toxic_rate", "high", "conflict-engaging"),
-    ("conflict_engagement_ratio", "high", "high-conflict-exposure"),
-    ("attention_received", "high", "central/popular"),
-    ("reciprocity", "high", "mutual-engager"),
-    ("interlocutor_breadth", "high", "broad-interaction"),
+    # Conflict / affect (single hostile-tail axis after tox_max/sev_max merge).
+    ("hostility_score", "high", "hostile"),
+    ("hostility_score", "low", "civil"),
+    # Topical / temporal
     ("topical_breadth", "high", "generalist"),
     ("topical_breadth", "low", "specialist"),
     ("tenure", "high", "veteran"),
     ("tenure", "low", "newcomer"),
+    # Conversational
     ("mean_indentation", "high", "deep-threading"),
     ("reply_rate", "high", "responder"),
     ("reply_rate", "low", "thread-initiator"),
@@ -48,12 +47,20 @@ TAG_LEXICON: list[tuple[str, str, str]] = [
     ("verbosity", "high", "verbose"),
     ("verbosity", "low", "terse"),
     ("activity", "high", "high-activity"),
-    ("wp_citation_rate", "high", "policy-oriented"),
-    ("frac_interpersonal", "high", "interpersonal-space"),
-    ("frac_content", "high", "article-focused"),
-    ("frac_project", "high", "project/policy-space"),
+    ("activity_density", "high", "intense-burst"),
+    ("burstiness_cv", "high", "bursty-poster"),
+    # Namespace focus: positive = content, negative = interpersonal.
+    ("namespace_focus", "high", "article-focused"),
+    ("namespace_focus", "low", "interpersonal-space"),
+    # Linguistic / affect
     ("exclaim_rate", "high", "emphatic"),
     ("lexical_ttr", "high", "rich-vocabulary"),
+    # NOTE: tags formerly driven by sparse/dropped features (frequently-targeted,
+    # conflict-engaging, high-conflict-exposure, central/popular, mutual-engager,
+    # broad-interaction, policy-oriented, project/policy-space) were removed when
+    # those features left VECTOR_FIELD_NAMES. _compute_tags skips any lexicon
+    # entry whose feature is absent, so this list stays crash-safe if features
+    # change again.
 ]
 Z_THRESHOLD = 1.0
 
@@ -74,6 +81,7 @@ class LeafProfile:
     typical_utterances: list[TypicalUtterance] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     size: int = 0
+    n_candidates: int = 0  # pre-dedup candidate utterance count (distillation coverage)
 
 
 class ArchetypeProfiler:
@@ -124,14 +132,35 @@ class ArchetypeProfiler:
                 leaf_feat[lid] = np.mean(vecs, axis=0)
         tag_map = self._compute_tags(leaf_feat)
 
+        # Per-leaf language centroids, computed up front so selection can be
+        # contrastive: prefer material close to THIS leaf's own voice and far
+        # from its nearest-neighbour leaf's, instead of "closest to my own
+        # centroid" alone — which tends to surface the most generic, most
+        # cross-leaf-similar examples (the leaf-overlap finding in
+        # quality_report.py's nearest_other_leaf_cosine diagnostic).
+        leaf_members = {lid: cluster_result.get_cluster_members(lid) for lid in leaf_ids}
+        leaf_lang_emb = {
+            lid: self._member_embeddings(leaf_members[lid], threads, lid, cluster_result)
+            for lid in leaf_ids
+        }
+        leaf_lang_centroid = {
+            lid: np.mean(list(e.values()), axis=0) for lid, e in leaf_lang_emb.items() if e
+        }
+        nearest_other = self._nearest_other_leaf(leaf_lang_centroid)
+
         profiles: dict[int, LeafProfile] = {}
         for lid in leaf_ids:
-            members = cluster_result.get_cluster_members(lid)
-            reps = self._representative_members(members, threads, lid, cluster_result)
-            utts = self._typical_utterances(reps, threads, lid, cluster_result, msg_by_id, topic_by_thread)
+            members = leaf_members[lid]
+            emb = leaf_lang_emb.get(lid, {})
+            own_c = leaf_lang_centroid.get(lid)
+            other_c = leaf_lang_centroid.get(nearest_other.get(lid))
+            reps = self._representative_members(members, emb, own_c, other_c)
+            utts, n_candidates = self._typical_utterances(
+                reps, threads, lid, cluster_result, msg_by_id, topic_by_thread, own_c, other_c
+            )
             profiles[lid] = LeafProfile(
                 leaf_id=lid, members=reps, typical_utterances=utts,
-                tags=tag_map.get(lid, []), size=len(members),
+                tags=tag_map.get(lid, []), size=len(members), n_candidates=n_candidates,
             )
         return profiles
 
@@ -149,6 +178,8 @@ class ArchetypeProfiler:
         for row, lid in enumerate(ids):
             tags = []
             for feat, direction, label in TAG_LEXICON:
+                if feat not in field_idx:
+                    continue  # feature dropped from VECTOR_FIELD_NAMES — skip
                 z = Z[row, field_idx[feat]]
                 if (direction == "high" and z >= Z_THRESHOLD) or (
                     direction == "low" and z <= -Z_THRESHOLD
@@ -172,17 +203,50 @@ class ArchetypeProfiler:
                 out[m] = np.asarray(emb).mean(axis=0)
         return out
 
-    def _representative_members(self, members, threads, leaf_id, cr) -> list[str]:
+    def _nearest_other_leaf(self, centroids: dict[int, np.ndarray]) -> dict[int, int]:
+        """Each leaf's nearest-neighbour leaf by language-centroid L2 distance."""
+        ids = list(centroids)
+        nearest: dict[int, int] = {}
+        for lid in ids:
+            best_id, best_d = None, None
+            for oid in ids:
+                if oid == lid:
+                    continue
+                d = float(np.linalg.norm(centroids[lid] - centroids[oid]))
+                if best_d is None or d < best_d:
+                    best_d, best_id = d, oid
+            if best_id is not None:
+                nearest[lid] = best_id
+        return nearest
+
+    def _contrastive_scores(
+        self, embs: dict[str, np.ndarray] | list[np.ndarray], own_centroid, other_centroid
+    ):
+        """own-distance minus other-distance — small/negative means close to this
+        leaf's voice and far from its nearest neighbour's; falls back to plain
+        own-distance when there's no neighbour centroid to contrast against."""
+        items = embs.items() if isinstance(embs, dict) else enumerate(embs)
+        scores = {}
+        for key, v in items:
+            own_d = float(np.linalg.norm(v - own_centroid))
+            if other_centroid is not None:
+                scores[key] = own_d - float(np.linalg.norm(v - other_centroid))
+            else:
+                scores[key] = own_d
+        return scores
+
+    def _representative_members(self, members, emb, own_centroid, other_centroid) -> list[str]:
         if len(members) <= self.top_m:
             return list(members)
-        emb = self._member_embeddings(members, threads, leaf_id, cr)
-        if not emb:
+        if not emb or own_centroid is None:
             return list(members)[: self.top_m]
-        centroid = np.mean(list(emb.values()), axis=0)
-        ranked = sorted(emb, key=lambda u: float(np.linalg.norm(emb[u] - centroid)))
+        scores = self._contrastive_scores(emb, own_centroid, other_centroid)
+        ranked = sorted(scores, key=scores.get)
         return ranked[: self.top_m]
 
-    def _typical_utterances(self, reps, threads, leaf_id, cr, msg_by_id, topic_by_thread) -> list[TypicalUtterance]:
+    def _typical_utterances(
+        self, reps, threads, leaf_id, cr, msg_by_id, topic_by_thread, own_centroid=None, other_centroid=None
+    ) -> tuple[list[TypicalUtterance], int]:
         rep_set = set(reps)
         # collect candidate messages authored by representative members
         cands: list[Message] = []
@@ -191,10 +255,11 @@ class ArchetypeProfiler:
                 if m.user_id in rep_set and m.text.strip() and not m.text.startswith("::"):
                     cands.append(m)
         if not cands:
-            return []
+            return [], 0
         embs = np.asarray(self.embedder.encode([m.text[:400] for m in cands], show_progress_bar=False))
-        centroid = embs.mean(axis=0)
-        order = np.argsort([float(np.linalg.norm(embs[i] - centroid)) for i in range(len(cands))])
+        ref_centroid = own_centroid if own_centroid is not None else embs.mean(axis=0)
+        scores = self._contrastive_scores(list(embs), ref_centroid, other_centroid)
+        order = np.argsort([scores[i] for i in range(len(cands))])
 
         # greedy semantic dedup (keep the one nearer the centroid)
         kept_idx: list[int] = []
@@ -222,7 +287,7 @@ class ArchetypeProfiler:
                 member=m.user_id, action=m.action_type.value, text=txt,
                 parent_context=ctx, topic=topic_by_thread.get(m.thread_id, ""),
             ))
-        return out
+        return out, len(cands)
 
     def save(self, profiles: dict[int, LeafProfile], out_dir: str | Path, platform: str) -> None:
         out_dir = Path(out_dir)

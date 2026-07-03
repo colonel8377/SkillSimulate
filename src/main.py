@@ -44,6 +44,8 @@ def _build_clusterer(args) -> "BehavioralClusterer":
     return BehavioralClusterer(
         method=_val("cluster_method", "two_stage"),
         n_clusters=_val("num_clusters", -1),
+        role_method=_val("role_method", "kmeans"),
+        role_k=_val("role_k", 12),
         role_min_cluster_size=_val("role_min_cluster_size", None),
         role_min_samples=_val("role_min_samples", None),
         style_min_cluster_size=_val("style_min_cluster_size", None),
@@ -66,10 +68,17 @@ def _add_cluster_args(p):
     p.add_argument("--cluster-method", type=str, default=None,
                    choices=["kmeans", "hdbscan", "two_stage"])
     p.add_argument("--num-clusters", type=int, default=None)
+    p.add_argument("--role-method", type=str, default=None,
+                   choices=["kmeans", "hdbscan"],
+                   help="Stage-1 role clusterer (default kmeans)")
+    p.add_argument("--role-k", type=int, default=None,
+                   help="Number of role clusters when --role-method=kmeans")
     p.add_argument("--role-mcs", type=int, default=None,
+                   dest="role_min_cluster_size",
                    help="Role HDBSCAN min_cluster_size")
     p.add_argument("--role-min-samples", type=int, default=None)
     p.add_argument("--style-mcs", type=int, default=None,
+                   dest="style_min_cluster_size",
                    help="Style HDBSCAN min_cluster_size")
     p.add_argument("--style-min-samples", type=int, default=None)
     p.add_argument("--target-min-leaves", type=int, default=None)
@@ -189,11 +198,12 @@ def cluster_eda(dataset: str, data_dir: str | None, output: str | None,
         import numpy as np
         from src.clustering.streaming import run_streaming_pipeline
         from src.clustering.eda import save_report
-        cr, accums = run_streaming_pipeline(
+        cr, accums, _user_emb = run_streaming_pipeline(
             data_dir, min_messages=min_messages, workers=workers,
             clusterer=clusterer,
         )
         from src.skill.cluster_profile import ArchetypeProfiler
+        from src.clustering.features import VECTOR_FIELD_NAMES
         leaf_feat = {}
         for l in cr.get_cluster_ids():
             if l < 0:
@@ -203,16 +213,36 @@ def cluster_eda(dataset: str, data_dir: str | None, output: str | None,
             if vecs:
                 leaf_feat[l] = np.mean(vecs, axis=0)
         tags = ArchetypeProfiler()._compute_tags(leaf_feat)
+
+        # Per-feature distribution over ALL clustered users — lets a single
+        # full-scale run reveal which columns collapse / lose variance at scale
+        # (the 2003-2004 audit can't, since distributions shift post-2006).
+        M = (np.stack([f.to_vector() for f in cr.user_features.values()])
+             if cr.user_features else np.zeros((0, len(VECTOR_FIELD_NAMES))))
+        feat_stats = {}
+        for i, name in enumerate(VECTOR_FIELD_NAMES):
+            col = M[:, i] if M.size else np.array([0.0])
+            feat_stats[name] = {
+                "mean": float(col.mean()), "std": float(col.std()),
+                "p50": float(np.percentile(col, 50)), "p90": float(np.percentile(col, 90)),
+                "nonzero_frac": float((col != 0).mean()),
+            }
         report = {
             "n_users_clustered": len(cr.user_features),
             "n_pre_impute_orphans": getattr(cr, "pre_impute_orphans", 0),
             "n_orphans_kept": getattr(cr, "n_orphans_kept", 0),
+            "feature_stats": feat_stats,
             "clustering": {
                 "n_leaves": cr.n_clusters,
                 "leaf_sizes": {int(l): len(cr.get_cluster_members(l))
                                for l in cr.get_cluster_ids() if l >= 0},
                 "silhouette": cr.silhouette_score,
                 "davies_bouldin": cr.davies_bouldin_score,
+                "leaf_silhouette": {int(k): v for k, v in cr.leaf_silhouette.items()},
+                "orphan_rate": (
+                    round(cr.n_orphans_kept / len(cr.user_features), 4)
+                    if cr.user_features else 0.0
+                ),
                 "leaf_tags": {int(k): v for k, v in tags.items()},
             },
         }
@@ -241,17 +271,20 @@ def export_corpus(dataset: str, data_dir: str | None, output: str | None,
     if data_dir and (Path(data_dir) / "wikiconv-2010").exists():
         import numpy as np
         from src.clustering.streaming import (
-            run_streaming_pipeline, collect_member_utterances, embed_sample_texts,
+            run_streaming_pipeline, collect_member_utterances,
+            collect_rejection_evidence,
         )
         from src.skill.cluster_profile import ArchetypeProfiler, LeafProfile, TypicalUtterance
         from src.skill.corpus_export import export_corpus_packs
 
-        cr, accums = run_streaming_pipeline(
+        cr, accums, user_embeddings = run_streaming_pipeline(
             data_dir, min_messages=min_messages, workers=workers,
             clusterer=clusterer,
         )
-        # language centroid per leaf → representative members
-        emb = embed_sample_texts(accums)
+        # language centroid per leaf → representative members — reuse the
+        # embeddings run_streaming_pipeline already computed/cached (identical
+        # mean+std vectors) instead of re-embedding the whole slice.
+        emb = user_embeddings
         leaf_ids = [l for l in cr.get_cluster_ids() if l >= 0]
         rep_members: dict[int, list[str]] = {}
         all_members: set[str] = set()
@@ -265,10 +298,18 @@ def export_corpus(dataset: str, data_dir: str | None, output: str | None,
             rep_members[l] = top
             all_members.update(top)
 
+        year_dirs = __import__(
+            "src.clustering.streaming", fromlist=["find_year_dirs"]
+        ).find_year_dirs(data_dir)
         member_utts = collect_member_utterances(
-            __import__("src.clustering.streaming", fromlist=["find_year_dirs"]).find_year_dirs(data_dir),
-            all_members, max_per_user=60, workers=workers,
+            year_dirs, all_members, max_per_user=60, workers=workers,
         )
+
+        # Per-leaf rejection evidence (anti-pattern grounding): the full corpus
+        # can't be held as in-memory threads, so collect deletions / high-tox /
+        # personal-attack signals via a dedicated streaming pass keyed by leaf.
+        user_to_leaf = {u: int(lid) for u, lid in cr.labels.items() if lid >= 0}
+        leaf_evidence = collect_rejection_evidence(year_dirs, user_to_leaf, workers=workers)
 
         # tags
         leaf_feat = {}
@@ -289,15 +330,31 @@ def export_corpus(dataset: str, data_dir: str | None, output: str | None,
                         member=m, action=it["action"], text=it["text"],
                         parent_context=it["parent_context"], topic=it["topic"],
                     ))
+            n_candidates = sum(len(member_utts.get(m, [])) for m in rep_members.get(l, []))
             profiles[l] = LeafProfile(
                 leaf_id=l, members=rep_members.get(l, []),
                 typical_utterances=utts, tags=tags.get(l, []), size=len(members),
+                n_candidates=n_candidates,
             )
 
         profiler = ArchetypeProfiler()
         profiler.save(profiles, out, dataset)
-        export_corpus_packs([], cr, profiles, out, dataset)
-        logger.info(f"Exported {len(profiles)} streaming leaf packs to {out / dataset}")
+        export_corpus_packs([], cr, profiles, out, dataset, leaf_evidence=leaf_evidence)
+        n_ev = sum(1 for v in leaf_evidence.values() if v)
+        logger.info(
+            f"Exported {len(profiles)} streaming leaf packs to {out / dataset} "
+            f"(rejection-evidence populated for {n_ev}/{len(profiles)} leaves)"
+        )
+
+        from src.skill.quality_report import build_quality_report
+        quality = build_quality_report(cr, profiles, leaf_evidence, user_embeddings=emb)
+        with open(out / dataset / "quality_report.json", "w") as f:
+            import json as _json
+            _json.dump(quality, f, ensure_ascii=False, indent=2)
+        logger.info(
+            f"Quality report → {out / dataset / 'quality_report.json'} "
+            f"({len(quality['concerns'])}/{quality['n_leaves']} leaves flagged)"
+        )
         return
 
     from src.clustering.clusterer import BehavioralClusterer
@@ -319,6 +376,21 @@ def export_corpus(dataset: str, data_dir: str | None, output: str | None,
     out = Path(output) if output else (settings.output_dir / "skill_corpus")
     profiler.save(profiles, out, dataset)            # typical.jsonl + profile.json
     export_corpus_packs(threads, cluster_result, profiles, out, dataset)  # for_colleague/for_nuwa
+
+    from src.skill.corpus_export import _rejected_evidence
+    from src.skill.quality_report import build_quality_report
+    leaf_evidence = {
+        lid: _rejected_evidence(prof, threads, cluster_result)
+        for lid, prof in profiles.items()
+    }
+    quality = build_quality_report(cluster_result, profiles, leaf_evidence)
+    with open(out / dataset / "quality_report.json", "w") as f:
+        import json as _json
+        _json.dump(quality, f, ensure_ascii=False, indent=2)
+    logger.info(
+        f"Quality report → {out / dataset / 'quality_report.json'} "
+        f"({len(quality['concerns'])}/{quality['n_leaves']} leaves flagged)"
+    )
 
 
 async def run_experiment(config_path: str, exp_type: str = "exp1") -> None:
