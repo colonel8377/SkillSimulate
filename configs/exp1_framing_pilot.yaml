@@ -50,7 +50,7 @@ alpha: 1.0
 alpha_tier1: 1.0
 alpha_tier2: 1.0
 alpha_tier3: 1.0
-num_clusters: 4
+num_clusters: 8
 cluster_method: kmeans
 top_n_threads: 20
 max_threads: 500

@@ -32,8 +32,10 @@ alpha: 1.0
 alpha_tier1: 1.0   # Expression DNA  (Tier 1 post-gen embedding filter)
 alpha_tier2: 1.0   # Mind Models     (Tier 2 retrieval injection)
 alpha_tier3: 1.0   # Anti-patterns   (Tier 3 two-stage enforcement)
-num_clusters: 4
+num_clusters: 8
 cluster_method: kmeans
+cluster_map_path: outputs/skill_corpus_k8_quantile/wikiconv/cluster_map.json
+skill_corpus_dir: outputs/skill_corpus_k8_quantile/wikiconv
 top_n_threads: 20
 checkpoint_every: 5
 max_threads: 2000

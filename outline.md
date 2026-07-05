@@ -147,14 +147,22 @@
 **方法学循环性防御声明**：聚类、编译、验证均基于同一社区数据，存在循环性质疑风险。本文通过四重机制防御：(1) 置换检验（§5.2 Condition 6 Shuffled）— 检测随机性；(2) 跨数据集迁移（§5.5 Wikipedia→Reddit）— 检测过拟合到特定社区；(3) Held-out 事件预测准确率（§5.3 Predictive Fidelity layer）— 检测方法是否捕获因果模式而非 spurious correlation；(4) 跨结构部分迁移（§5.5，共享分类器校准）— 在 community A 编译 .skill，部分迁移到结构不同的 community B（如 Reddit → GitHub：迁移可泛化组件 Expression DNA + 通用 Anti-patterns，含其校准的 θ_sem 语义阈值；平台特定的 Mind Models 与 Category C 行为分类器在 B 上重编译），若 fidelity 部分保持则说明捕获的是可泛化行为模式。Held-out 事件定义标准：由 2 名标注者独立编码争议性事件（conflict escalation / persuasion success / consensus formation），Cohen's κ ≥ 0.7 后取共识标签作为 ground truth。
 
 ### 4.2 Step 1: Clustering Typical Individuals
-- 输入：平台完整对话日志
-- 两阶段特征提取：
-  - Stage 1: 行为信号 (reply depth, edit frequency, stance shift rate, conflict engagement ratio)
-  - Stage 2: 语言嵌入 (sentence-BERT 或 domain-adapted embeddings)
-  - 自适应权重拼接
-- 聚类：K-Means / HDBSCAN, K=3-5
-- K 选择标准：silhouette score + Davies-Bouldin index + 领域可解释性
-- **Cluster stability**: 重采样 ARI variance < 0.2
+
+- **数据集**：English Wikipedia Talk Pages (WikiConv + CGA ConvoKit), 2001–2018 全量讨论页（约 80M utterances）
+- **用户粒度**：以注册用户 / 稳定匿名 IP 为个体；跨年份累积行为特征，仅保留活跃度 floor 以上用户（最终 593,617 用户）
+- **行为特征**：21 维行为向量，包括回复深度、回复率、编辑/删除/恢复率、毒性暴露、感叹率、疑问率、命名空间偏好、话题广度、 tenure、活动密度、burstiness CV 等（详见 `src/clustering/features.py:VECTOR_FIELD_NAMES`）
+- **语言嵌入**：BGE  sentence embeddings；为每个用户聚合 toxicity-stratified 文本样本（高毒/低毒各保留一部分），确保语言 centroid 能覆盖冲突性情境
+- **预处理**：`QuantileTransformer(output_distribution='normal')` 对行为特征做非参数正态化；对比 `RobustScaler(5-95)` 显著提升 silhouette 与 Davies-Bouldin
+- **聚类**：K-Means, K=8（经 K=3–15 全量 sweep：silhouette、Davies-Bouldin、领域可解释性综合权衡）
+  - K=8  silhouette = 0.259, Davies-Bouldin = 1.528
+  - 聚类锁定结果：`outputs/stream_cache/clustering_k8_final_quantile.pkl`
+- **K 选择标准**：silhouette score + Davies-Bouldin index + 领域可解释性；K=8 是 quality–interpretability 的折中，K>10 仅边际提升但可解释性下降
+- **Skill 合并**：8 个聚类经可解释性审查后合并为 **6 个蒸馏 skill**（`outputs/skill_corpus_k8_quantile/wikiconv/cluster_map.json`）
+  - cluster 1 → 0：Substantive discussant（深度讨论型）
+  - cluster 5 → 4：Veteran generalist（资深泛化老手）
+  - 独立保留：Niche terse specialist (2)、Confrontational editor (3)、Community patroller (6)、Expert fact-checker (7)
+- **Cluster stability**：重采样 ARI variance < 0.2（sweep 阶段已验证）
+- **下游语料**：每个 skill 抽取 30 个 centroid-最近代表用户，每人最多 300 条 utterances，生成约 15k typical utterances 用于 colleague/nuwa-skill 蒸馏
 
 ### 4.3 Step 2: nuwa-skill Compilation (Dual-Track)
 - Top-N 最具代表性交互（N≈20 对话线程）
@@ -226,8 +234,19 @@
 - **API 模型 (GPT-4o, Claude)**：仅使用 output filtering + re-prompting（无法访问 logits）
 
 ### 4.5 Step 4: Agent Configuration & Population
-- 按真实比例分配 N≈30 agents
+
+- **Agent 人口 = 6 个 skill × 每 skill 5 个 agents = 30 agents**（`exp1_full.yaml` population_size=30）
+  - 保持 30 这个数字是为了与 outline §5.1 成本估算一致，同时确保每个 skill 有 5 个独立 agent 副本，避免单个 agent 的 idiosyncrasy 主导该 skill 的仿真
+  - 比例按真实 cluster size 加权分配：skill 0 (25.3%), skill 2 (8.7%), skill 3 (7.0%), skill 4 (38.5%), skill 6 (10.9%), skill 7 (9.6%) → 30 agents 下四舍五入为：8 / 3 / 2 / 11 / 3 / 3
+  - 若严格按 size 分配导致某 skill 只有 1–2 agents，则上取到 3，剩余从最大 skill 扣除；最终各 skill 至少 2 agents
+- **Framing pilot 与 pilot**：使用 10 agents（`exp1_framing_pilot.yaml` / `exp1_pilot.yaml`），按最小可解释比例分配：2 / 1 / 1 / 3 / 1 / 2
 - .skill 通过三层机制挂载为硬约束
+- **Population 合理性检查**：
+  - Micro Behavior 层比较 agent-by-action matrix，30 agents 已能稳定估计动作分布
+  - Meso/Macro 网络指标随 agent 数增长而改善，但 30 是成本-效益拐点（估计约 $2,000–4,000 全网格）
+  - 5 repeats 下 30 agents 满足 §5.1 power analysis 对 Cohen's d ≥ 0.5 的 80% power 要求
+
+> **与早期版本的改动**：早期 outline 写 "N≈30 agents" 但未说明与 K 的关系；K=8→6 skills 后，30 agents 明确为 6×5 结构，保证每个 skill 有独立统计样本。
 
 ### 4.6 Step 5: Constrained Interaction Sandbox
 - 平台拓扑约束 + 平台特定动作空间：
@@ -273,11 +292,13 @@
 - 模型: DeepSeek-V4-Flash（v1 single-model；cross-model generality deferred to future work — see §7.1）
 - 总条件数: 13 × 3 × 1 = 39 cells × 5 repeats = 195 simulation runs
 - 重复: 每条件 5 次（framing-pilot effect-size dependent；d ≥ 0.5 → 5 repeats sufficient for 80% power at α=0.05）
+- **Agent 人口**：30 agents = 6 skills × 5 agents per skill（outline §4.5）
+- **每轮 API 调用数**：50 rounds × (30 agents + 环境/观察行为) ≈ 1,500 calls/run；195 runs 共约 292K calls
 - **样本量与可行性说明**：195 cells × 50 rounds × 30 agents per cell；API 成本估算（DeepSeek-V4-Flash @ $0.10/1K input + $0.40/1K output）约 $2,000–4,000。DeepSeek-V4-Pro 保留用于 skill compilation。Cross-model analysis (§7.1) deferred to v2 — single-model ≠ negative finding, mirroring the §4.4.4 deferred-work caveat
 - **Power analysis**：基于 pilot data（Wikipedia 单数据集）的 effect size 估计，Cohen's d ≥ 0.5 时 5 次重复即可达到 80% power (α=0.05)；若 pilot 显示 d < 0.5，则增加至 10 次重复
 - **Framing pilot（review-driven, ARS 2026-06-19）**：在主实验之前运行 `configs/exp1_framing_pilot.yaml`——**4 条件 (descriptive / pop_aligned / rich_narrative / cadp_full)** × 10 repeats × Wikipedia × 单模型，仅测 Micro Behavior + Predictive Fidelity 两层。**Pre-registered 决策规则**（unblinding 前冻结，不可事后调整）：d ≥ 0.5 on ≥2 layers → method 主导 framing 可行；d ≈ 0.3 或单层 → benchmark 主导 framing；d < 0.3 → CADP 路线重构；CADP 输给 Pop-Aligned → benchmark framing + 重写 §2.3；**CADP 在 Predictive Fidelity 输给 Rich-Narrative（条件 15）→ 核心论点（杠杆 2 必要性）失败，转 benchmark framing + 重写 §1.4/§2.2.5**。Framing pilot 与 §5.1 Power analysis 共享 effect-size 估计但作用不同：前者决定 paper framing，后者决定主实验 repeat 数
 - **base-model 机制对照（review-driven, 2026-06-23，reduced grid）**：回应 Chameleon's Limit "collapse resides in the weights, not the reasoning chain" 的根本质疑。同一套 CADP + baseline 分别跑在 (a) base/弱对齐模型 与 (b) 强 RLHF 模型 上，比较 CADP 相对 baseline 的边际增益：增益在 RLHF 模型上显著更大 → 证明 enforcement 确实对抗 RLHF 吸引子（机制验证）；两者相等 → enforcement 为通用约束效果（故事变弱但成立）；RLHF 模型上更小 → 权重主导、prompt 时间管不住（kill condition）。**前置可行性**：需在 `configs/models.yaml` 配置一个 base/弱对齐模型端点；若无法获取，降级为 §7.4 limitation（机制假设未独立验证）。此对照为 optional，视 framing pilot 结果决定是否投入
-- **聚类共享原则**：所有 13 个条件使用相同的 Step 1 聚类结果（相同 agent 分组），差异仅在 persona/skill 内容和 enforcement 机制。这隔离聚类结构贡献与行为规则蒸馏贡献
+- **聚类共享原则**：所有 13 个条件使用相同的 Step 1 聚类结果与 **6-skill 合并映射（`cluster_map.json`）**（相同 agent 分组），差异仅在 persona/skill 内容和 enforcement 机制。这隔离聚类结构贡献与行为规则蒸馏贡献
 - **Statistical analysis（确认性 vs 探索性声明）**：Confirmatory comparisons = CADP (Full) vs 每个 baseline 在 5 个 metric layer 上的逐层检验，层内 Bonferroni 校正；报告 effect size (Cohen's d) + 95% CI，不仅 p 值。消融（条件 9-12）、α-sweep（§5.6.5）、迁移测试（§5.5）、trigger calibration（§5.3.5）归为 exploratory，描述性报告、不做 family-wise 校正，结论措辞相应弱化（"suggest"/"indicate" 而非 "prove"）
 - **可复现性 (Reproducibility)**：发布 (a) 完整 pipeline 代码 + nuwa-skill 编译器，(b) 化名（anonymized）聚合级 .skill 文件（不发布个体级，见 §7.5 dual-use），(c) 全部随机种子，(d) API 模型快照日期（DeepSeek-V4-Flash / DeepSeek-V4-Pro 具体版本）+ 开源模型 commit hash（预留 future-work slots），(e) 标注协议 + 标注数据。数据集来自公开平台 API（CC-BY-SA / 平台 ToS 研究用途）
 
@@ -287,9 +308,9 @@
 3. Segmentation Persona (复现 Qin et al. 2026)
 4. **Population-Aligned Persona (复现 arXiv:2509.10127)** — 最直接竞争者，测试"属性分布匹配"能否达到"行为规则蒸馏"的保真度
 5. **COLLEAGUE capability-only (no Constraint Track, no enforcement)** — 直接前驱方法。在同一 sandbox 中用 nuwa-skill 框架编译 capability-only .skill（仅 Capability Track；**注**：真实 COLLEAGUE.SKILL 为 dual-track advisory，见 §2.4，此处为 capability-only 消融），无三层 enforcement。隔离 enforcement 的增量贡献
-6. **Clustering-Only Descriptive Persona** — 共享 Step 1 聚类结果，每聚类使用描述性 persona（如"你是 Wikipedia 编辑者，属于 cluster A"）而非 .skill。隔离聚类结构贡献 vs 行为规则蒸馏贡献。若此条件已接近 CADP Full，则说明优势主要来自聚类而非 .skill
+6. **Clustering-Only Descriptive Persona** — 共享 Step 1 聚类结果与 6-skill 合并映射，每 skill 使用描述性 persona（如"你是 Wikipedia 讨论者中的 Substantive discussant，特征是回复深度高、疑问率高、verbose"）而非 .skill。隔离聚类结构贡献 vs 行为规则蒸馏贡献。若此条件已接近 CADP Full，则说明优势主要来自聚类而非 .skill
 7. CADP (Full) — 三维完整 + three-tier enforcement
-8. **CADP (Shuffled)** — 置换检验。**Shuffle 定义**：保持 agent 分组结构不变，但随机重分配 .skill 到错误聚类（将 cluster A 的 .skill 分配给 cluster B 的 agent）。测试"正确匹配"的重要性——若 shuffled 性能 ≈ random baseline，则说明正确 .skill 分配是关键；若 shuffled 仍优于 baseline，则说明 .skill 本身有 generic 价值
+8. **CADP (Shuffled)** — 置换检验。**Shuffle 定义**：保持 6-skill agent 分组结构不变，但随机重分配 .skill 到错误 skill（将 skill A 的 .skill 分配给 skill B 的 agent）。测试"正确匹配"的重要性——若 shuffled 性能 ≈ random baseline，则说明正确 .skill 分配是关键；若 shuffled 仍优于 baseline，则说明 .skill 本身有 generic 价值
 9. **CADP minus Expression DNA** — 去语言维度消融
 10. **CADP minus Mind Models** — 去认知维度消融（同时检验 Tier 2 retrieval-augmented conditioning 的独立贡献）
 11. **CADP minus Anti-patterns** — 去反模式消融 (测 RLHF override 假设)
