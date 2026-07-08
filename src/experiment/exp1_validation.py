@@ -32,8 +32,10 @@ class Experiment1Runner(ExperimentRunner):
             role_labels_dir=str(settings.role_labels_dir),
             model_provenance=self.llm.get_all_provenance(),
         )
-        # Cache compiled skills per dataset
-        self._skill_cache: dict[str, dict[str, Any]] = {}
+        # Cache compiled skills per (dataset, distiller) — distiller is
+        # None for pipeline-A/bare-file conditions, "colleague"/"nuwa" for
+        # the manual-distiller comparison conditions.
+        self._skill_cache: dict[tuple[str, str | None], dict[str, Any]] = {}
         self._data_cache: dict[str, list] = {}
         self._cluster_cache: dict[str, Any] = {}  # dataset → ClusterResult
         self._stability_cache: dict[str, dict] = {}  # dataset → stability report
@@ -55,7 +57,10 @@ class Experiment1Runner(ExperimentRunner):
         # Compile skills if CADP condition (shared per dataset)
         skills = {}
         if is_cadp_condition(cell.condition):
-            skills = await self._get_or_compile_skills(cell.dataset, threads, cluster_result, thread_cluster_map)
+            skills = await self._get_or_compile_skills(
+                cell.dataset, threads, cluster_result, thread_cluster_map,
+                condition=cell.condition,
+            )
 
         # Build population
         pop_builder = PopulationBuilder(
@@ -215,19 +220,47 @@ class Experiment1Runner(ExperimentRunner):
         threads: list,
         cluster_result,
         thread_cluster_map: dict,
+        condition: str = "cadp_full",
     ) -> dict:
         """Get or compile skills for a dataset.
 
         First checks disk for existing .skill files (avoid recompilation).
-        Falls back to compilation if not found.
+        Falls back to compilation if not found — EXCEPT for the manual-
+        distiller conditions (``cadp_full_colleague`` / ``cadp_full_nuwa``),
+        which fail fast instead. Those conditions exist specifically to
+        evaluate the manually-distilled colleague-skill / nuwa-skill
+        artifacts (converted via ``scripts/convert_distilled_skills.py`);
+        silently falling back to pipeline A's LLM re-extraction would
+        defeat the purpose of the comparison and mask a missing-file bug
+        as a successful run (plan: "打通蒸馏产出与 CADP 实验", 2026-07-08).
         """
-        if dataset not in self._skill_cache:
+        from src.experiment.conditions import distiller_suffix
+
+        distiller = distiller_suffix(condition)
+        cache_key = (dataset, distiller)
+        if cache_key not in self._skill_cache:
             from src.config.settings import settings as proj_settings
             from src.skill.compiler import SkillCompiler
 
-            # Check if skill files already exist on disk
             cluster_ids = [str(cid) for cid in cluster_result.get_cluster_ids()]
-            if SkillCompiler.skills_exist(
+
+            if distiller is not None:
+                if not SkillCompiler.skills_exist(
+                    proj_settings.skills_dir, dataset, cluster_ids, distiller=distiller
+                ):
+                    raise FileNotFoundError(
+                        f"Condition '{condition}' requires pre-converted '{distiller}' "
+                        f"skill files for dataset '{dataset}' (clusters {cluster_ids}) "
+                        f"under {proj_settings.skills_dir}, e.g. "
+                        f"skill_cluster_{cluster_ids[0]}_{dataset}_{distiller}.yaml. "
+                        f"Run scripts/convert_distilled_skills.py first — this condition "
+                        f"does not fall back to pipeline A recompilation."
+                    )
+                logger.info(f"Loading existing '{distiller}' skills for {dataset} from disk")
+                skills = SkillCompiler.load_all_skills(
+                    proj_settings.skills_dir, platform=dataset, distiller=distiller
+                )
+            elif SkillCompiler.skills_exist(
                 proj_settings.skills_dir, dataset, cluster_ids
             ):
                 logger.info(f"Loading existing skills for {dataset} from disk")
@@ -251,12 +284,12 @@ class Experiment1Runner(ExperimentRunner):
                 for cid, skill in skills.items():
                     compiler.save_skill(skill)
 
-            self._skill_cache[dataset] = skills
+            self._skill_cache[cache_key] = skills
             logger.info(
-                f"Skills ready for {dataset}: {len(skills)} clusters "
-                f"({list(skills.keys())})"
+                f"Skills ready for {dataset} (distiller={distiller}): "
+                f"{len(skills)} clusters ({list(skills.keys())})"
             )
-        return self._skill_cache[dataset]
+        return self._skill_cache[cache_key]
 
     def _assign_threads_to_clusters(self, threads: list, cluster_result) -> dict[str, int]:
         """Assign each thread to a cluster based on its participants' majority cluster."""

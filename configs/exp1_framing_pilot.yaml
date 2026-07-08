@@ -42,7 +42,8 @@ models: [deepseek-v4-flash]   # REPLACE with your target headline model
 conditions:
   - descriptive
   - pop_aligned
-  - cadp_full
+  - cadp_full_colleague
+  - cadp_full_nuwa
 num_repeats: 10
 num_rounds: 20
 population_size: 10

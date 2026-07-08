@@ -358,6 +358,16 @@ class PopulationBuilder:
             skill = self._get_skill_or_raise(cluster_id, condition)
             return CADPAgent(skill=skill, **alpha_kwargs, **common_kwargs)
 
+        elif condition in ("cadp_full_colleague", "cadp_full_nuwa"):
+            # Same CADPAgent runtime as cadp_full — the only difference is
+            # which skill dict was loaded upstream (manually distilled via
+            # colleague-skill / nuwa-skill Markdown, converted by
+            # scripts/convert_distilled_skills.py, vs pipeline A's LLM
+            # re-extraction). See _get_skill_or_raise / conditions.py
+            # distiller_suffix for the fail-fast loading behavior.
+            skill = self._get_skill_or_raise(cluster_id, condition)
+            return CADPAgent(skill=skill, **alpha_kwargs, **common_kwargs)
+
         elif condition == "cadp_shuffled":
             if not self.skills:
                 raise ValueError(

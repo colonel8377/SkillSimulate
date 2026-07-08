@@ -29,6 +29,24 @@ def is_cadp_condition(condition: str) -> bool:
     }
 
 
+def distiller_suffix(condition: str) -> str | None:
+    """Return the manual-distiller suffix ("colleague" | "nuwa") for
+    ``cadp_full_colleague`` / ``cadp_full_nuwa``, or ``None`` for every
+    other condition (including the retired bare ``cadp_full``).
+
+    Used by ``Experiment1Runner._get_or_compile_skills`` to select
+    ``skill_cluster_{cid}_{platform}_{distiller}.yaml`` instead of the
+    bare (pipeline-A-compiled) filename, and to fail fast rather than
+    silently falling back to pipeline A when the distilled file is
+    missing (plan: "打通蒸馏产出与 CADP 实验", 2026-07-08).
+    """
+    if condition == "cadp_full_colleague":
+        return "colleague"
+    if condition == "cadp_full_nuwa":
+        return "nuwa"
+    return None
+
+
 def is_replay_only_condition(condition: str) -> bool:
     """Conditions that replay observed traces instead of running a sandbox.
 

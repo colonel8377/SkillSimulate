@@ -269,12 +269,19 @@ class SkillCompiler:
     def load_all_skills(
         skills_dir: str | Path,
         platform: str | None = None,
+        distiller: str | None = None,
     ) -> dict[str, SkillFile]:
         """Load all .skill files from a directory.
 
         Args:
             skills_dir: Directory containing .skill YAML files.
             platform: If set, only load files matching this platform.
+            distiller: If set (e.g. "colleague" | "nuwa"), only load files
+                matching ``skill_cluster_*_{platform}_{distiller}.yaml``
+                (see ``scripts/convert_distilled_skills.py``). ``None``
+                matches the bare pipeline-A filename
+                ``skill_cluster_*_{platform}.yaml`` only (excludes any
+                distiller-suffixed files) to avoid mixing skill sources.
 
         Returns:
             Dict mapping cluster_id → SkillFile.
@@ -284,8 +291,23 @@ class SkillCompiler:
             logger.warning(f"Skills directory not found: {skills_dir}")
             return {}
 
-        pattern = f"*_{platform}.yaml" if platform else "*.yaml"
+        if distiller:
+            pattern = f"*_{platform or '*'}_{distiller}.yaml"
+        elif platform:
+            pattern = f"*_{platform}.yaml"
+        else:
+            pattern = "*.yaml"
         skill_files = sorted(skills_dir.glob(pattern))
+        if distiller is None:
+            # Bare-pattern glob also matches "*_{platform}_{distiller}.yaml"
+            # files (since "*_wikipedia.yaml" wildcards through the
+            # distiller suffix too) — exclude anything with a distiller
+            # suffix so a bare-file load never silently mixes in
+            # colleague/nuwa skills.
+            skill_files = [
+                f for f in skill_files
+                if not any(f.stem.endswith(f"_{d}") for d in ("colleague", "nuwa"))
+            ]
 
         skills = {}
         for sf in skill_files:
@@ -303,6 +325,7 @@ class SkillCompiler:
         skills_dir: str | Path,
         platform: str,
         cluster_ids: list[str],
+        distiller: str | None = None,
     ) -> bool:
         """Check if skill files exist for all clusters of a platform.
 
@@ -310,13 +333,17 @@ class SkillCompiler:
             skills_dir: Skills output directory.
             platform: Platform name (e.g. "wikipedia").
             cluster_ids: List of cluster IDs to check.
+            distiller: If set (e.g. "colleague" | "nuwa"), check for
+                ``skill_cluster_{cid}_{platform}_{distiller}.yaml`` instead
+                of the bare pipeline-A filename.
 
         Returns:
             True if all expected skill files exist.
         """
         skills_dir = Path(skills_dir)
+        suffix = f"_{distiller}" if distiller else ""
         for cid in cluster_ids:
-            path = skills_dir / f"skill_cluster_{cid}_{platform}.yaml"
+            path = skills_dir / f"skill_cluster_{cid}_{platform}{suffix}.yaml"
             if not path.exists():
                 return False
         return True

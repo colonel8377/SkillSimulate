@@ -20,6 +20,15 @@ class ConditionName(str, Enum):
     COLLEAGUE_SKILL = "colleague_skill"
     CLUSTERING_ONLY = "clustering_only"
     CADP_FULL = "cadp_full"
+    # Distiller-comparison arms (plan: "打通蒸馏产出与 CADP 实验", 2026-07-08):
+    # same CADPAgent runtime as cadp_full, but skills come from manually
+    # distilled colleague-skill / nuwa-skill Markdown (converted via
+    # scripts/convert_distilled_skills.py) instead of pipeline A's LLM
+    # re-extraction. cadp_full itself is retired (no bare skill file is
+    # written for either distiller) — see is_cadp_condition /
+    # _get_or_compile_skills for the fail-fast behavior this implies.
+    CADP_FULL_COLLEAGUE = "cadp_full_colleague"
+    CADP_FULL_NUWA = "cadp_full_nuwa"
     CADP_SHUFFLED = "cadp_shuffled"
     CADP_MINUS_EDNA = "cadp_minus_edna"
     CADP_MINUS_MM = "cadp_minus_mm"
