@@ -1,0 +1,229 @@
+{
+  "name": "Community Patroller",
+  "display_name": "Community Patroller",
+  "character": "celebrity",
+  "research_profile": "budget-friendly",
+  "classification": {
+    "language": "en",
+    "domain": "wikipedia",
+    "archetype": "talk-page editor",
+    "gallery_category": "Celebrity",
+    "tags": [
+      "wikipedia",
+      "talk-page",
+      "wikiconv",
+      "cluster-6",
+      "patroller",
+      "welcoming",
+      "procedural",
+      "emphatic",
+      "newcomer-socialization",
+      "vandalism-revert",
+      "civility",
+      "good-faith",
+      "escalation-ladder"
+    ]
+  },
+  "profile": "A warm, emphatic, procedural Wikipedia talk-page caretaker who welcomes newcomers, reverts vandalism, issues warnings, and keeps communal space civil.",
+  "tags": [
+    "wikipedia",
+    "talk-page",
+    "wikiconv",
+    "cluster-6",
+    "patroller",
+    "welcoming",
+    "procedural",
+    "emphatic",
+    "newcomer-socialization",
+    "vandalism-revert",
+    "civility",
+    "good-faith",
+    "escalation-ladder"
+  ],
+  "knowledge_sources": [
+    {
+      "source": "WikiConv behavioral archetype corpus, cluster 6",
+      "path": "/mnt/sda/qm/dev/SkillSimulate/outputs/skill_corpus_k8_quantile/wikiconv/cluster_6/for_nuwa.md",
+      "type": "corpus",
+      "description": "60 representative Community Patroller members drawn from 64,544 total users; primary grounding for talk-page behavioral patterns."
+    },
+    {
+      "source": "Merged research summary",
+      "path": "/home/zf/.claude/skills/dot-skill/skills/celebrity/community-patroller/knowledge/research/merged/summary.md",
+      "type": "synthesis"
+    },
+    {
+      "source": "Core profile raw notes",
+      "path": "/home/zf/.claude/skills/dot-skill/skills/celebrity/community-patroller/knowledge/research/raw/01_core_profile.md",
+      "type": "raw-notes"
+    },
+    {
+      "source": "Conversations and decisions raw notes",
+      "path": "/home/zf/.claude/skills/dot-skill/skills/celebrity/community-patroller/knowledge/research/raw/02_conversations_and_decisions.md",
+      "type": "raw-notes"
+    },
+    {
+      "source": "Expression and reception raw notes",
+      "path": "/home/zf/.claude/skills/dot-skill/skills/celebrity/community-patroller/knowledge/research/raw/03_expression_and_reception.md",
+      "type": "raw-notes"
+    }
+  ],
+  "type": "celebrity",
+  "lifecycle": {
+    "status": "active",
+    "created_at": "2026-07-07T07:33:06.960085+00:00",
+    "updated_at": "2026-07-07T07:33:06.960085+00:00",
+    "version": "v1"
+  },
+  "generation": {
+    "engine": "dot-skill",
+    "character": "celebrity",
+    "research_profile": "budget-friendly",
+    "preset": "dot.celebrity.v1",
+    "prompt_bundle": {
+      "preset": "dot.celebrity.v1",
+      "intake": "prompts/celebrity/intake.md",
+      "research": "prompts/celebrity/research.md",
+      "work_analyzer": "prompts/work_analyzer.md",
+      "persona_analyzer": "prompts/celebrity/persona_analyzer.md",
+      "work_builder": "prompts/work_builder.md",
+      "persona_builder": "prompts/celebrity/persona_builder.md",
+      "merger": "prompts/celebrity/merger.md",
+      "correction_handler": "prompts/correction_handler.md"
+    },
+    "research_profile_bundle": {
+      "research": "prompts/celebrity/research.md",
+      "persona_analyzer": "prompts/celebrity/persona_analyzer.md",
+      "persona_builder": "prompts/celebrity/persona_builder.md"
+    },
+    "research_profile_references": [],
+    "merge_strategy": "compact",
+    "quality_profile": "budget-friendly",
+    "knowledge_dirs": [
+      "docs",
+      "messages",
+      "emails",
+      "research/raw",
+      "research/merged",
+      "research/reviews",
+      "transcripts",
+      "subtitles"
+    ],
+    "storage_root": "skills/celebrity",
+    "research_tools": {
+      "subtitle_downloader": "tools/research/download_subtitles.sh",
+      "subtitle_cleaner": "tools/research/srt_to_transcript.py",
+      "research_merger": "tools/research/merge_research.py",
+      "quality_check": "tools/research/quality_check.py"
+    },
+    "created_from": [
+      {
+        "source": "WikiConv behavioral archetype corpus, cluster 6",
+        "path": "/mnt/sda/qm/dev/SkillSimulate/outputs/skill_corpus_k8_quantile/wikiconv/cluster_6/for_nuwa.md",
+        "type": "corpus",
+        "description": "60 representative Community Patroller members drawn from 64,544 total users; primary grounding for talk-page behavioral patterns."
+      },
+      {
+        "source": "Merged research summary",
+        "path": "/home/zf/.claude/skills/dot-skill/skills/celebrity/community-patroller/knowledge/research/merged/summary.md",
+        "type": "synthesis"
+      },
+      {
+        "source": "Core profile raw notes",
+        "path": "/home/zf/.claude/skills/dot-skill/skills/celebrity/community-patroller/knowledge/research/raw/01_core_profile.md",
+        "type": "raw-notes"
+      },
+      {
+        "source": "Conversations and decisions raw notes",
+        "path": "/home/zf/.claude/skills/dot-skill/skills/celebrity/community-patroller/knowledge/research/raw/02_conversations_and_decisions.md",
+        "type": "raw-notes"
+      },
+      {
+        "source": "Expression and reception raw notes",
+        "path": "/home/zf/.claude/skills/dot-skill/skills/celebrity/community-patroller/knowledge/research/raw/03_expression_and_reception.md",
+        "type": "raw-notes"
+      }
+    ],
+    "corrections_count": 0
+  },
+  "source_context": {
+    "domain": "public",
+    "relationship_to_user": "public_figure",
+    "is_real_person": true,
+    "is_public_figure": true,
+    "is_fictional": false
+  },
+  "engine": {
+    "name": "dot-skill",
+    "kind": "meta-skill",
+    "character": "celebrity",
+    "research_profile": "budget-friendly",
+    "preset": "dot.celebrity.v1",
+    "prompt_bundle": {
+      "preset": "dot.celebrity.v1",
+      "intake": "prompts/celebrity/intake.md",
+      "research": "prompts/celebrity/research.md",
+      "work_analyzer": "prompts/work_analyzer.md",
+      "persona_analyzer": "prompts/celebrity/persona_analyzer.md",
+      "work_builder": "prompts/work_builder.md",
+      "persona_builder": "prompts/celebrity/persona_builder.md",
+      "merger": "prompts/celebrity/merger.md",
+      "correction_handler": "prompts/correction_handler.md"
+    },
+    "research_profile_bundle": {
+      "research": "prompts/celebrity/research.md",
+      "persona_analyzer": "prompts/celebrity/persona_analyzer.md",
+      "persona_builder": "prompts/celebrity/persona_builder.md"
+    },
+    "research_profile_references": [],
+    "merge_strategy": "compact",
+    "quality_profile": "budget-friendly",
+    "knowledge_dirs": [
+      "docs",
+      "messages",
+      "emails",
+      "research/raw",
+      "research/merged",
+      "research/reviews",
+      "transcripts",
+      "subtitles"
+    ],
+    "storage_root": "skills/celebrity",
+    "research_tools": {
+      "subtitle_downloader": "tools/research/download_subtitles.sh",
+      "subtitle_cleaner": "tools/research/srt_to_transcript.py",
+      "research_merger": "tools/research/merge_research.py",
+      "quality_check": "tools/research/quality_check.py"
+    }
+  },
+  "schema_version": "3",
+  "slug": "community-patroller",
+  "kind": "meta-skill",
+  "subtype": null,
+  "preset": "dot.celebrity.v1",
+  "id": "meta-skill.celebrity.community-patroller",
+  "artifacts": {
+    "combined_skill": "SKILL.md",
+    "work_skill": "work_skill.md",
+    "persona_skill": "persona_skill.md",
+    "work_doc": "work.md",
+    "persona_doc": "persona.md",
+    "manifest": "manifest.json",
+    "combined_name": "celebrity_community-patroller",
+    "work_name": "celebrity_community-patroller_work",
+    "persona_name": "celebrity_community-patroller_persona",
+    "combined_command": "celebrity-community-patroller",
+    "work_command": "celebrity-community-patroller-work",
+    "persona_command": "celebrity-community-patroller-persona"
+  },
+  "compat": {
+    "legacy_command": "/create-icon",
+    "legacy_storage_root": "skills/celebrity",
+    "legacy_type": "celebrity"
+  },
+  "summary": "Community Patroller, A warm, emphatic, procedural Wikipedia talk-page caretaker who welcomes newcomers, reverts vandalism, issues warnings, and keeps communal space civil.",
+  "created_at": "2026-07-07T07:33:06.960085+00:00",
+  "updated_at": "2026-07-07T07:33:06.960085+00:00",
+  "version": "v1",
+  "corrections_count": 0
+}

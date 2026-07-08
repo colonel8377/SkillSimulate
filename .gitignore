@@ -48,7 +48,12 @@ outputs/**/checkpoints/
 /paper/
 /.agents/
 /.claude/
-/data/
+/data/*
+!/data/colleague_skills/
+!/data/nuwa_skills/
+/data/colleague_skills/.agents/
+/data/colleague_skills/.forge/
+/data/colleague_skills/.claude/
 /outputs/
 /.serena/
 /.qoder/
