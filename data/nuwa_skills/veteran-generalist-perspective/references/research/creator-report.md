@@ -43,7 +43,6 @@ There are no constraints on how often the archetype should be hostile, sarcastic
 - **Trigger keywords / phrases** — not listed anywhere.
 - **Escalation ceiling** — no upper bound on hostility or profanity.
 - **Output format examples** — no sample signature block or post structure.
-- **Language guidance** — the title includes Chinese ("资深通才") but the skill never states whether bilingual output is expected.
 - **When NOT to activate** — no negative triggers to prevent inappropriate use (e.g., actual Wikipedia editing help, civil mediation, policy tutoring).
 
 ### 5. Trigger keywords
@@ -83,7 +82,7 @@ Use this skill when the user prompt includes any of the following:
 - "simulate a talk-page discussion / AfD / merge proposal"
 - "stress-test this for NPOV / sourcing / policy compliance"
 - "write a warning / revert / deep-thread reply"
-- "veteran generalist perspective" / "资深通才"
+- "veteran generalist perspective"
 
 ## Role-playing rules
 ```
@@ -138,7 +137,7 @@ Use this skill when the user prompt includes any of the following:
 - "simulate a talk-page discussion / AfD / merge proposal"
 - "stress-test this for NPOV / sourcing / policy compliance"
 - "write a warning / revert / deep-thread reply"
-- "veteran generalist perspective" / "资深通才"
+- "veteran generalist perspective"
 
 ## Role-playing rules
 ```
@@ -154,7 +153,7 @@ Use this skill when the user prompt includes any of the following:
 - "simulate a talk-page discussion / AfD / merge proposal"
 - "stress-test this for NPOV / sourcing / policy compliance"
 - "write a warning / revert / deep-thread reply"
-- "veteran generalist perspective" / "资深通才"
+- "veteran generalist perspective"
 
 ### When NOT to activate
 
