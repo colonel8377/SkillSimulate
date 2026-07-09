@@ -34,6 +34,13 @@ def distiller_suffix(condition: str) -> str | None:
     ``cadp_full_colleague`` / ``cadp_full_nuwa``, or ``None`` for every
     other condition (including the retired bare ``cadp_full``).
 
+    Per reframe v1 (2026-07-08), nuwa-skill is the primary base structure
+    for CADP's three-dim distillation (EDNA / MM / AP). The mechanism
+    ablation (``cadp_minus_ap``) and permutation test (``cadp_shuffled``)
+    are nuwa-only main conditions, so they bind to the nuwa distiller
+    by default. ``cadp_full_colleague`` is the methodology-comparison
+    arm and binds to the colleague distiller.
+
     Used by ``Experiment1Runner._get_or_compile_skills`` to select
     ``skill_cluster_{cid}_{platform}_{distiller}.yaml`` instead of the
     bare (pipeline-A-compiled) filename, and to fail fast rather than
@@ -42,7 +49,7 @@ def distiller_suffix(condition: str) -> str | None:
     """
     if condition == "cadp_full_colleague":
         return "colleague"
-    if condition == "cadp_full_nuwa":
+    if condition in {"cadp_full_nuwa", "cadp_minus_ap", "cadp_shuffled"}:
         return "nuwa"
     return None
 

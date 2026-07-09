@@ -118,9 +118,22 @@ class Experiment1Runner(ExperimentRunner):
         return report.to_dict()
 
     def _load_data(self, dataset: str):
-        """Load and cache dataset."""
+        """Load and cache dataset.
+
+        Reframe v1 (2026-07-08): cap utterance ingestion upstream by
+        passing ``cfg.max_threads`` as the loader's ``limit=`` kwarg.
+        Previously the loader read the full 18-year WikiConv corpus and
+        the downstream cap in this method only fired AFTER OOM. The
+        loader's ``limit`` is per-corpus-balanced, so the upstream cap
+        is both faster and statistically equivalent to the old
+        post-hoc random subsample.
+        """
         if dataset not in self._data_cache:
+            # Pass max_threads as the loader's utterance cap (None → load
+            # everything). Loader distributes evenly across year-corpora.
             loader = self.get_dataset_loader(dataset)
+            if hasattr(loader, "limit"):
+                loader.limit = self.config.max_threads
             threads = loader.load()
             if self.config.max_threads is not None and len(threads) > self.config.max_threads:
                 rng = np.random.RandomState(self.config.seed)
@@ -154,31 +167,140 @@ class Experiment1Runner(ExperimentRunner):
         )
 
     def _get_or_compute_clusters(self, dataset: str, threads: list):
-        """Get cached clustering result or compute new one (outline §4.2)."""
+        """Get cached clustering result.
+
+        Reframe v1 (2026-07-08): prefer the locked precomputed pickle over
+        live ``clusterer.fit()``. Skill files were distilled against the
+        locked cluster IDs (0,2,3,4,6,7 after merging 1→0, 5→4); live
+        re-fitting produces different IDs → CADP conditions silently load
+        wrong skills. Live fit remains a fallback for datasets without a
+        canonical pickle.
+        """
         if dataset not in self._cluster_cache:
-            clusterer = self._make_clusterer()
-            cluster_result = clusterer.fit(threads)
-            self._cluster_cache[dataset] = cluster_result
-            logger.info(
-                f"Clustering {dataset}: {cluster_result.n_clusters} clusters, "
-                f"silhouette={cluster_result.silhouette_score:.3f}, "
-                f"db={cluster_result.davies_bouldin_score:.3f}"
-            )
+            pickle_path = self.config.clustering_pickle_path
+            if pickle_path:
+                cluster_result = self._load_locked_clusters(pickle_path)
+                self._cluster_cache[dataset] = cluster_result
+                logger.info(
+                    f"Loaded locked clustering for {dataset}: "
+                    f"{cluster_result.n_clusters} clusters, "
+                    f"silhouette={cluster_result.silhouette_score:.3f}, "
+                    f"db={cluster_result.davies_bouldin_score:.3f} "
+                    f"(pickle={pickle_path})"
+                )
+            else:
+                clusterer = self._make_clusterer()
+                cluster_result = clusterer.fit(threads)
+                self._cluster_cache[dataset] = cluster_result
+                logger.info(
+                    f"Clustering {dataset} (live fit): "
+                    f"{cluster_result.n_clusters} clusters, "
+                    f"silhouette={cluster_result.silhouette_score:.3f}, "
+                    f"db={cluster_result.davies_bouldin_score:.3f}"
+                )
         return self._cluster_cache[dataset]
 
+    def _load_locked_clusters(self, pickle_path: str):
+        """Load locked ClusterResult pickle and apply merge_map if present.
+
+        The pickle holds the canonical K=8 source clustering. The merge
+        map (JSON alongside skill_corpus_k8_quantile) collapses leaves
+        {1→0, 5→4} to the 6 final skill archetypes that the distilled
+        skill files were named after. Returns a ClusterResult whose
+        ``labels`` and ``user_features`` already reflect the merged IDs.
+        """
+        import pickle
+        from pathlib import Path
+
+        from src.clustering.clusterer import ClusterResult
+
+        path = Path(pickle_path)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"clustering_pickle_path set but file not found: {path}. "
+                f"Either set the path to outputs/stream_cache/"
+                f"clustering_k8_final_quantile.pkl or clear the field "
+                f"to fall back to live clusterer.fit()."
+            )
+
+        with open(path, "rb") as f:
+            cluster_result = pickle.load(f)
+
+        # Apply merge map if provided (collapses K=8 → 6 skill archetypes).
+        merge_map_path = self.config.cluster_merge_map_path
+        if merge_map_path and Path(merge_map_path).is_file():
+            import json
+            with open(merge_map_path) as f:
+                cm = json.load(f)
+            merge_map = cm.get("merge_map", {})  # {"1": 0, "5": 4}
+            if merge_map:
+                merged_labels = {
+                    uid: int(merge_map.get(str(lbl), lbl))
+                    for uid, lbl in cluster_result.labels.items()
+                }
+                cluster_result.labels = merged_labels
+                logger.info(
+                    f"Applied cluster merge_map {merge_map} → "
+                    f"{len(set(merged_labels.values()))} final skill archetypes"
+                )
+
+        return cluster_result
+
+    def _load_locked_quality(self) -> dict:
+        """Load precomputed cluster-quality numbers for §5.4 reporting.
+
+        Looks for ``quality_report.json`` alongside the merge map (same
+        directory). Returns a dict shaped like the live ARI report so
+        downstream code can consume either transparently. ``source``
+        field lets paper §5.4 cite where the numbers came from.
+        """
+        import json
+        from pathlib import Path
+
+        merge_path = Path(self.config.cluster_merge_map_path or "")
+        candidates = [
+            merge_path.parent / "quality_report.json" if merge_path else None,
+        ]
+        for c in candidates:
+            if c and c.is_file():
+                with open(c) as f:
+                    data = json.load(f)
+                return {
+                    "source": f"locked:{c}",
+                    "silhouette": data.get("silhouette"),
+                    "davies_bouldin": data.get("davies_bouldin"),
+                    "n_final_skills": data.get("n_final_skills"),
+                    "n_users": data.get("n_users"),
+                    "concerns": data.get("concerns", []),
+                    # Marker so analysis layer knows this isn't a live ARI:
+                    "locked_pickle": True,
+                    "ari_mean": None,
+                    "ari_variance": None,
+                }
+        logger.warning(
+            "clustering_pickle_path set but no quality_report.json found "
+            f"alongside {merge_path}; §5.4 stability table will be empty"
+        )
+        return {"source": "missing", "locked_pickle": True}
+
     def _validate_cluster_stability(self, dataset: str, threads: list) -> dict:
-        """Validate cluster stability via ARI bootstrap (outline §5.4).
+        """Validate cluster stability (outline §5.4).
 
-        ARI variance < 0.2 indicates stable clustering.
-
-        For large corpora we validate on a random subsample of threads:
-        the bootstrap loop calls ``clusterer.fit()`` (which re-embeds every
-        message) ``n_iterations`` times, so passing the full 100K+ thread
-        corpus would re-embed millions of messages dozens of times. A
-        2,000-thread sample is statistically sufficient for ARI variance
-        estimation and keeps each fit under a few seconds.
+        Reframe v1 (2026-07-08): when ``clustering_pickle_path`` is set,
+        the clustering is LOCKED — ARI bootstrap on re-fit is meaningless
+        (we no longer re-fit). Return the precomputed quality numbers
+        from ``quality_report.json`` (alongside the merge map) instead.
+        Falls through to live ARI bootstrap only when no pickle is set.
         """
         if dataset not in self._stability_cache:
+            if self.config.clustering_pickle_path:
+                self._stability_cache[dataset] = self._load_locked_quality()
+                logger.info(
+                    f"Stability for {dataset}: using locked-pickle quality "
+                    f"report (no live ARI bootstrap — clustering is canonical)"
+                )
+                return self._stability_cache[dataset]
+
             import numpy as np
 
             stability_cap = 2000

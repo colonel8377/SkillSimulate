@@ -221,6 +221,7 @@ class PopulationBuilder:
 
         from src.agents.vanilla import VanillaAgent
         from src.agents.descriptive import DescriptivePersonaAgent
+        from src.agents.rich_narrative import RichNarrativeAgent
         from src.agents.segmentation import SegmentationPersonaAgent
         from src.agents.pop_aligned import (
             PopAlignedPersonaAgent,
@@ -337,6 +338,26 @@ class PopulationBuilder:
             return PopAlignedPersonaAgent(
                 cluster_attributes=cluster_stats,
                 sampled_attributes=sampled,
+                **common_kwargs,
+            )
+
+        elif condition == "rich_narrative":
+            # Lever-1 ceiling / kill condition (reframe v1, 2026-07-08):
+            # maximalist narrative persona from the SAME cluster stats as
+            # the descriptive condition, rendered as multi-paragraph
+            # narrative with concrete episodes and example moves. NO
+            # compiled .skill rules, NO filter-retry. Same data source
+            # as cadp_full_nuwa → isolates "rules vs description" as
+            # the sole variable in the kill comparison.
+            members = cluster_result.get_cluster_members(int(cluster_id))
+            member_features = [
+                cluster_result.user_features[uid]
+                for uid in members
+                if uid in cluster_result.user_features
+            ]
+            persona = self._build_rich_narrative_persona(cluster_id, member_features)
+            return RichNarrativeAgent(
+                persona_description=persona,
                 **common_kwargs,
             )
 
@@ -568,6 +589,208 @@ class PopulationBuilder:
             f"Community group: {stats['n_members']} users with similar behavioral patterns",
         ]
         return "\n".join(lines)
+
+    def _build_rich_narrative_persona(
+        self,
+        cluster_id: str,
+        member_features: list,
+    ) -> str:
+        """Build lever-1 ceiling narrative persona from real cluster stats.
+
+        Same input as ``_build_descriptive_persona`` (cluster behavioral
+        statistics) but rendered as multi-paragraph narrative with
+        concrete episodes and example moves, NOT terse stat bullets.
+        Token budget (~350-400 words) matched to a CADP skill file so
+        length is not the confound — only form differs (description vs
+        rules).
+
+        Used by the ``rich_narrative`` kill condition (reframe v1,
+        2026-07-08). If CADP loses to this on Predictive Fidelity, the
+        headline thesis fails.
+        """
+        stats = self._cluster_stats(member_features)
+        if not stats:
+            return (
+                f"You are a long-time participant in this online community, "
+                f"part of a cohort of regulars who have drifted together over "
+                f"months of shared discussion. You know the regulars, you "
+                f"remember past disputes, and you have a feel for how things "
+                f"usually unfold here. Group {cluster_id}."
+            )
+
+        def _level(val, low, high):
+            if val >= high:
+                return "high"
+            if val <= low:
+                return "low"
+            return "moderate"
+
+        activity = _level(stats["avg_messages"], low=2, high=10)
+        conflict = _level(stats["conflict_engagement_ratio"], low=0.15, high=0.4)
+        flexibility = _level(stats["stance_shift_rate"], low=0.15, high=0.4)
+
+        # Activity narrative
+        if activity == "high":
+            activity_passage = (
+                f"You are one of the more active regulars in your cohort — on "
+                f"average you post about {stats['avg_messages']:.0f} messages "
+                f"across {stats['avg_threads']:.0f} different threads. You "
+                f"show up often, you read most of what's been said before "
+                f"jumping in, and people recognize your handle."
+            )
+        elif activity == "low":
+            activity_passage = (
+                f"You are a quiet but consistent presence — you only post "
+                f"about {stats['avg_messages']:.0f} messages and tend to "
+                f"stick to {stats['avg_threads']:.0f} thread at a time. You "
+                f"read far more than you write, and when you do speak up "
+                f"it's usually because something specific caught your eye."
+            )
+        else:
+            activity_passage = (
+                f"You participate at a moderate clip — about "
+                f"{stats['avg_messages']:.0f} messages across "
+                f"{stats['avg_threads']:.0f} threads. You're not the loudest "
+                f"voice, but you're not a lurker either; you contribute when "
+                f"you feel you have something to add."
+            )
+
+        # Conflict narrative
+        conflict_ratio = stats["conflict_engagement_ratio"]
+        if conflict == "high":
+            conflict_passage = (
+                f"You don't shy away from disputes. Roughly "
+                f"{conflict_ratio:.0%} of the threads you join turn "
+                f"contentious, and that doesn't bother you — you'll push "
+                f"back when a claim looks weak, call out inconsistencies, "
+                f"and press for sources. A typical move for you is to quote "
+                f"the line you disagree with and explain, point by point, "
+                f"why it doesn't hold up."
+            )
+        elif conflict == "low":
+            conflict_passage = (
+                f"You steer around open conflict. Only about "
+                f"{conflict_ratio:.0%} of the threads you join turn "
+                f"contentious, and even there you tend to defuse rather than "
+                f"escalate — you'll acknowledge the other side, reframe the "
+                f"sticking point, or quietly walk away rather than trade "
+                f"blows."
+            )
+        else:
+            conflict_passage = (
+                f"You engage with conflict selectively. About "
+                f"{conflict_ratio:.0%} of the threads you join have some "
+                f"heat, and you'll wade in when the issue matters to you, "
+                f"but you don't go looking for fights. When you do push "
+                f"back, it's usually paired with a concrete fix or a "
+                f"question, not a bare objection."
+            )
+
+        # Stance-flexibility narrative
+        stance = stats["stance_shift_rate"]
+        if flexibility == "high":
+            stance_passage = (
+                f"You change your mind in public. In about {stance:.0%} of "
+                f"disputes you've been part of, you've shifted position at "
+                f"least once after hearing counter-arguments, and you're "
+                f"willing to say so — 'fair point, I was wrong about that' "
+                f"is something you'll actually write."
+            )
+        elif flexibility == "low":
+            stance_passage = (
+                f"You hold your positions. Your stance shift rate is only "
+                f"{stance:.0%}; once you've laid out a view you tend to "
+                f"defend it, and you rarely concede in-thread even if you "
+                f"privately revise later."
+            )
+        else:
+            stance_passage = (
+                f"You're persuadable but not wishy-washy — you revise your "
+                f"position in about {stance:.0%} of disputes, usually when "
+                f"someone brings a source or a point you hadn't considered."
+            )
+
+        # Depth + editing
+        depth_passage = (
+            f"You tend to reply about {stats['reply_depth']:.1f} levels deep "
+            f"in a thread before you feel a point is settled, and you edit "
+            f"your own messages about {stats['edit_frequency']:.2f} times "
+            f"each — small fixes for wording, sources, or formatting, not "
+            f"full rewrites."
+        )
+
+        # Typical opening move — derived from conflict × flexibility combo.
+        # Stays descriptive ("you tend to..."), never prescriptive, so it
+        # remains lever-1 narrative rather than drifting into lever-2 rules.
+        if conflict == "high" and flexibility != "low":
+            opening_passage = (
+                f"Your typical opening move is to identify one concrete "
+                f"problem with the previous post — an unsourced claim, an "
+                f"inconsistency, a slant — and put a question or proposed "
+                f"fix next to it. You don't post drive-by objections; if "
+                f"you disagree, you say why and what would change your mind."
+            )
+        elif conflict == "low":
+            opening_passage = (
+                f"Your typical opening move is to build on the previous "
+                f"post — agree where you can, add a clarifying detail or a "
+                f"supporting source, then gently flag the one place you "
+                f"see differently. You'd rather extend a thread than end "
+                f"one."
+            )
+        else:
+            opening_passage = (
+                f"Your typical opening move depends on the thread — if it "
+                f"looks solid you'll add to it, but if something's off "
+                f"you'll name it plainly and suggest a fix rather than "
+                f"wave it through."
+            )
+
+        # Interaction style — synthesises activity × conflict into a single
+        # "how you show up" sketch. Concrete utterance snippets are first-
+        # person paraphrases, not verbatim quotes, to stay descriptive.
+        if activity == "high" and conflict == "high":
+            interaction_passage = (
+                f"You come across as a hands-on regular: you answer "
+                f"questions, push threads forward, and don't let weak "
+                f"claims slide. Other readers can tell from how you write "
+                f"that you've been around — you reference prior discussions, "
+                f"you don't re-litigate settled points, and when you do "
+                f"disagree you lay out the reasoning instead of just "
+                f"dismissing the other side."
+            )
+        elif activity == "low":
+            interaction_passage = (
+                f"You come across as the careful type who only speaks when "
+                f"they have something to add — most of your replies carry "
+                f"weight precisely because you don't fill space. People "
+                f"learn to read your silences as 'nothing to add yet'."
+            )
+        else:
+            interaction_passage = (
+                f"You come across as measured — you contribute steadily "
+                f"without dominating, and you'd rather ask one good "
+                f"question than post three quick takes. You assume good "
+                f"faith until shown otherwise, but you don't pretend a bad "
+                f"argument is a good one."
+            )
+
+        cohort_passage = (
+            f"You're part of a cohort of about {stats['n_members']} users "
+            f"who behave similarly — you'll recognize their handles and "
+            f"they'll recognize yours. Assume good faith by default, but "
+            f"privilege substance over enthusiasm."
+        )
+
+        return "\n\n".join([
+            activity_passage,
+            conflict_passage,
+            stance_passage,
+            depth_passage,
+            opening_passage,
+            interaction_passage,
+            cohort_passage,
+        ])
 
     def _build_segmentation_profile(
         self,

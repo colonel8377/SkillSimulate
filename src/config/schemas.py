@@ -17,6 +17,13 @@ class ConditionName(str, Enum):
     DESCRIPTIVE = "descriptive"
     SEGMENTATION = "segmentation"
     POP_ALIGNED = "pop_aligned"
+    # Lever-1 ceiling / kill-condition (reframe v1, 2026-07-08): the
+    # richest possible persona description built from the same cluster
+    # stats — long narrative form, all available descriptors — but NO
+    # compiled .skill rules, NO filter-retry. Tests whether distilled
+    # behavioral skills beat the strongest lever-1 description. If CADP
+    # loses to this on Predictive Fidelity, the headline thesis fails.
+    RICH_NARRATIVE = "rich_narrative"
     COLLEAGUE_SKILL = "colleague_skill"
     CLUSTERING_ONLY = "clustering_only"
     CADP_FULL = "cadp_full"
@@ -78,6 +85,15 @@ class ExperimentConfig:
     alpha_tier3: float | None = None
     num_clusters: int = 4        # K for clustering
     cluster_method: str = "kmeans"  # "kmeans" or "hdbscan" or "two_stage"
+    # Locked-clustering artifact loading (reframe v1, 2026-07-08). When set
+    # and file exists, the runner loads the canonical precomputed
+    # ClusterResult pickle instead of re-fitting live. Cluster IDs then
+    # match the manually-distilled skill files (otherwise CADP conditions
+    # silently load wrong skills). Pickle is the locked K=8 source
+    # clustering; merge_map (in cluster_merge_map_path JSON) collapses
+    # leaves {1→0, 5→4} to the 6 final skill archetypes.
+    clustering_pickle_path: str = ""
+    cluster_merge_map_path: str = ""
     # Two-stage HDBSCAN tuning (NEW)
     role_min_cluster_size: int | None = None
     role_min_samples: int | None = None
