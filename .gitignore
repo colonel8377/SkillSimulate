@@ -51,6 +51,7 @@ outputs/**/checkpoints/
 /data/*
 !/data/colleague_skills/
 !/data/nuwa_skills/
+!/data/cluster_toxic_keywords.json
 /data/colleague_skills/.agents/
 /data/colleague_skills/.forge/
 /data/colleague_skills/.claude/

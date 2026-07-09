@@ -66,6 +66,7 @@ COLLEAGUE_DIR = PROJECT_ROOT / "data" / "colleague_skills"
 NUWA_DIR = PROJECT_ROOT / "data" / "nuwa_skills"
 CORPUS_DIR = PROJECT_ROOT / "outputs" / "skill_corpus_k8_quantile" / "wikiconv"
 CLUSTER_MAP_PATH = CORPUS_DIR / "cluster_map.json"
+TOXIC_KEYWORDS_PATH = PROJECT_ROOT / "data" / "cluster_toxic_keywords.json"
 
 # slug (as used in data/colleague_skills, data/nuwa_skills) -> cluster_id
 # (as used in outputs/skill_corpus_k8_quantile/wikiconv/cluster_map.json).
@@ -82,6 +83,71 @@ SLUG_TO_CLUSTER_ID = {
 def _load_archetype_labels() -> dict[str, str]:
     data = json.loads(CLUSTER_MAP_PATH.read_text())
     return {cid: info["label"] for cid, info in data["skills"].items()}
+
+
+# ---------------------------------------------------------------------------
+# Trigger extraction for Tier 3 enforcement
+# ---------------------------------------------------------------------------
+
+# Toxic keywords are derived from the corpus, not hardcoded. See
+# data/cluster_toxic_keywords.json (pre-computed from ConvoKit toxicity labels).
+_CLUSTER_TOXIC_KEYWORDS: dict[str, list[str]] = json.loads(
+    TOXIC_KEYWORDS_PATH.read_text()
+)
+
+# Anti-pattern descriptions that indicate profanity/slur/attack content.
+# When matched, attach the cluster's actual toxic keywords (Category A).
+_TOXIC_DESCRIPTION_FRAGMENTS = [
+    "profanity", "slur", "hate speech", "bigot", "insult",
+    "ad hominem", "personal attack", "incivility",
+]
+
+
+def _extract_triggers(
+    description: str,
+    evidence: list[str],
+    cluster_id: str,
+) -> dict:
+    """Extract Tier 3 trigger fields from anti-pattern description + evidence.
+
+    Strategy:
+      - **Category B (semantic)**: Only quoted phrases from evidence text.
+        They are real utterances from the corpus, suitable for Sentence-BERT
+        cosine matching. No fallback to the description: terse labels are
+        meta-descriptions, not observable trigger phrases.
+      - **Category A (keywords)**: If the description indicates profanity/
+        slurs/insults, attach the cluster-specific toxic keywords derived from
+        ConvoKit toxicity labels. No fabricated universal list.
+      - **Category C (action patterns)**: Not extracted here — action patterns
+        like "revert->revert->revert" require domain knowledge of the
+        simulation's action vocabulary and are set manually if needed.
+
+    Returns:
+        Dict with keys matching AntiPattern fields:
+        trigger_keywords, trigger_semantic_phrases, trigger_regex.
+    """
+    trigger_keywords: list[str] = []
+    trigger_semantic_phrases: list[str] = []
+    trigger_regex: list[str] = []
+
+    # --- Category B: semantic phrases from evidence ---
+    # Only double-quoted phrases from evidence are corpus-grounded utterances.
+    for ev in evidence:
+        quotes = re.findall(r'"([^"]+)"', ev)
+        for q in quotes:
+            if 10 <= len(q) <= 200:
+                trigger_semantic_phrases.append(q)
+
+    # --- Category A: keywords for profanity/slur anti-patterns ---
+    desc_lower = description.lower()
+    if any(frag in desc_lower for frag in _TOXIC_DESCRIPTION_FRAGMENTS):
+        trigger_keywords = sorted(_CLUSTER_TOXIC_KEYWORDS.get(cluster_id, []))
+
+    return {
+        "trigger_keywords": trigger_keywords,
+        "trigger_semantic_phrases": trigger_semantic_phrases,
+        "trigger_regex": trigger_regex,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +184,7 @@ def _bullets(text: str) -> list[str]:
 # Colleague-skill (persona_skill.md, Layer 0-7) parser
 # ---------------------------------------------------------------------------
 
-def parse_colleague(md_path: Path) -> dict:
+def parse_colleague(md_path: Path, cluster_id: str) -> dict:
     """Parse colleague-skill ``persona_skill.md`` into keep-table fields.
 
     Keeps: Layer 0 (-> generic DecisionHeuristic), Layer 2 (-> expression_rules),
@@ -223,9 +289,13 @@ def parse_colleague(md_path: Path) -> dict:
             label, reason = m.group(1), m.group(2)
         else:
             label, reason = reject, ""
+        triggers = _extract_triggers(label, [], cluster_id)
         anti_patterns.append(AntiPattern(
             description=label,
             trigger_conditions=[],
+            trigger_keywords=triggers["trigger_keywords"],
+            trigger_semantic_phrases=triggers["trigger_semantic_phrases"],
+            trigger_regex=triggers["trigger_regex"],
             reason=reason,
         ))
 
@@ -241,7 +311,7 @@ def parse_colleague(md_path: Path) -> dict:
 # nuwa-skill (SKILL.md) parser
 # ---------------------------------------------------------------------------
 
-def parse_nuwa(md_path: Path) -> dict:
+def parse_nuwa(md_path: Path, cluster_id: str) -> dict:
     """Parse nuwa-skill ``SKILL.md`` into keep-table fields.
 
     Keeps: Role-playing rules (-> expression_rules), Response workflow
@@ -389,9 +459,13 @@ def parse_nuwa(md_path: Path) -> dict:
             if nline:
                 evidence.append(nline)
 
+        triggers = _extract_triggers(label.strip(), evidence, cluster_id)
         anti_patterns.append(AntiPattern(
             description=label.strip(),
             trigger_conditions=[],
+            trigger_keywords=triggers["trigger_keywords"],
+            trigger_semantic_phrases=triggers["trigger_semantic_phrases"],
+            trigger_regex=triggers["trigger_regex"],
             evidence=evidence,
         ))
 
@@ -460,10 +534,10 @@ def build_skill_file(
 ) -> SkillFile:
     if distiller == "colleague":
         md_path = COLLEAGUE_DIR / slug / "persona_skill.md"
-        parsed = parse_colleague(md_path)
+        parsed = parse_colleague(md_path, cluster_id)
     elif distiller == "nuwa":
         md_path = NUWA_DIR / f"{slug}-perspective" / "SKILL.md"
-        parsed = parse_nuwa(md_path)
+        parsed = parse_nuwa(md_path, cluster_id)
     else:
         raise ValueError(f"Unknown distiller: {distiller}")
 
