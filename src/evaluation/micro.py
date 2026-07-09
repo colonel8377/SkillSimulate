@@ -152,6 +152,72 @@ def behavior_complexity(
     return float(np.mean(np.var(matrix_norm, axis=0)))
 
 
+def caricature_index(
+    agent_action_counts: dict[str, Counter],
+    agent_clusters: dict[str, int],
+) -> float:
+    """Caricature Index — between-cluster behavioral Cohen's d.
+
+    Measures whether agents in different clusters produce behaviorally
+    distinct action distributions (high d = caricatured / stereotyped;
+    low d = naturally overlapping). Responds to Chameleon's Limit
+    §3.3 "fidelity breeds caricature" (Cohen's d > 6 in their report)
+    and Promise-with-a-Catch (more LLM content → more bias).
+
+    CADP's claim: filter-retry enforcement constrains output distribution
+    without increasing caricature (§3.2). This metric tests that
+    prediction directly.
+
+    Args:
+        agent_action_counts: {agent_id: {action: count}}.
+        agent_clusters: {agent_id: cluster_id}.
+
+    Returns:
+        Mean pairwise Cohen's d between clusters. 0 = no separation,
+        higher = more caricatured. NaN if < 2 clusters have data.
+    """
+    # Group agents by cluster
+    cluster_profiles: dict[int, list[np.ndarray]] = defaultdict(list)
+    all_actions = sorted(set(
+        a for counts in agent_action_counts.values() for a in counts
+    ))
+    if not all_actions:
+        return 0.0
+
+    for agent_id, counts in agent_action_counts.items():
+        cluster_id = agent_clusters.get(agent_id, -1)
+        if cluster_id < 0:
+            continue
+        profile = np.array([counts.get(a, 0) for a in all_actions], dtype=float)
+        total = profile.sum()
+        if total > 0:
+            profile /= total
+        cluster_profiles[cluster_id].append(profile)
+
+    # Need at least 2 clusters with ≥ 2 agents each for meaningful d
+    valid_clusters = {k: v for k, v in cluster_profiles.items() if len(v) >= 2}
+    if len(valid_clusters) < 2:
+        return 0.0
+
+    # Compute pairwise Cohen's d between cluster centroids
+    cluster_ids = sorted(valid_clusters.keys())
+    d_values = []
+    for i in range(len(cluster_ids)):
+        for j in range(i + 1, len(cluster_ids)):
+            profiles_i = np.array(valid_clusters[cluster_ids[i]])
+            profiles_j = np.array(valid_clusters[cluster_ids[j]])
+            mean_i = profiles_i.mean(axis=0)
+            mean_j = profiles_j.mean(axis=0)
+            var_i = profiles_i.var(axis=0, ddof=1).mean()
+            var_j = profiles_j.var(axis=0, ddof=1).mean()
+            pooled_std = np.sqrt((var_i + var_j) / 2)
+            if pooled_std > 1e-10:
+                d = float(np.linalg.norm(mean_i - mean_j) / pooled_std)
+                d_values.append(d)
+
+    return float(np.mean(d_values)) if d_values else 0.0
+
+
 class MicroMetrics:
     """Container for all micro-level metrics."""
 

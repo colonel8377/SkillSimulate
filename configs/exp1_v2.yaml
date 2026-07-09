@@ -4,8 +4,8 @@
 # Reduced-grid appendix conditions (segmentation, capability-only, layer-5
 # ablations, length-matched, etc.) live in exp1_appendix.yaml.
 name: exp1_v2
-datasets: [wikipedia, reddit]
-models: [deepseek-v4-flash, qwen-2.5-72b]
+datasets: [wikipedia]
+models: [deepseek-v4-flash]
 compile_model: deepseek-v4-pro
 conditions:
   # --- Lever-1 baseline ladder (escalating description richness) ---------

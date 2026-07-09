@@ -269,7 +269,7 @@
 - 30-50 轮/条件（**轮次设定依据**：从真实数据统计争议性事件的交互轮次中位数作为基准，sandbox 轮次设为基准的 1.5× 以允许动态涌现空间），重复 5-10 次
 
 ### 4.7 Baselines Preview (v1 精简，详见 §5.2)
-**主网格 8 条件**（每条 × 2 datasets × 2 models × 5 repeats = 160 runs）：
+**主网格 8 条件**（每条 × 1 dataset × 1 model × 5 repeats = 40 runs）：
 1. Vanilla LLM
 2. Descriptive Persona
 3. **Population-Aligned Persona** (复现 arXiv:2509.10127) — 最直接竞品
@@ -281,7 +281,7 @@
 
 **附录消融（reduced grid: Wikipedia × 单模型 × 5 repeats）**：Segmentation Persona、COLLEAGUE capability-only、Clustering-Only、CADP minus Expression DNA / Mind Models（nuwa）、CADP Constraint-Only、Pop-Aligned + CADP、Length-Matched Control、colleague 版 Shuffled（methodology robustness for permutation test）。完整定义见 §5.2。
 
-> **精简说明（2026-07-08）**：原 13×3×4×5=780 cells 边际收益低且不可行。主网格 8 条件覆盖 lever-1 baseline 族 + CADP 主张（nuwa-primary + colleague comparison）+ 关键消融；附录保留全部原条件以 Wikipedia × 单模型 reduced grid 跑。Cell 总数从 780 降到 160 主 + ~50 附录。
+> **精简说明（2026-07-08）**：原 13×3×4×5=780 cells 边际收益低且不可行。主网格 8 条件覆盖 lever-1 baseline 族 + CADP 主张（nuwa-primary + colleague comparison）+ 关键消融；附录保留全部原条件以 Wikipedia × 单模型 reduced grid 跑。Cell 总数从 780 降到 40 主 + ~50 附录。
 > **Distiller 选择 rationale**：CADP Full 以 nuwa 为主条件，因 nuwa 5-layer 结构与 CADP 三维一对一对映、anti-patterns 层结构化可消融；colleague 6-layer 作 methodology head-to-head，回答"结构差异是否影响 fidelity"。所有消融/置换检验只在 nuwa 上跑（结构清晰），colleague 版归附录 robustness。
 > **实验设计原则**：所有条件共享 Step 1 聚类结果（相同的 agent 分组结构），差异仅在于每组 agent 接收的 persona/skill 内容和 enforcement 机制。这隔离了"聚类结构"与"行为规则蒸馏"的贡献，避免混淆。
 > Figure 2: CADP Pipeline 流程图 (含 nuwa 5-layer skill + three-tier filter-retry)
@@ -290,13 +290,13 @@
 
 ## Chapter 5: Experiment 1 — Method Validation (~3 pages)
 ### 5.1 Setup
-- 数据集: **Wikipedia Talk Pages（primary）+ Reddit r/changemyview（transfer target，§5.5）**。GitHub Issues 移至 Exp 2 跨结构迁移节点，不入 Exp 1 主网格
-- 模型: **2 模型 = 1 API（DeepSeek-V4-Flash）+ 1 开源（Qwen-Max 或 Llama-3）**。Cross-model generality 由这 2 模型代表；更多模型 deferred to future work
-- 总条件数: **8 主条件 × 2 datasets × 2 models = 32 cells × 5 repeats = 160 simulation runs**（v1 精简 2026-07-08；原 13×3×4×5=780 cells 不可行且边际收益低，附录保留扩展消融。**8 主条件 = 7 baseline/主条件 + CADP Full 双 distiller (colleague + nuwa)**，因两个 distiller 产出的 skill 内容不同，需都进主网格以回答 distiller-robustness 问题；消融条件只跑 colleague，nuwa 版本归附录）
+- 数据集: **Wikipedia Talk Pages（primary）**。Reddit r/changemyview 迁移测试 deferred to v2 (§7.5)；GitHub Issues 移至 Exp 2 跨结构迁移节点，不入 Exp 1 主网格
+- 模型: **1 模型 = DeepSeek-V4-Flash**。Cross-model generality deferred to future work (§7.5)；v1 单模型聚焦 method contribution 验证
+- 总条件数: **8 主条件 × 1 dataset × 1 model = 8 cells × 5 repeats = 40 simulation runs**（v1 精简 2026-07-08；原 13×3×4×5=780 cells 不可行且边际收益低，附录保留扩展消融。**8 主条件 = 7 baseline/主条件 + CADP Full 双 distiller (colleague + nuwa)**，因两个 distiller 产出的 skill 内容不同，需都进主网格以回答 distiller-robustness 问题；消融条件只跑 colleague，nuwa 版本归附录）
 - 重复: 每条件 5 次（framing-pilot effect-size dependent；d ≥ 0.5 → 5 repeats sufficient for 80% power at α=0.05）
 - **Agent 人口**：30 agents = 6 skills × 5 agents per skill（outline §4.5）
-- **每轮 API 调用数**：50 rounds × (30 agents + 环境/观察行为) ≈ 1,500 calls/run；160 runs 共约 240K calls（filter-retry 每条最多 3x tokens，估算上浮到 ~720K effective tokens）
-- **样本量与可行性说明**：160 cells × 50 rounds × 30 agents per cell；API 成本估算（DeepSeek-V4-Flash @ $0.10/1K input + $0.40/1K output + Qwen 开源 self-host 或 API）约 $900–1,700。DeepSeek-V4-Pro 保留用于 skill compilation。Cross-model analysis (§7.1) 由 2 模型代表，更多模型 deferred to v2
+- **每轮 API 调用数**：50 rounds × (30 agents + 环境/观察行为) ≈ 1,500 calls/run；40 runs 共约 60K calls（filter-retry 每条最多 3x tokens，估算上浮到 ~180K effective tokens）
+- **样本量与可行性说明**：40 cells × 50 rounds × 30 agents per cell；API 成本估算（DeepSeek-V4-Flash @ $0.10/1K input + $0.40/1K output）约 $450–850。DeepSeek-V4-Pro 保留用于 skill compilation（已蒸馏完毕，不重复调用）。Cross-model analysis deferred to v2 (§7.5)
 - **Power analysis**：基于 pilot data（Wikipedia 单数据集）的 effect size 估计，Cohen's d ≥ 0.5 时 5 次重复即可达到 80% power (α=0.05)；若 pilot 显示 d < 0.5，则增加至 10 次重复
 - **Framing pilot（review-driven, ARS 2026-06-19）**：在主实验之前运行 `configs/exp1_framing_pilot.yaml`——**4 条件 (descriptive / pop_aligned / rich_narrative / cadp_full) × 10 repeats × Wikipedia × 单模型**，仅测 Micro Behavior + Predictive Fidelity 两层。**Pre-registered 决策规则**（unblinding 前冻结）：d ≥ 0.5 on ≥2 layers → method 主导 framing 可行；d ≈ 0.3 或单层 → benchmark 主导 framing；d < 0.3 → CADP 路线重构；CADP 输给 Pop-Aligned → benchmark framing + 重写 §2.3；**CADP 在 Predictive Fidelity 输给 Rich-Narrative（条件 4）→ 核心论点（inference-time intervention 必要性）失败，转 benchmark framing + 重写 §1.4/§2.2.5**。Framing pilot 与 §5.1 Power analysis 共享 effect-size 估计但作用不同
 - **聚类共享原则**：所有 7 个主条件使用相同的 Step 1 聚类结果与 **6-skill 合并映射（`cluster_map.json`）**（相同 agent 分组），差异仅在 persona/skill 内容和 enforcement 机制。这隔离聚类结构贡献与行为规则蒸馏贡献
@@ -306,7 +306,7 @@
 
 ### 5.2 Baselines (v1 精简为 8 主条件 + 附录消融，nuwa-primary，2026-07-08)
 
-**主网格 8 条件**（每条 × 2 datasets × 2 models × 5 repeats）：
+**主网格 8 条件**（每条 × 1 dataset × 1 model × 5 repeats）：
 1. **Vanilla LLM** (无 persona) — 地板参考
 2. **Descriptive Persona** (标准 system prompt) — lever-1 baseline
 3. **Population-Aligned Persona** (复现 arXiv:2509.10127) — §2.3 最直接竞品
@@ -331,7 +331,7 @@
 > - nuwa 作 base 因 5-layer 一对一对映 CADP 三维；anti-patterns 层结构化（named pattern + 3 quotes）直接喂 §4.4.1 trigger classifier；Honest boundaries 层与 §7.4 诚实声明对齐
 > - colleague 6-layer 含 Work Skill 模块（与 social sim 无关）+ Correction Log（与 filter-retry 平行，混淆 contribution），不适合作 base 但作 methodology head-to-head 回答结构问题
 > - 所有消融/置换检验只在 nuwa 上跑（结构清晰可消融），colleague 版归附录 robustness
-> **精简理由**：原 13×3×4×5=780 cells 边际收益低。8 主条件覆盖 lever-1 baseline 族 + CADP 主张（nuwa-primary + colleague comparison）+ 关键消融/置换（nuwa）。Cell 总数 780 → 160 主 + ~50 附录。**此条件需新增代码**：新 agent adapter for Rich-Narrative，经 `src/agents/registry.py` 注册
+> **精简理由**：原 13×3×4×5=780 cells 边际收益低。8 主条件覆盖 lever-1 baseline 族 + CADP 主张（nuwa-primary + colleague comparison）+ 关键消融/置换（nuwa）。Cell 总数 780 → 40 主 + ~50 附录。**此条件需新增代码**：新 agent adapter for Rich-Narrative，经 `src/agents/registry.py` 注册
 
 > **消融逻辑链**（逐层隔离结构贡献，主网格 + 附录合看）：
 > - COLLEAGUE capability-only（附录）→ CADP minus Anti-patterns（主，nuwa）→ CADP Full（主，nuwa）：隔离 filter-retry 的增量
@@ -432,10 +432,10 @@
 - 预测性保真度: held-out 事件预测准确率
 - Trigger calibration: per-category P/R/F1 + 跨域迁移性能（§5.3.5）
 - α Sensitivity: per-dimension α 曲线（附录 reduced grid）
-- 跨模型一致性（2 模型）
+- 跨模型一致性（deferred to v2）
 - **Human evaluation 结果**：3 名专家盲评（Cohen's κ ≥ 0.6）中 CADP 的辨识度——专家能否区分 CADP 仿真 vs 真实交互（作为外部效度的核心证据，在主结果中报告）
 
-> Table 1: 主结果表 (8 conditions × 5 metric layers × 2 models × 2 datasets)
+> Table 1: 主结果表 (8 conditions × 5 metric layers × 1 model × 1 dataset)
 > Table 2: 附录消融结果表 (附录条件 × 5 metric layers，Wikipedia 单模型 reduced grid) + COLLEAGUE capability-only 链式对比
 > Table 2b: Clustering-Only vs Descriptive vs CADP（附录，聚类贡献隔离）
 > Table 2c: Length-Matched Control vs Descriptive vs CADP（附录，token-budget 贡献隔离，DA-E1）
@@ -477,7 +477,7 @@
 - **Caricature 分析**：CADP 的 cluster 间 Cohen's d 随 fidelity 提升如何变化？若 fidelity 提升但 caricature 不增 → §3.2 "截断而非加内容" 论证成立；若 caricature 同步上升 → 如实承认 CADP 未逃脱 caricature 陷阱
 - **COLLEAGUE → CADP 的增量来源（methodology comparison）**：CADP Full (nuwa 5-layer) vs CADP Full (colleague 6-layer) 在 5 metric layer 的差异定位结构贡献。若两者相近 → framework robust；若 nuwa 显著更优 → 5-layer 结构对 social sim 更适配
 - **Pop-Aligned + CADP 叠加效果解读**：若叠加无显著增益，说明 CADP 的行为规则已隐含人口属性信息；若有增益，说明两维度正交互补
-- **回应 "What Limits LLM Simulation" (arXiv:2501.08579)**：跨模型对比分析（2 模型）——若 CADP 在不同模型上的提升幅度一致，说明 design fix（CADP）的效果不依赖模型能力；若在更强模型上提升幅度递减，则支持"LLMs and Design 共同限制"的交互效应假设
+- **回应 "What Limits LLM Simulation" (arXiv:2501.08579)**：跨模型对比分析 deferred to v2 (§7.5)；v1 单模型结果已足以验证 method contribution——若 CADP 在单模型上显著优于 lever-1 baseline，则 design fix 效果确立；跨模型 generality 留后续验证
 - Anti-patterns 作为 filter-retry trigger 的作用机制（**不主张 weights-level RLHF override**，§7.4 acknowledged）
 - α Sensitivity: per-dimension 最优配置的维度差异性（附录 reduced grid）
 - Predictive fidelity 的 "so what" 论证

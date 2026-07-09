@@ -15,7 +15,7 @@ from src.data.schemas import Message, Thread
 from src.evaluation.linguistics import LinguisticMetrics
 from src.evaluation.macro import MacroMetrics
 from src.evaluation.meso import MesoMetrics
-from src.evaluation.micro import MicroMetrics
+from src.evaluation.micro import MicroMetrics, caricature_index
 from src.evaluation.predictive import PredictiveMetrics
 from src.simulation.sandbox import SimulationResult
 
@@ -288,6 +288,17 @@ class MetricsAggregator:
             ))
         except Exception as e:
             logger.warning(f"MicroMetrics computation failed: {e}")
+
+        # Caricature Index (outline §5.3 — between-cluster behavioral Cohen's d)
+        # Responds to Chameleon's Limit §3.3 "fidelity breeds caricature":
+        # measures whether enforcement increases between-cluster stereotyping.
+        try:
+            caricature_sim = caricature_index(
+                sim_agent_counts, sim_communities,
+            )
+            all_metrics["caricature_index_sim"] = caricature_sim
+        except Exception as e:
+            logger.warning(f"Caricature index computation failed: {e}")
 
         # Layer 4: Linguistics
         try:
