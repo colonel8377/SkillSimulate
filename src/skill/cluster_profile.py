@@ -72,6 +72,13 @@ class TypicalUtterance:
     text: str
     parent_context: str
     topic: str
+    # Provenance for train/test separation (outline §5.1): the source
+    # thread (conversation_id) and message id, so the simulation pool
+    # can exclude any thread/message that informed skill distillation.
+    # Older typical.jsonl files lack these keys; consumers must
+    # ``.get("thread_id", "")`` for back-compat.
+    thread_id: str = ""
+    msg_id: str = ""
 
 
 @dataclass
@@ -286,6 +293,7 @@ class ArchetypeProfiler:
             out.append(TypicalUtterance(
                 member=m.user_id, action=m.action_type.value, text=txt,
                 parent_context=ctx, topic=topic_by_thread.get(m.thread_id, ""),
+                thread_id=m.thread_id, msg_id=m.msg_id,
             ))
         return out, len(cands)
 

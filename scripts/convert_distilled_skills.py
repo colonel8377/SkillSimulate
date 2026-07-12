@@ -95,12 +95,32 @@ _CLUSTER_TOXIC_KEYWORDS: dict[str, list[str]] = json.loads(
     TOXIC_KEYWORDS_PATH.read_text()
 )
 
-# Anti-pattern descriptions that indicate profanity/slur/attack content.
-# When matched, attach the cluster's actual toxic keywords (Category A).
-_TOXIC_DESCRIPTION_FRAGMENTS = [
+# Description fragments that indicate hostile/violating content.
+# When matched, attach the cluster's corpus-derived toxic keywords (Category A).
+# Not limited to profanity — covers edit-warring, vandalism, personal attacks,
+# and other hostile behaviors that the corpus toxic-keyword extraction captures.
+_HOSTILE_DESCRIPTION_FRAGMENTS = [
     "profanity", "slur", "hate speech", "bigot", "insult",
-    "ad hominem", "personal attack", "incivility",
+    "ad hominem", "personal attack", "incivility", "uncivil",
+    "vandalism", "vandal", "edit warring", "edit war", "revert war",
+    "harassment", "hounding", "baiting", "trolling", "troll",
+    "attack", "hostile", "aggressive", "threat",
+    "disruptive", "disruption", "blatant",
 ]
+
+
+def _load_corpus_evidence(cluster_id: str) -> list[str]:
+    """Load Rejected-behavior evidence lines from the corpus pack.
+
+    Used as fallback when the nuwa SKILL.md anti-patterns section
+    contains only short labels without embedded quotes.
+    """
+    corpus_md = CORPUS_DIR / f"cluster_{cluster_id}" / "for_colleague.md"
+    if not corpus_md.exists():
+        return []
+    text = corpus_md.read_text()
+    evidence_section = _section(text, r"^## Rejected-behavior evidence", r"^##")
+    return [l.strip() for l in evidence_section.splitlines() if l.strip().startswith("- [")]
 
 
 def _extract_triggers(
@@ -111,13 +131,15 @@ def _extract_triggers(
     """Extract Tier 3 trigger fields from anti-pattern description + evidence.
 
     Strategy:
-      - **Category B (semantic)**: Only quoted phrases from evidence text.
+      - **Category B (semantic)**: Quoted phrases from evidence text.
         They are real utterances from the corpus, suitable for Sentence-BERT
-        cosine matching. No fallback to the description: terse labels are
-        meta-descriptions, not observable trigger phrases.
-      - **Category A (keywords)**: If the description indicates profanity/
-        slurs/insults, attach the cluster-specific toxic keywords derived from
-        ConvoKit toxicity labels. No fabricated universal list.
+        cosine matching. When evidence yields no semantic phrases (e.g. nuwa
+        anti-patterns with terse labels and no quotes), falls back to the
+        cluster's corpus rejected-behavior evidence from for_colleague.md.
+      - **Category A (keywords)**: If the description indicates hostile
+        behavior (profanity, vandalism, edit-warring, personal attacks, etc.),
+        attach the cluster-specific toxic keywords derived from ConvoKit
+        toxicity labels via log-odds extraction. No hardcoded word list.
       - **Category C (action patterns)**: Not extracted here — action patterns
         like "revert->revert->revert" require domain knowledge of the
         simulation's action vocabulary and are set manually if needed.
@@ -131,17 +153,54 @@ def _extract_triggers(
     trigger_regex: list[str] = []
 
     # --- Category B: semantic phrases from evidence ---
-    # Only double-quoted phrases from evidence are corpus-grounded utterances.
+    # Corpus evidence lines (from for_colleague.md/for_nuwa.md) start with "- ["
+    # and contain the full utterance text after the tag. Extract the text content.
+    # Nuwa SKILL.md evidence uses double-quoted phrases — extract those too.
     for ev in evidence:
-        quotes = re.findall(r'"([^"]+)"', ev)
-        for q in quotes:
-            if 10 <= len(q) <= 200:
-                trigger_semantic_phrases.append(q)
+        # Corpus evidence format: "- [label] text content"
+        if ev.strip().startswith("- ["):
+            # Remove the leading tag "- [label] " and keep the text
+            m = re.match(r"^-\s*\[[^\]]+\]\s*(.+)$", ev.strip())
+            if m:
+                text = m.group(1).strip()
+                if 10 <= len(text) <= 200:
+                    trigger_semantic_phrases.append(text)
+        else:
+            # Nuwa SKILL.md format: double-quoted phrases within evidence text
+            quotes = re.findall(r'"([^"]+)"', ev)
+            for q in quotes:
+                if 10 <= len(q) <= 200:
+                    trigger_semantic_phrases.append(q)
 
-    # --- Category A: keywords for profanity/slur anti-patterns ---
+    # Fallback: if no semantic phrases extracted from inline evidence,
+    # use the cluster's corpus rejected-behavior evidence.
+    if not trigger_semantic_phrases:
+        corpus_evidence = _load_corpus_evidence(cluster_id)
+        for ev in corpus_evidence:
+            m = re.match(r"^-\s*\[[^\]]+\]\s*(.+)$", ev.strip())
+            if m:
+                text = m.group(1).strip()
+                if 10 <= len(text) <= 200:
+                    trigger_semantic_phrases.append(text)
+
+    # --- Category A: keywords for hostile/violating anti-patterns ---
+    # Strategy: if the cluster has corpus-derived toxic keywords AND the
+    # anti-pattern description is even loosely hostile/conflict-adjacent,
+    # attach them. The toxic keywords came from high-toxicity utterances
+    # in this cluster — they ARE the cluster's toxic vocabulary regardless
+    # of which anti-pattern label they sit under.
+    cluster_kw = _CLUSTER_TOXIC_KEYWORDS.get(cluster_id, [])
     desc_lower = description.lower()
-    if any(frag in desc_lower for frag in _TOXIC_DESCRIPTION_FRAGMENTS):
-        trigger_keywords = sorted(_CLUSTER_TOXIC_KEYWORDS.get(cluster_id, []))
+    # Broad match: any hostile/conflict/quality-violation language
+    _BROAD_HOSTILE = _HOSTILE_DESCRIPTION_FRAGMENTS + [
+        "unsourced", "unverifiable", "unverified", "original research",
+        "biased", "promotional", "advertorial", "coi", "conflict of interest",
+        "loaded", "opinionated", "subjective", "pov", "point of view",
+        "vandal", "disrupt", "low-quality", "unreliable", "off-topic",
+        "trivia", "fancruft", "contradiction", "inconsisten",
+    ]
+    if cluster_kw and any(frag in desc_lower for frag in _BROAD_HOSTILE):
+        trigger_keywords = sorted(cluster_kw)
 
     return {
         "trigger_keywords": trigger_keywords,
@@ -184,6 +243,26 @@ def _bullets(text: str) -> list[str]:
 # Colleague-skill (persona_skill.md, Layer 0-7) parser
 # ---------------------------------------------------------------------------
 
+def _extract_rejected_evidence_from_corpus(cluster_id: str) -> list[str]:
+    """Extract Rejected-behavior evidence lines from the corpus pack
+    ``outputs/skill_corpus_k8_quantile/wikiconv/cluster_N/for_colleague.md``.
+
+    This is the same corpus-grounded evidence used during colleague distillation,
+    containing the actual high-toxicity/attack/delete utterances that inform
+    anti-pattern triggers. We use it here because the final ``persona_skill.md``
+    Layer 5 Rejects section contains only short labels without the original
+    quotes.
+    """
+    corpus_md = CORPUS_DIR / f"cluster_{cluster_id}" / "for_colleague.md"
+    if not corpus_md.exists():
+        logger.warning(f"Corpus pack {corpus_md} not found — colleague triggers will be empty")
+        return []
+
+    text = corpus_md.read_text()
+    evidence_section = _section(text, r"^## Rejected-behavior evidence", r"^##")
+    return [l.strip() for l in evidence_section.splitlines() if l.strip().startswith("- [")]
+
+
 def parse_colleague(md_path: Path, cluster_id: str) -> dict:
     """Parse colleague-skill ``persona_skill.md`` into keep-table fields.
 
@@ -196,6 +275,11 @@ def parse_colleague(md_path: Path, cluster_id: str) -> dict:
     Timeline, Correction Log.
     """
     text = md_path.read_text()
+
+    # Load corpus-grounded rejected-behavior evidence for trigger extraction.
+    # The Layer 5 Rejects section in persona_skill.md contains only short labels
+    # without quotes, so we pull the original evidence from the distillation input pack.
+    corpus_evidence = _extract_rejected_evidence_from_corpus(cluster_id)
 
     # Layer 0: Core Thinking Rules -> generic decision heuristics (durable,
     # cross-context; the outline's DecisionHeuristic is the closest field).
@@ -289,7 +373,7 @@ def parse_colleague(md_path: Path, cluster_id: str) -> dict:
             label, reason = m.group(1), m.group(2)
         else:
             label, reason = reject, ""
-        triggers = _extract_triggers(label, [], cluster_id)
+        triggers = _extract_triggers(label, corpus_evidence, cluster_id)
         anti_patterns.append(AntiPattern(
             description=label,
             trigger_conditions=[],

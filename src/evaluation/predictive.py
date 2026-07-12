@@ -755,6 +755,44 @@ class PredictiveMetrics:
         result: dict[str, Any] = {}
         # Build thread index once for O(1) lookup across all operations
         real_thread_index = _build_thread_index(real_messages)
+
+        # When held-out events come from the CGA corpus (thread IDs that
+        # may not exist in the WikiConv real_messages sample), we need to
+        # ensure the thread index contains CGA data so test features can
+        # be extracted. Load CGA utterances and merge them in.
+        if held_out_events is not None:
+            hoe_tids = {e.thread_id for e in held_out_events}
+            missing_tids = {tid for tid in hoe_tids if tid not in real_thread_index}
+            if missing_tids:
+                from src.config.settings import settings as _settings
+                cga_dir = (
+                    _settings.raw_data_dir / "wikiconv_en" / "cga"
+                    / "conversations-gone-awry-corpus"
+                )
+                if cga_dir.exists():
+                    import json as _json
+                    n_added = 0
+                    with open(cga_dir / "utterances.jsonl") as _f:
+                        for _line in _f:
+                            _line = _line.strip()
+                            if not _line:
+                                continue
+                            _u = _json.loads(_line)
+                            _cid = _u.get("conversation_id", _u.get("id"))
+                            if _cid in missing_tids:
+                                real_thread_index.setdefault(_cid, []).append({
+                                    "thread_id": _cid,
+                                    "user_id": _u.get("speaker", ""),
+                                    "text": _u.get("text", ""),
+                                    "action_type": "discuss",
+                                    "timestamp": _u.get("timestamp"),
+                                })
+                                n_added += 1
+                    logger.info(
+                        f"Predictive Fidelity: merged {n_added} CGA utterances "
+                        f"for {len(missing_tids)} held-out thread IDs not in "
+                        f"real_messages"
+                    )
         # Per-task protocol tracking (outline §5.3 transparency). Each of the
         # three predictive tasks may independently fall back to heuristic GT
         # when consensus labels are unavailable; reporting a single flat

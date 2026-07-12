@@ -127,20 +127,51 @@ class Experiment1Runner(ExperimentRunner):
         loader's ``limit`` is per-corpus-balanced, so the upstream cap
         is both faster and statistically equivalent to the old
         post-hoc random subsample.
+
+        Graph-density fix: single-message / single-user threads carry
+        no interaction signal (no edges in the interaction graph), so
+        they make Macro Topology metrics uninformative.  After loading,
+        filter to threads with >= 2 messages AND >= 2 distinct
+        participants.  To compensate for the ~95% reduction, the
+        utterance cap is inflated by ``thread_filter_oversample``
+        (default 10×) so that enough multi-user threads survive.
         """
         if dataset not in self._data_cache:
-            # Pass max_threads as the loader's utterance cap (None → load
-            # everything). Loader distributes evenly across year-corpora.
+            # Inflate the utterance cap so filtering still yields
+            # enough threads.  The loader's limit is utterance-level;
+            # ~95% of utterances land in single-msg threads, so we
+            # need ~10× oversampling to hit the target thread count
+            # after filtering.
+            oversample = getattr(self.config, "thread_filter_oversample", 10)
+            effective_limit = (
+                self.config.max_threads * oversample
+                if self.config.max_threads is not None
+                else None
+            )
             loader = self.get_dataset_loader(dataset)
             if hasattr(loader, "limit"):
-                loader.limit = self.config.max_threads
+                loader.limit = effective_limit
             threads = loader.load()
+
+            # Filter to threads with actual interaction structure
+            before = len(threads)
+            threads = [
+                t for t in threads
+                if len(t.messages) >= 2 and len(t.participants) >= 2
+            ]
+            if before > 0 and len(threads) < before:
+                logger.info(
+                    f"Thread filter: {len(threads)}/{before} threads kept "
+                    f"(>=2 msgs, >=2 participants)"
+                )
+
+            # Cap to max_threads after filtering
             if self.config.max_threads is not None and len(threads) > self.config.max_threads:
                 rng = np.random.RandomState(self.config.seed)
                 idx = rng.choice(len(threads), size=self.config.max_threads, replace=False)
                 threads = [threads[i] for i in idx]
                 logger.info(
-                    f"Capped {dataset} to {self.config.max_threads} threads (from full corpus)"
+                    f"Capped {dataset} to {self.config.max_threads} threads (from filtered set)"
                 )
             self._data_cache[dataset] = threads
             logger.info(f"Loaded {len(threads)} threads from {dataset}")
@@ -428,11 +459,127 @@ class Experiment1Runner(ExperimentRunner):
                 thread_map[thread.thread_id] = 0
         return thread_map
 
-    def _prepare_sim_threads(self, threads: list, cell: ExperimentCell) -> list:
-        """Prepare thread stubs for simulation (empty messages, same topics)."""
-        from src.data.schemas import Thread as ThreadModel
+    def _load_cga_seed_threads(self) -> list:
+        """Load high-conflict CGA threads as seed material for simulation."""
+        from src.data.schemas import Thread as ThreadModel, Message, Platform, ActionType
 
-        # Sample diverse topics
+        if hasattr(self, '_cga_seed_cache') and self._cga_seed_cache is not None:
+            return self._cga_seed_cache
+
+        cga_dir = settings.data_dir / "raw" / "wikiconv_en" / "cga" / "conversations-gone-awry-corpus"
+        conv_path = cga_dir / "conversations.json"
+        utt_path = cga_dir / "utterances.jsonl"
+
+        if not conv_path.exists() or not utt_path.exists():
+            logger.warning(f"CGA corpus not found at {cga_dir}, falling back to empty stubs")
+            self._cga_seed_cache = None
+            return []
+
+        import json
+        from datetime import datetime
+
+        # 1. Load attack conversations
+        with open(conv_path) as f:
+            convs = json.load(f)
+        attack_conv_ids = {
+            cid for cid, meta in convs.items()
+            if meta.get("conversation_has_personal_attack")
+        }
+        logger.info(f"CGA: {len(attack_conv_ids)} attack conversations out of {len(convs)}")
+
+        # 2. Load utterances, group by conversation
+        conv_utterances: dict[str, list[dict]] = {}
+        with open(utt_path) as f:
+            for line in f:
+                utt = json.loads(line)
+                cid = utt.get("conversation_id", "")
+                if cid in attack_conv_ids:
+                    conv_utterances.setdefault(cid, []).append(utt)
+
+        # 3. Build Thread objects, filter by max toxicity
+        min_tox = self.config.seed_min_toxicity
+        seed_threads: list[ThreadModel] = []
+        for cid, utts in conv_utterances.items():
+            # Sort utterances by timestamp/id for order
+            utts.sort(key=lambda u: u.get("id", ""))
+            max_tox = max(
+                (u.get("meta", {}).get("toxicity", 0) for u in utts),
+                default=0,
+            )
+            if max_tox < min_tox:
+                continue
+            page_title = convs[cid].get("page_title", cid)
+            messages = []
+            participants = set()
+            for u in utts:
+                if u.get("meta", {}).get("is_section_header"):
+                    continue
+                text = u.get("text", "").strip()
+                if not text:
+                    continue
+                speaker = u.get("speaker", "Unknown")
+                participants.add(speaker)
+                ts_raw = u.get("meta", {}).get("timestamp")
+                try:
+                    ts = datetime.fromisoformat(ts_raw) if ts_raw else datetime.now()
+                except (ValueError, TypeError):
+                    ts = datetime.now()
+                messages.append(Message(
+                    msg_id=u["id"],
+                    thread_id=cid,
+                    user_id=speaker,
+                    platform=Platform.WIKIPEDIA,
+                    timestamp=ts,
+                    text=text,
+                    action_type=ActionType.DISCUSS,
+                    metadata=u.get("meta", {}),
+                ))
+            if len(messages) < 2:
+                continue
+            seed_threads.append(ThreadModel(
+                thread_id=cid,
+                platform=Platform.WIKIPEDIA,
+                topic=page_title,
+                messages=messages,
+                participants=participants,
+            ))
+
+        logger.info(
+            f"CGA seed threads: {len(seed_threads)} (toxicity >= {min_tox})"
+        )
+        self._cga_seed_cache = seed_threads
+        return seed_threads
+
+    def _prepare_sim_threads(self, threads: list, cell: ExperimentCell) -> list:
+        """Prepare sim threads seeded with real CGA conflict conversations."""
+        from src.data.schemas import Thread as ThreadModel
+        import copy
+
+        seed_threads = self._load_cga_seed_threads()
+
+        if seed_threads:
+            # Sample diverse topics from CGA seeds
+            seen_topics = set()
+            sim_threads = []
+            rng = np.random.default_rng(self.config.seed + hash(cell.cell_id) % 10000)
+            indices = rng.permutation(len(seed_threads))
+            for idx in indices:
+                seed = seed_threads[idx]
+                if seed.topic in seen_topics:
+                    continue
+                seen_topics.add(seed.topic)
+                # Clone with sim_ prefix; keep original messages as seed context
+                sim = copy.deepcopy(seed)
+                sim.thread_id = f"sim_{cell.cell_id}_{seed.thread_id}"
+                sim_threads.append(sim)
+                if len(sim_threads) >= self.config.max_sim_threads:
+                    break
+
+            if sim_threads:
+                return sim_threads
+            # Fall through to stub logic if no diverse topics found
+
+        # Fallback: original empty-stub logic (CGA unavailable)
         seen_topics = set()
         sim_threads = []
         for thread in threads:
@@ -446,7 +593,6 @@ class Experiment1Runner(ExperimentRunner):
             if len(sim_threads) >= self.config.max_sim_threads:
                 break
 
-        # Ensure at least one thread
         if not sim_threads and threads:
             sim_threads.append(ThreadModel(
                 thread_id=f"sim_{cell.cell_id}_default",

@@ -152,7 +152,19 @@ class MetricsAggregator:
         # Encode role strings as integer cluster IDs (deterministic ordering)
         unique_roles = sorted(set(labels.values()))
         role_to_id = {r: i for i, r in enumerate(unique_roles)}
-        return {uid: role_to_id[r] for uid, r in labels.items()}
+        raw_mapping = {uid: role_to_id[r] for uid, r in labels.items()}
+
+        # PII anonymization: role labels store raw Wikipedia usernames, but
+        # graph nodes have been scrubbed through anonymize_user_id.  Apply
+        # the same deterministic salted hash so the keys match.
+        from src.data.pii import anonymize_user_id
+        anonymized = {anonymize_user_id(uid): rid for uid, rid in raw_mapping.items()}
+
+        matched = len(anonymized)
+        logger.info(
+            f"Role labels: {matched} users loaded, anonymized via PII hash"
+        )
+        return anonymized
 
     def evaluate(
         self,
@@ -388,7 +400,10 @@ class MetricsAggregator:
             repeat=sim_result.repeat,
             metrics=all_metrics,
             used_role_label_proxy=sim_result.dataset in self.datasets_using_role_label_proxy,
-            used_held_out_events_heuristic=(held_out_events is None),
+            used_held_out_events_heuristic=(
+                held_out_events is None
+                or all_metrics.get("pred_predictive_fidelity", 1.0) == 0.0
+            ),
             model_snapshot_date=self.model_provenance.get(sim_result.model, {}).get("snapshot_date", ""),
             model_commit_hash=self.model_provenance.get(sim_result.model, {}).get("commit_hash", ""),
         )

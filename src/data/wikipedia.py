@@ -89,6 +89,7 @@ class WikipediaLoader(DatasetLoader):
         action-policy signal the behaviour axis clusters on.
         """
         cga = self._load_cga_labels(root)
+        logger.info(f"CGA labels: {len(cga)} entries; processing {len(corpus_dirs)} year corpora")
         threads_map: dict[str, Thread] = {}
 
         _event_action = {
@@ -107,6 +108,7 @@ class WikipediaLoader(DatasetLoader):
         for cdir in corpus_dirs:
             if self.limit is not None and n_utts >= self.limit:
                 break
+            logger.info(f"Loading {cdir.name} …")
             conv_meta = self._load_conversations(cdir)
             dir_count = 0
             with open(cdir / "utterances.jsonl") as f:
@@ -229,7 +231,7 @@ class WikipediaLoader(DatasetLoader):
                 platform=self.get_platform(),
                 timestamp=self._parse_ts(utt.get("timestamp")),
                 text=str(utt.get("text") or ""),
-                action_type=ActionType.DISCUSS,
+                action_type=self._infer_action(utt, str(utt.get("text") or "")),
                 parent_msg_id=str(reply_to) if reply_to else None,
                 metadata=base_meta,
             )

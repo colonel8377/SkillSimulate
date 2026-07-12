@@ -40,7 +40,8 @@ cluster_merge_map_path: outputs/skill_corpus_k8_quantile/wikiconv/cluster_map.js
 top_n_threads: 20
 checkpoint_every: 5
 max_threads: 2000
-max_concurrency: 32
+max_sim_threads: 20
+max_concurrency: 8
 seed: 42
 # Long-horizon context budget (B3). Raising both vs defaults improves
 # long-horizon signal retention; applied uniformly across all conditions

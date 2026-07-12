@@ -79,13 +79,25 @@ def ei_polarization_index(
     """
     external = 0
     internal = 0
+    skipped = 0
+    total_edges = graph.number_of_edges()
     for u, v in graph.edges():
         cu = communities.get(u)
         cv = communities.get(v)
-        if cu is not None and cv is not None and cu == cv:
+        if cu is None or cv is None:
+            skipped += 1
+            continue
+        if cu == cv:
             internal += 1
         else:
             external += 1
+
+    if skipped > total_edges // 2:
+        from loguru import logger
+        logger.warning(
+            f"EI polarization: {skipped}/{total_edges} edges skipped "
+            f"(unlabeled endpoints) — sparse community labeling"
+        )
 
     total = external + internal
     if total == 0:

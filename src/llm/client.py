@@ -217,7 +217,7 @@ class LLMClient:
         # so operators can tighten it for fragile endpoints. The breaker is
         # reset on each new runner.run_all() invocation.
         self._breaker = get_breaker(
-            threshold=int(os.getenv("CADP_BREAKER_THRESHOLD", "3"))
+            threshold=int(os.getenv("CADP_BREAKER_THRESHOLD", "20"))
         )
         self._init_clients()
 
@@ -321,7 +321,10 @@ class LLMClient:
                     raw_url = ep_cfg.get("base_url", "") or default_url
                     clean_url, detected_type = _normalize_base_url(raw_url)
                     ep_model = ep_cfg.get("model", "") or ep.model
-                    client = AsyncOpenAI(api_key=api_key, base_url=clean_url)
+                    client = AsyncOpenAI(
+                        api_key=api_key, base_url=clean_url,
+                        timeout=float(os.getenv("CADP_API_TIMEOUT", "120")),
+                    )
                     pool_states.append(EndpointState(
                         config=EndpointConfig(
                             base_url=clean_url,
@@ -375,7 +378,10 @@ class LLMClient:
                     f"Model '{name}' resolved api_type='{ep.api_type}' "
                     f"(base_url='{raw_url}' → '{clean_url}')"
                 )
-            self.clients[name] = AsyncOpenAI(api_key=api_key, base_url=clean_url)
+            self.clients[name] = AsyncOpenAI(
+                api_key=api_key, base_url=clean_url,
+                timeout=float(os.getenv("CADP_API_TIMEOUT", "120")),
+            )
 
     async def chat_completion(
         self,

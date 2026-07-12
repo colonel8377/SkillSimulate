@@ -41,7 +41,7 @@ class ActionType(str, Enum):
 
     @classmethod
     def for_platform(cls, platform: Platform) -> list["ActionType"]:
-        wiki = {cls.EDIT, cls.REVERT, cls.DISCUSS, cls.REPORT, cls.DELETE, cls.RESTORE}
+        wiki = {cls.EDIT, cls.REVERT, cls.DISCUSS, cls.REPORT, cls.DELETE, cls.RESTORE, cls.AGREE, cls.DISAGREE}
         reddit = {cls.REPLY, cls.AWARD_DELTA, cls.COUNTER_ARGUE, cls.BLOCK}
         github = {cls.COMMENT, cls.LABEL, cls.CLOSE, cls.REOPEN, cls.ASSIGN}
         mapping = {

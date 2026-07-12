@@ -9,14 +9,32 @@ from src.simulation.platforms.base import PlatformTopology
 
 
 class WikipediaTopology(PlatformTopology):
-    """Edit tree structure: edit → revert → re-edit."""
+    """Edit tree structure: edit → revert → re-edit.
+
+    Action space reflects real Wikipedia talk-page behaviour:
+      - DISCUSS: general talk-page comment (always available)
+      - AGREE: express agreement with a prior position
+      - DISAGREE: challenge or oppose a prior claim
+      - EDIT: modify article content
+      - REVERT: undo another editor's change
+      - REPORT: flag content for admin attention
+    """
 
     @property
     def valid_actions(self) -> list[ActionType]:
-        return [ActionType.EDIT, ActionType.REVERT, ActionType.DISCUSS, ActionType.REPORT]
+        return [
+            ActionType.DISCUSS, ActionType.AGREE, ActionType.DISAGREE,
+            ActionType.EDIT, ActionType.REVERT, ActionType.REPORT,
+        ]
 
     def get_valid_actions(self, thread: Thread, agent_id: str) -> list[ActionType]:
         actions = [ActionType.DISCUSS]  # always available
+
+        # AGREE / DISAGREE available when there are other messages to respond to
+        has_others = any(m.user_id != agent_id for m in thread.messages)
+        if has_others:
+            actions.append(ActionType.AGREE)
+            actions.append(ActionType.DISAGREE)
 
         # Can edit if there's content to edit
         if thread.messages:
@@ -63,11 +81,9 @@ class WikipediaTopology(PlatformTopology):
     ) -> str | None:
         """Wikipedia edit-tree topology (outline §6.3).
 
-        - ``REVERT``: targets the most recent ``EDIT`` by another user
-          (the edit being reverted). This is what makes the edit chain
-          non-degenerate in the interaction graph.
-        - ``DISCUSS`` / ``REPORT``: target the most recent message by
-          another user (talk-page reply chain).
+        - ``REVERT``: targets the most recent ``EDIT`` by another user.
+        - ``DISCUSS`` / ``AGREE`` / ``DISAGREE`` / ``REPORT``: target the
+          most recent message by another user (talk-page reply chain).
         - ``EDIT``: an edit modifies the article, not a message — return
           ``None`` so the topology reflects the article-vs-talk split.
         """
@@ -80,7 +96,7 @@ class WikipediaTopology(PlatformTopology):
             if target is not None:
                 return target.msg_id
             return None  # nothing to revert
-        # DISCUSS / REPORT — talk-page reply chain
+        # DISCUSS / AGREE / DISAGREE / REPORT — talk-page reply chain
         return super().select_reply_target(
             action, agent_id, thread, hint_target_msg_id
         )

@@ -607,39 +607,137 @@ async def annotate_held_out_events(
             f"Extracted {len(candidates)} threads from simulation snapshots"
         )
     else:
-        # --- Read threads from real data (original behaviour) ---
-        loaders = {
-            "wikipedia": WikipediaLoader,
-            "reddit": RedditLoader,
-            "github": GitHubLoader,
-        }
-        loader_cls = loaders.get(dataset)
-        if loader_cls is None:
-            raise ValueError(f"Unknown dataset: {dataset}")
+        # --- Read threads from real data ---
+        if dataset == "wikipedia":
+            # Use CGA corpus directly — it has toxicity + personal-attack
+            # labels, ~3K utterances (vs 50M in full WikiConv). Selecting
+            # high-signal threads here means the LLM annotator gets
+            # informative material instead of random benign discussions.
+            cga_dir = (
+                settings.raw_data_dir / "wikiconv_en" / "cga"
+                / "conversations-gone-awry-corpus"
+            )
+            if not cga_dir.exists():
+                raise FileNotFoundError(
+                    f"CGA corpus not found at {cga_dir}. "
+                    f"Needed for held-out event annotation."
+                )
+            import numpy as np
+            rng = np.random.default_rng(42)
 
-        loader = loader_cls(str(settings.raw_data_dir / dataset))
-        threads = loader.load()
-        logger.info(f"Loaded {len(threads)} threads from {dataset}")
+            # Load utterances, group by conversation
+            conv_utterances: dict[str, list[dict]] = defaultdict(list)
+            conv_page_title: dict[str, str] = {}
+            with open(cga_dir / "utterances.jsonl") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    u = _json.loads(line)
+                    cid = u.get("conversation_id", u.get("id"))
+                    conv_utterances[cid].append(u)
+                    meta = u.get("meta", {})
+                    pt = meta.get("page_title")
+                    if pt and cid not in conv_page_title:
+                        conv_page_title[cid] = pt
 
-        # Sample controversial threads (>= 2 participants, has conflict actions)
-        conflict_actions = {"disagree", "revert", "counter_argue", "report"}
-        for t in threads:
-            if len(t.participants) < 2:
-                continue
-            has_conflict = any(m.action_type.value in conflict_actions for m in t.messages)
-            if not has_conflict:
-                continue
-            exchange = "\n".join(
-                f"[{m.user_id}] ({m.action_type.value}): {m.text[:200]}"
-                for m in t.messages[:15]
-            )[:2000]
-            candidates.append({
-                "thread_id": t.thread_id,
-                "topic": t.topic,
-                "exchange": exchange,
-            })
-            if len(candidates) >= 50:
-                break
+            # Load conversation-level metadata if available
+            conv_meta = {}
+            conv_path = cga_dir / "conversations.json"
+            if conv_path.exists():
+                with open(conv_path) as f:
+                    conv_meta = _json.load(f)
+
+            # Select conversations with high-signal features:
+            # 1. Has personal attack (gold label)
+            # 2. Has high toxicity utterances
+            # 3. Mixed (some attack + some civil) — best for annotation
+            scored_convs: list[tuple[str, float]] = []
+            for cid, utterances in conv_utterances.items():
+                if len(utterances) < 2:
+                    continue
+                speakers = {u.get("speaker") for u in utterances
+                            if u.get("speaker")}
+                if len(speakers) < 2:
+                    continue
+                # Signal score: attack label + toxicity
+                has_attack = sum(
+                    1 for u in utterances
+                    if u.get("meta", {}).get("comment_has_personal_attack")
+                )
+                max_tox = max(
+                    (u.get("meta", {}).get("toxicity", 0) or 0)
+                    for u in utterances
+                )
+                # Prefer mixed conversations (some attack, some civil)
+                # for maximum annotation signal diversity
+                attack_ratio = has_attack / max(len(utterances), 1)
+                signal = 0.0
+                if has_attack > 0:
+                    signal += 2.0  # gold attack label present
+                if max_tox >= 0.7:
+                    signal += 1.0  # high toxicity
+                if 0.1 <= attack_ratio <= 0.5:
+                    signal += 1.5  # mixed = best for annotation
+                scored_convs.append((cid, signal))
+
+            # Sort by signal score descending, take top 50
+            scored_convs.sort(key=lambda x: x[1], reverse=True)
+            top_convs = scored_convs[:50]
+
+            for cid, score in top_convs:
+                utterances = conv_utterances[cid]
+                # Sort by id for chronological order
+                utterances.sort(key=lambda u: u.get("id", ""))
+                page_title = conv_page_title.get(cid, cid)
+                exchange = "\n".join(
+                    f"[{u.get('speaker', '?')}] "
+                    f"(tox={u.get('meta', {}).get('toxicity', 0):.2f}): "
+                    f"{u.get('text', '')[:150]}"
+                    for u in utterances[:15]
+                )[:2000]
+                candidates.append({
+                    "thread_id": cid,
+                    "topic": page_title,
+                    "exchange": exchange,
+                })
+
+            logger.info(
+                f"Selected {len(candidates)} high-signal CGA threads "
+                f"(from {len(conv_utterances)} conversations)"
+            )
+        else:
+            # Non-Wikipedia datasets: original loader path
+            loaders = {
+                "reddit": RedditLoader,
+                "github": GitHubLoader,
+            }
+            loader_cls = loaders.get(dataset)
+            if loader_cls is None:
+                raise ValueError(f"Unknown dataset: {dataset}")
+            loader = loader_cls(str(settings.raw_data_dir / dataset))
+            logger.info(f"Loading {dataset} data …")
+            threads = loader.load()
+            logger.info(f"Loaded {len(threads)} threads from {dataset}")
+
+            conflict_actions = {"disagree", "revert", "counter_argue", "report"}
+            for t in threads:
+                if len(t.participants) < 2:
+                    continue
+                has_conflict = any(m.action_type.value in conflict_actions for m in t.messages)
+                if not has_conflict:
+                    continue
+                exchange = "\n".join(
+                    f"[{m.user_id}] ({m.action_type.value}): {m.text[:200]}"
+                    for m in t.messages[:15]
+                )[:2000]
+                candidates.append({
+                    "thread_id": t.thread_id,
+                    "topic": t.topic,
+                    "exchange": exchange,
+                })
+                if len(candidates) >= 50:
+                    break
 
     logger.info(f"Annotating {len(candidates)} controversial threads for {dataset}")
 

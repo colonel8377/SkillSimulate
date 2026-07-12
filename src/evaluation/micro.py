@@ -14,61 +14,51 @@ def action_matrix_similarity(
     sim_matrix: np.ndarray,
     real_matrix: np.ndarray,
 ) -> float:
-    """Frobenius norm similarity between agent×action matrices.
+    """Cosine similarity of column-marginal action-type proportions.
 
-    Aligns row counts by sampling/padding and pads columns to the union of
-    actions. Normalization uses the sum of both norms, guaranteeing a score
-    in [0, 1] and avoiding the negative values produced by the old
-    truncation-to-min-size logic.
+    Scale-invariant: compares the *distribution* of action types across
+    all agents, independent of agent count.  Replaces the old
+    Frobenius approach that required row-count alignment via random
+    downsampling, which made the metric dependent on population size.
 
     Args:
         sim_matrix: Simulated agent × action count matrix.
         real_matrix: Real agent × action count matrix.
 
     Returns:
-        Similarity in [0, 1]. 1 = identical, 0 = maximally different.
+        Cosine similarity in [0, 1]. 1 = identical action proportions.
     """
     if sim_matrix.size == 0 or real_matrix.size == 0:
         return 0.0
 
-    n_sim, m_sim = sim_matrix.shape
-    n_real, m_real = real_matrix.shape
-
-    # Pad columns to the union action set. The matrices are built from the
-    # same sorted action list, so right-padding zeros preserves alignment.
+    # Pad columns to the union action set
+    m_sim, m_real = sim_matrix.shape[1], real_matrix.shape[1]
     max_cols = max(m_sim, m_real)
     if m_sim < max_cols:
         sim_matrix = np.pad(sim_matrix, ((0, 0), (0, max_cols - m_sim)))
     if m_real < max_cols:
         real_matrix = np.pad(real_matrix, ((0, 0), (0, max_cols - m_real)))
 
-    # Align row counts deterministically. Prefer sampling real rows down to
-    # the simulated population size; if the real matrix is smaller, pad it.
-    target_rows = max(n_sim, n_real)
-    if n_real > n_sim:
-        rng = np.random.RandomState(42)
-        idx = rng.choice(n_real, size=n_sim, replace=False)
-        real_matrix = real_matrix[idx]
-    elif n_real < n_sim:
-        real_matrix = np.pad(real_matrix, ((0, n_sim - n_real), (0, 0)))
+    # Column marginals → action-type proportion vectors
+    sim_col = sim_matrix.sum(axis=0)
+    real_col = real_matrix.sum(axis=0)
+    sim_col = sim_col / (sim_col.sum() + 1e-10)
+    real_col = real_col / (real_col.sum() + 1e-10)
 
-    if sim_matrix.shape != real_matrix.shape:
-        # Defensive fallback: truncate to common shape if padding failed.
-        min_rows = min(sim_matrix.shape[0], real_matrix.shape[0])
-        min_cols = min(sim_matrix.shape[1], real_matrix.shape[1])
-        sim_matrix = sim_matrix[:min_rows, :min_cols]
-        real_matrix = real_matrix[:min_rows, :min_cols]
-
-    frob = np.linalg.norm(sim_matrix - real_matrix)
-    max_possible = np.linalg.norm(sim_matrix) + np.linalg.norm(real_matrix) + 1e-10
-    return float(1.0 - frob / max_possible)
+    denom = np.linalg.norm(sim_col) * np.linalg.norm(real_col) + 1e-10
+    return float(np.dot(sim_col, real_col) / denom)
 
 
 def representational_similarity(
     sim_profiles: np.ndarray,
     real_profiles: np.ndarray,
 ) -> float:
-    """RSA — correlation of behavioral profile similarity matrices.
+    """RSA via eigenvalue spectrum of similarity matrices.
+
+    Compares the *sorted eigenvalue spectra* of the within-group profile
+    similarity matrices.  Dimension-agnostic: no min-size truncation,
+    so RSA is well-defined even when sim and real have different agent
+    counts.
 
     Args:
         sim_profiles: Agent behavioral profiles (agent × feature matrix).
@@ -80,25 +70,24 @@ def representational_similarity(
     if len(sim_profiles) < 2 or len(real_profiles) < 2:
         return 0.0
 
-    # Compute similarity matrices (cosine)
-    def _sim_matrix(profiles: np.ndarray) -> np.ndarray:
+    def _spectrum(profiles: np.ndarray) -> np.ndarray:
         norms = np.linalg.norm(profiles, axis=1, keepdims=True)
         normalized = profiles / (norms + 1e-10)
-        return normalized @ normalized.T
+        sim = normalized @ normalized.T
+        eigenvalues = np.linalg.eigvalsh(sim)
+        return np.sort(eigenvalues)[::-1][:min(10, len(eigenvalues))]
 
-    sim_sim = _sim_matrix(sim_profiles)
-    real_sim = _sim_matrix(real_profiles)
+    sim_spec = _spectrum(sim_profiles)
+    real_spec = _spectrum(real_profiles)
 
-    # Min size match
-    min_size = min(sim_sim.shape[0], real_sim.shape[0])
-    sim_flat = sim_sim[:min_size, :min_size].flatten()
-    real_flat = real_sim[:min_size, :min_size].flatten()
+    # Pad to same length
+    max_len = max(len(sim_spec), len(real_spec))
+    sim_spec = np.pad(sim_spec, (0, max_len - len(sim_spec)))
+    real_spec = np.pad(real_spec, (0, max_len - len(real_spec)))
 
-    if np.std(sim_flat) == 0 or np.std(real_flat) == 0:
+    if np.std(sim_spec) == 0 or np.std(real_spec) == 0:
         return 0.0
-
-    corr = np.corrcoef(sim_flat, real_flat)[0, 1]
-    return float(corr)
+    return float(np.corrcoef(sim_spec, real_spec)[0, 1])
 
 
 def behavior_uniformity(action_counts: Counter) -> float:

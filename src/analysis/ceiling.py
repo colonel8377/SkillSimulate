@@ -55,12 +55,14 @@ DEFAULT_METHOD_FAMILIES: dict[str, list[str]] = {
         "descriptive",
         "segmentation",
         "pop_aligned",
+        "rich_narrative",
         "clustering_only",
         "length_matched_control",
     ],
     "distillation_advisory": ["colleague_skill"],
-    "distillation_enforced": [
-        "cadp_full",
+    "distillation_filter_enforced": [
+        "cadp_full_nuwa",
+        "cadp_full_colleague",
         "cadp_shuffled",
         "cadp_minus_edna",
         "cadp_minus_mm",
