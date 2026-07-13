@@ -132,7 +132,7 @@ def main() -> None:
 
     # Table 2: Linguistic
     cols2 = [
-        ("discourse_marker_match_normal", r"Discourse $\uparrow$", "max"),
+        ("discourse_relation_match_normal", r"Discourse $\uparrow$", "max"),
         ("sentiment_trajectory_similarity_normal", r"Sentiment $\uparrow$", "max"),
         ("speech_act_similarity_normal", r"Speech Act $\uparrow$", "max"),
         ("sip_normal", r"SIP $\uparrow$", "max"),

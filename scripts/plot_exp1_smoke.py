@@ -100,7 +100,7 @@ def plot_linguistic(df: pd.DataFrame, out_dir: Path) -> None:
     x = np.arange(len(df))
     width = 0.2
     cols = [
-        "discourse_marker_match_normal",
+        "discourse_relation_match_normal",
         "sentiment_trajectory_similarity_normal",
         "speech_act_similarity_normal",
         "sip_normal",

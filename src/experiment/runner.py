@@ -52,10 +52,37 @@ class ExperimentRunner:
     ):
         self.config = config
         self.llm = LLMClient(models_config)
+        self.classification_model = self._resolve_classification_model()
         self.checkpoint_dir = settings.simulations_dir / config.name
         self.checkpoint = CheckpointManager(self.checkpoint_dir)
         self.results_dir = settings.results_dir / config.name
         self.results_dir.mkdir(parents=True, exist_ok=True)
+
+    def _resolve_classification_model(self) -> str | None:
+        """Determine model name for classification tasks.
+
+        If CADP_ENDPOINTS_CLASSIFICATION is set (and the 'classification'
+        model is in models.yaml), return 'classification'. Otherwise None,
+        signaling the aggregator to fall back to the simulation model.
+        """
+        import json as _json
+        endpoints_json = os.getenv("CADP_ENDPOINTS_CLASSIFICATION")
+        if endpoints_json:
+            try:
+                endpoints = _json.loads(endpoints_json)
+                if isinstance(endpoints, list) and len(endpoints) > 0:
+                    logger.info(
+                        f"Classification model: 'classification' "
+                        f"({len(endpoints)} endpoints from env)"
+                    )
+                    return "classification"
+            except _json.JSONDecodeError:
+                pass
+        logger.warning(
+            "CADP_ENDPOINTS_CLASSIFICATION not set — classification tasks "
+            "will use the simulation LLM. Set the env var to decouple."
+        )
+        return None
 
     def build_grid(self) -> list[ExperimentCell]:
         """Build full experiment grid."""

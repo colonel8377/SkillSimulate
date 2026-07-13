@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import networkx as nx
 import numpy as np
@@ -16,8 +16,10 @@ from src.evaluation.linguistics import LinguisticMetrics
 from src.evaluation.macro import MacroMetrics
 from src.evaluation.meso import MesoMetrics
 from src.evaluation.micro import MicroMetrics, caricature_index
-from src.evaluation.predictive import PredictiveMetrics
 from src.simulation.sandbox import SimulationResult
+
+if TYPE_CHECKING:
+    from src.llm.client import LLMClient
 
 
 @dataclass
@@ -34,6 +36,8 @@ class MetricsReport:
     # the externally-annotated labels mandated by §5.3. Surface these in the
     # paper's per-dataset validity table (G8).
     used_role_label_proxy: bool = False
+    # Retained for schema compat; predictive fidelity layer removed.
+    # Always False — regex-based event detection deleted.
     used_held_out_events_heuristic: bool = False
     # Audit P5 / outline §5.1(d): reproducibility provenance for the model
     # that produced this run. Empty strings when unrecorded (the paper's
@@ -84,6 +88,8 @@ class MetricsAggregator:
         held_out_events_dir: str | None = None,
         role_labels_dir: str | None = None,
         model_provenance: dict[str, dict[str, str]] | None = None,
+        llm_client: LLMClient | None = None,
+        llm_model_name: str | None = None,
     ):
         self.reports: list[MetricsReport] = []
         self.held_out_events_dir = held_out_events_dir
@@ -94,16 +100,16 @@ class MetricsAggregator:
         # Stamped into every MetricsReport so the paper's reproducibility
         # table can cite the exact dated snapshot / commit per row.
         self.model_provenance: dict[str, dict[str, str]] = dict(model_provenance or {})
+        # LLM client for speech act classification (optional)
+        self._llm_client = llm_client
+        self._llm_model_name = llm_model_name
 
     def _load_held_out_events(self, dataset: str) -> list | None:
         """Load annotated held-out events for a dataset, if available.
 
-        Searches ``held_out_events_dir/{dataset}.jsonl`` for standard
-        annotated events.  When no annotation file exists, returns None
-        so that ``PredictiveMetrics.compute`` falls back to the
-        text-content heuristic with structural contention scoring
-        (R3 fix — produces multi-class labels even for polite-agent
-        simulations where action-type heuristics collapse to a single
+        Retained for future use when proper human annotation is available.
+        Predictive fidelity layer was removed 2026-07-13 (regex-based event
+        detection was unreliable).
         class).
         """
         if not self.held_out_events_dir:
@@ -166,7 +172,7 @@ class MetricsAggregator:
         )
         return anonymized
 
-    def evaluate(
+    async def evaluate(
         self,
         sim_result: SimulationResult,
         real_threads: list[Thread],
@@ -339,17 +345,28 @@ class MetricsAggregator:
                 if m.metadata.get("constraint_forced", False)
             ]
 
-            pooled_metrics = LinguisticMetrics.compute(
+            # Speech act classification: local RoBERTa model is the primary
+            # path (fast, free). LLM classifier is an optional upgrade when
+            # the caller explicitly requests higher quality via
+            # llm_client + llm_model_name.
+            classifier = None
+            if self._llm_client is not None and self._llm_model_name is not None:
+                from src.evaluation.linguistics import LLMSpeechActClassifier
+                classifier = LLMSpeechActClassifier(self._llm_client, self._llm_model_name)
+
+            pooled_metrics = await LinguisticMetrics.compute(
                 sim_messages=sim_msg_objects,
                 real_messages=all_real_msgs,
+                classifier=classifier,
             )
             all_metrics.update(pooled_metrics)
 
             # Headline stratum: normal (non-safe-template) outputs.
             if sim_normal:
-                normal_metrics = LinguisticMetrics.compute(
+                normal_metrics = await LinguisticMetrics.compute(
                     sim_messages=sim_normal,
                     real_messages=all_real_msgs,
+                    classifier=classifier,
                 )
                 for k, v in normal_metrics.items():
                     all_metrics[f"{k}_normal"] = v
@@ -359,33 +376,22 @@ class MetricsAggregator:
             all_metrics["linguistics_safe_template_count"] = float(len(sim_safe))
             all_metrics["linguistics_normal_count"] = float(len(sim_normal))
             if sim_safe:
-                safe_metrics = LinguisticMetrics.compute(
+                safe_metrics = await LinguisticMetrics.compute(
                     sim_messages=sim_safe,
                     real_messages=all_real_msgs,
+                    classifier=classifier,
                 )
                 for k, v in safe_metrics.items():
                     all_metrics[f"{k}_safe_template"] = v
         except Exception as e:
             logger.warning(f"LinguisticMetrics computation failed: {e}")
 
-        # Layer 5: Predictive
-        held_out_events: list | None = None
-        try:
-            held_out_events = self._load_held_out_events(sim_result.dataset)
-            pred_result = PredictiveMetrics.compute(
-                sim_messages=sim_messages,
-                real_messages=real_messages,
-                held_out_events=held_out_events,
-            )
-            # Flatten nested prediction task dicts with prefixes
-            for task_name, task_metrics in pred_result.items():
-                if isinstance(task_metrics, dict):
-                    for metric_name, value in task_metrics.items():
-                        all_metrics[f"pred_{task_name}_{metric_name}"] = value
-                else:
-                    all_metrics[f"pred_{task_name}"] = task_metrics
-        except Exception as e:
-            logger.warning(f"PredictiveMetrics computation failed: {e}")
+        # Predictive fidelity layer removed — regex-based event detection
+        # was unreliable (precision/recall both low, context-blind keyword
+        # matching). CGA corpus provides gold-standard
+        # ``conversation_has_personal_attack`` labels; a future replacement
+        # should use those directly instead of train-on-sim/test-on-real
+        # prediction with heuristic labels. See memory/predictive-fidelity-cga-fix.md.
 
         # Enforcement stats
         if sim_result.enforcement_stats:
@@ -400,10 +406,7 @@ class MetricsAggregator:
             repeat=sim_result.repeat,
             metrics=all_metrics,
             used_role_label_proxy=sim_result.dataset in self.datasets_using_role_label_proxy,
-            used_held_out_events_heuristic=(
-                held_out_events is None
-                or all_metrics.get("pred_predictive_fidelity", 1.0) == 0.0
-            ),
+            used_held_out_events_heuristic=False,
             model_snapshot_date=self.model_provenance.get(sim_result.model, {}).get("snapshot_date", ""),
             model_commit_hash=self.model_provenance.get(sim_result.model, {}).get("commit_hash", ""),
         )

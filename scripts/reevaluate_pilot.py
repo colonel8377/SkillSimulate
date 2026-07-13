@@ -144,7 +144,7 @@ async def main() -> None:
             sim_result.repeat = repeat
 
             # Evaluate
-            report = aggregator.evaluate(sim_result, threads)
+            report = await aggregator.evaluate(sim_result, threads)
             result = report.to_dict()
 
             # Save

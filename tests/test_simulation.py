@@ -66,7 +66,7 @@ def test_user_features():
     assert "user1" in features
     assert features["user1"].message_count == 5
     vec = features["user1"].to_vector()
-    assert len(vec) == 4
+    assert len(vec) == 13
 
 
 def test_expression_dna():
@@ -425,7 +425,7 @@ def test_g8_proxy_fallback_summary():
     assert summary["release_ready"] is False
 
 
-def test_g8_evaluate_survives_held_out_events_load_failure():
+async def test_g8_evaluate_survives_held_out_events_load_failure():
     """Regression: if _load_held_out_events throws, evaluate() must still
     construct a MetricsReport (held_out_events is referenced at report-build
     time, so it must be pre-initialized to None outside the try)."""
@@ -466,8 +466,9 @@ def test_g8_evaluate_survives_held_out_events_load_failure():
     agg._load_held_out_events = boom
 
     # Must not raise
-    report = agg.evaluate(sim_result, real_threads)
-    assert report.used_held_out_events_heuristic is True
+    report = await agg.evaluate(sim_result, real_threads)
+    # Predictive layer removed; heuristic flag always False now
+    assert report.used_held_out_events_heuristic is False
     assert report.used_role_label_proxy is True  # no role_labels dir configured
 
 

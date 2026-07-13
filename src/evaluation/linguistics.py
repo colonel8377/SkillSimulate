@@ -10,18 +10,100 @@ Plus SIP (Semantic Information Preservation) via Sentence-BERT cosine.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import re
+from typing import TYPE_CHECKING
 
 import numpy as np
+from loguru import logger
 
 from src.data.schemas import Message
 
+if TYPE_CHECKING:
+    from src.llm.client import LLMClient
+
 
 # ---------------------------------------------------------------------------
-# Discourse markers — orthogonal to Expression DNA lexicons
-# (Expression DNA uses: CERTAIN_WORDS, HEDGE_WORDS, TRANSITION_WORDS,
-#  FIRST_PERSON_PRONOUNS, ACADEMIC_WORDS, ANALOGY_MARKERS)
+# Discourse relation classification via PDTB2 model
+# Replaces sparse DISCOURSE_MARKERS lexicon (<0.3% coverage → ≈0.97 always).
+# Uses murathankurfali/bert-large-uncased-pdtb2-explicit-four-way
+# 4 classes: Comparison, Contingency, Expansion, Temporal
 # ---------------------------------------------------------------------------
+_PDTB_CATEGORIES = ("Comparison", "Contingency", "Expansion", "Temporal")
+
+_pdtb_pipeline = None
+
+
+def _get_pdtb_pipeline():
+    """Lazy-load the PDTB2 discourse relation classifier."""
+    global _pdtb_pipeline
+    if _pdtb_pipeline is not None:
+        return _pdtb_pipeline
+    try:
+        from transformers import pipeline as hf_pipeline
+        import torch
+        device = 0 if torch.cuda.is_available() else -1
+        _pdtb_pipeline = hf_pipeline(
+            "text-classification",
+            model="murathankurfali/bert-large-uncased-pdtb2-explicit-four-way",
+            device=device,
+        )
+        logger.info(
+            f"PDTB2 discourse relation classifier loaded (device={device})"
+        )
+    except Exception as e:
+        logger.warning(
+            f"Failed to load PDTB2 discourse model: {e}. "
+            f"Discourse relation metrics will be unavailable."
+        )
+        _pdtb_pipeline = False  # sentinel: tried and failed
+    return _pdtb_pipeline
+
+
+def discourse_relation_distribution(messages: list[Message]) -> dict[str, float]:
+    """Compute proportion of each PDTB2 discourse relation category.
+
+    Uses BERT-large classifier instead of sparse lexicon.
+    Returns dict with keys: Comparison, Contingency, Expansion, Temporal.
+    Values are fraction of total messages.
+    """
+    pipe = _get_pdtb_pipeline()
+    if pipe is False or pipe is None:
+        return {cat: 0.25 for cat in _PDTB_CATEGORIES}
+
+    if not messages:
+        return {cat: 0.0 for cat in _PDTB_CATEGORIES}
+
+    texts = [m.text for m in messages if m.text.strip()]
+    if not texts:
+        return {cat: 0.0 for cat in _PDTB_CATEGORIES}
+
+    try:
+        results = pipe(texts, batch_size=64, truncation=True, max_length=512)
+    except Exception as e:
+        logger.warning(f"PDTB2 batch classification failed: {e}")
+        return {cat: 0.25 for cat in _PDTB_CATEGORIES}
+
+    counts = {cat: 0 for cat in _PDTB_CATEGORIES}
+    for r in results:
+        label = r["label"]
+        if label in counts:
+            counts[label] += 1
+        else:
+            # Map lowercase or partial matches
+            for cat in _PDTB_CATEGORIES:
+                if cat.lower() == label.lower():
+                    counts[cat] += 1
+                    break
+
+    total = sum(counts.values()) or 1
+    return {cat: count / total for cat, count in counts.items()}
+
+
+# Keep DISCOURSE_MARKERS for orthogonality verification (G9) only.
+# Not used for the main discourse_marker_match metric anymore.
 DISCOURSE_MARKERS = {
     "fillers": {
         "well", "okay", "right", "basically", "literally",
@@ -42,91 +124,217 @@ DISCOURSE_MARKERS = {
 }
 
 # ---------------------------------------------------------------------------
-# Sentiment lexicon — simple positive/negative word lists
-# (No overlap with Expression DNA lexicons by construction)
+# Speech act cues — DELETED: regex patterns removed 2026-07-13.
+# Context-blind regex cannot reliably infer speech act category.
+# LLM classifier is the primary path; fallback returns "assertive".
 # ---------------------------------------------------------------------------
-POSITIVE_WORDS = {
-    "good", "great", "excellent", "wonderful", "amazing", "fantastic",
-    "love", "happy", "glad", "pleased", "support", "agree", "correct",
-    "true", "beneficial", "positive", "useful", "effective", "helpful",
-    "valuable", "important", "success", "win", "better", "best",
-    "improve", "benefit", "advantage", "appreciate", "commend",
-}
-NEGATIVE_WORDS = {
-    "bad", "terrible", "horrible", "awful", "wrong", "false", "incorrect",
-    "harmful", "negative", "useless", "ineffective", "unhelpful",
-    "damaging", "problem", "issue", "fail", "worse", "worst", "broken",
-    "flawed", "bias", "unfair", "hate", "angry", "sad", "disappointed",
-    "frustrated", "concern", "worry", "threat", "risk", "danger",
-}
+
+
 
 # ---------------------------------------------------------------------------
-# Speech act cues — structural surface-form patterns
+# LLM-based speech act classification (replaces context-blind regex)
 # ---------------------------------------------------------------------------
-_COMMISSIVE_PATTERNS = re.compile(
-    r"\b(?:i\s+(?:will|won't|ll|shall|promise|agree|plan|intend|commit|volunteer)|let's|we\s+(?:will|shall))\b",
-    re.IGNORECASE,
-)
-_BASE_VERBS_LEAD = re.compile(
-    r"^(?:do|don't|stop|start|begin|let|give|take|make|go|come|try|consider|"
-    r"look|check|see|think|wait|remember|note|keep|put|use|ensure|verify|"
-    r"fix|add|remove|change|update|create|delete|open|close|read|write)\b",
-    re.IGNORECASE,
-)
+_SPEECH_ACT_CATEGORIES = ("assertive", "directive", "commissive", "expressive")
 
+# Mapping from quantor-project/speech-act-classification 8-class labels
+# to our 4-class taxonomy:
+#   <com> = commissive, <dec> = declarative→assertive, <dir> = directive,
+#   <exp> = expressive, <icu> = indirect request→directive,
+#   <rep> = representative→assertive, <soc> = social→expressive,
+#   <xpa> = expressive-assertive→expressive
+_QUANTOR_TO_FOUR: dict[str, str] = {
+    "<com>": "commissive",
+    "<dec>": "assertive",
+    "<dir>": "directive",
+    "<exp>": "expressive",
+    "<icu>": "directive",
+    "<rep>": "assertive",
+    "<soc>": "expressive",
+    "<xpa>": "expressive",
+}
+
+_SPEECH_ACT_PROMPT = """Classify each message into exactly one speech act category.
+
+Categories:
+- assertive: statements of fact, belief, or description (e.g. "The data shows X", "I think that")
+- directive: requests, commands, questions (e.g. "Please review", "Can you check?", "Fix the bug")
+- commissive: commitments to future action (e.g. "I will fix it", "We plan to release tomorrow")
+- expressive: emotional reactions, greetings, thanks (e.g. "Great job!", "Thanks!", "Ugh")
+
+Messages:
+{messages_json}
+
+Respond with a JSON array of category strings, one per message, in order.
+Example: ["assertive", "directive", "commissive", "expressive"]"""
+
+
+class LLMSpeechActClassifier:
+    """Optional LLM-based speech act classification (upgrade over local model).
+
+    Use when higher accuracy justifies API cost. The default path uses
+    a local RoBERTa model (quantor-project/speech-act-classification)
+    which is fast, free, and sufficient for most evaluation needs.
+    """
+
+    def __init__(self, llm_client: LLMClient, model_name: str, batch_size: int = 20):
+        self._client = llm_client
+        self._model = model_name
+        self._batch_size = batch_size
+        self._cache: dict[str, str] = {}
+
+    async def classify_batch(self, messages: list[Message]) -> list[str]:
+        """Classify messages into speech act categories.
+
+        Returns list of category strings in same order as input.
+        Uses LLM batch calls (batch_size msgs/call), falls back to
+        local RoBERTa classifier on failure.
+        """
+        results: list[str | None] = [None] * len(messages)
+        uncached_indices: list[int] = []
+        uncached_texts: list[str] = []
+
+        for i, msg in enumerate(messages):
+            key = hashlib.sha256(msg.text.encode()).hexdigest()
+            if key in self._cache:
+                results[i] = self._cache[key]
+            else:
+                uncached_indices.append(i)
+                uncached_texts.append(msg.text)
+
+        # Batch-classify uncached messages
+        for start in range(0, len(uncached_texts), self._batch_size):
+            batch_slice = slice(start, start + self._batch_size)
+            batch_indices = uncached_indices[batch_slice]
+            batch_texts = uncached_texts[batch_slice]
+            categories = await self._llm_classify(batch_texts)
+
+            for idx, text, cat in zip(batch_indices, batch_texts, categories):
+                results[idx] = cat
+                key = hashlib.sha256(text.encode()).hexdigest()
+                self._cache[key] = cat
+
+        # Fill any remaining None with local RoBERTa fallback
+        for i in range(len(results)):
+            if results[i] is None:
+                results[i] = _speech_act_local(messages[i].text)
+
+        return results  # type: ignore[return-value]
+
+    async def _llm_classify(self, texts: list[str]) -> list[str]:
+        """Call LLM to classify a batch of texts."""
+        numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
+        prompt = _SPEECH_ACT_PROMPT.format(messages_json=numbered)
+
+        try:
+            result = await self._client.chat_completion_json(
+                messages=[{"role": "user", "content": prompt}],
+                model_name=self._model,
+                temperature=0.0,
+                max_tokens=1024,
+                default=None,
+            )
+            if isinstance(result, list) and len(result) == len(texts):
+                valid = [r for r in result if r in _SPEECH_ACT_CATEGORIES]
+                if len(valid) == len(texts):
+                    return valid
+        except Exception:
+            pass
+
+        # Fallback: local RoBERTa classifier
+        return [_speech_act_local(t) for t in texts]
+
+
+# ---------------------------------------------------------------------------
+# Local RoBERTa speech act classifier (fallback when LLM unavailable)
+# Uses quantor-project/speech-act-classification (8-class RoBERTa-base)
+# mapped to our 4-class taxonomy.
+# ---------------------------------------------------------------------------
+
+_local_speech_act_pipeline = None
+
+
+def _get_local_speech_act_pipeline():
+    """Lazy-load the local speech act classification pipeline."""
+    global _local_speech_act_pipeline
+    if _local_speech_act_pipeline is not None:
+        return _local_speech_act_pipeline
+    try:
+        from transformers import pipeline as hf_pipeline
+        import torch
+        device = 0 if torch.cuda.is_available() else -1
+        _local_speech_act_pipeline = hf_pipeline(
+            "text-classification",
+            model="quantor-project/speech-act-classification",
+            device=device,
+        )
+        logger.info(
+            f"Local speech act classifier loaded "
+            f"(quantor-project/speech-act-classification, device={device})"
+        )
+    except Exception as e:
+        logger.warning(
+            f"Failed to load local speech act model: {e}. "
+            f"Will return 'assertive' as neutral default."
+        )
+        _local_speech_act_pipeline = False  # sentinel: tried and failed
+    return _local_speech_act_pipeline
+
+
+def _speech_act_local(text: str) -> str:
+    """Local RoBERTa speech act classification.
+
+    Falls back to "assertive" only if model load fails entirely.
+    """
+    pipe = _get_local_speech_act_pipeline()
+    if pipe is False or pipe is None:
+        return "assertive"
+    try:
+        result = pipe(text, truncation=True, max_length=512)
+        label = result[0]["label"]
+        return _QUANTOR_TO_FOUR.get(label, "assertive")
+    except Exception:
+        return "assertive"
+
+
+def _speech_act_fallback(text: str) -> str:
+    """Deprecated: use _speech_act_local instead."""
+    return _speech_act_local(text)
 
 def discourse_marker_distribution(messages: list[Message]) -> dict[str, float]:
-    """Compute proportion of each discourse marker category.
+    """Compute proportion of each PDTB2 discourse relation category.
 
-    Returns dict with keys: fillers, stallers, evidentials, hedges_interactional.
-    Values are fraction of total tokens.
+    Delegates to discourse_relation_distribution (PDTB2 classifier).
+    Kept for backward compatibility with orthogonality verifier (G9).
     """
-    all_tokens = []
-    for msg in messages:
-        tokens = re.findall(r"\b\w+\b", msg.text.lower())
-        all_tokens.extend(tokens)
-
-    if not all_tokens:
-        return {cat: 0.0 for cat in DISCOURSE_MARKERS}
-
-    total = len(all_tokens)
-    dist = {}
-    for cat, words in DISCOURSE_MARKERS.items():
-        count = sum(1 for t in all_tokens if t in words)
-        dist[cat] = count / total
-
-    return dist
+    return discourse_relation_distribution(messages)
 
 
-def discourse_marker_match(
+def discourse_relation_match(
     sim_messages: list[Message],
     real_messages: list[Message],
 ) -> float:
-    """Jensen-Shannon similarity of discourse-marker *composition*.
+    """Jensen-Shannon similarity of discourse *relation* composition.
 
-    Both sets' per-category marker rates are normalised over the
-    discourse-marker categories into proper probability distributions, then
-    JS-divergence = 0.5·KL(P‖M) + 0.5·KL(Q‖M) (M = (P+Q)/2) is computed by
-    SUMMING the per-category contributions. The previous implementation
-    averaged half-contributions over un-normalised rates — neither standard
-    JS nor scale-comparable — which compressed absolute scores toward 1.
+    Uses PDTB2 BERT-large classifier instead of sparse lexicon.
+    Both sets' per-category relation rates are normalised into proper
+    probability distributions, then JS-divergence is computed.
 
-    Returns score in [0, 1]. 1 = identical marker-type composition; 0.0 only
-    when exactly one side has no discourse markers at all.
+    Returns score in [0, 1]. 1 = identical relation composition; 0.0 only
+    when exactly one side has no classified relations at all.
     """
-    sim_dist = discourse_marker_distribution(sim_messages)
-    real_dist = discourse_marker_distribution(real_messages)
-    cats = list(DISCOURSE_MARKERS.keys())
+    sim_dist = discourse_relation_distribution(sim_messages)
+    real_dist = discourse_relation_distribution(real_messages)
+    cats = list(_PDTB_CATEGORIES)
 
     p = np.array([sim_dist.get(c, 0.0) for c in cats], dtype=float)
     q = np.array([real_dist.get(c, 0.0) for c in cats], dtype=float)
     p_sum = float(p.sum())
     q_sum = float(q.sum())
 
-    # Both marker-free → compositions trivially identical.
+    # Both zero → compositions trivially identical.
     if p_sum <= 0.0 and q_sum <= 0.0:
         return 1.0
-    # One marker-free, the other not → no compositional overlap.
+    # One zero, the other not → no compositional overlap.
     if p_sum <= 0.0 or q_sum <= 0.0:
         return 0.0
 
@@ -143,17 +351,158 @@ def discourse_marker_match(
     return float(1.0 / (1.0 + js))
 
 
-def _per_message_sentiment(text: str) -> float:
-    """Simple lexicon-based sentiment score per message.
+# Backward-compatible alias
+discourse_marker_match = discourse_relation_match
 
-    Returns value in [-1, 1].
+
+# ---------------------------------------------------------------------------
+# RoBERTa-based sentiment classification (replaces lexicon)
+# Uses cardiffnlp/twitter-roberta-base-sentiment-latest for contextual
+# scoring with negation awareness. Falls back to VADER if model load fails.
+# ---------------------------------------------------------------------------
+
+class RoBERTaSentimentClassifier:
+    """Batch sentiment scoring via cardiffnlp RoBERTa, with VADER fallback."""
+
+    def __init__(self, device: int | None = None):
+        self._pipeline = None
+        self._vader = None
+        self._device = device
+        self._cache: dict[str, float] = {}
+
+    def _ensure_pipeline(self):
+        """Lazy-load the RoBERTa pipeline on GPU."""
+        if self._pipeline is not None:
+            return
+        try:
+            from transformers import pipeline as hf_pipeline
+            import torch
+            device = self._device
+            if device is None:
+                device = 0 if torch.cuda.is_available() else -1
+            self._pipeline = hf_pipeline(
+                "sentiment-analysis",
+                model="cardiffnlp/twitter-roberta-base-sentiment-latest",
+                device=device,
+            )
+            logger.info(
+                f"RoBERTaSentimentClassifier loaded on device={device}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to load RoBERTa sentiment model: {e}. "
+                f"Falling back to VADER."
+            )
+            self._pipeline = None
+            self._ensure_vader()
+
+    def _ensure_vader(self):
+        """Lazy-load VADER as fallback."""
+        if self._vader is not None:
+            return
+        try:
+            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+            self._vader = SentimentIntensityAnalyzer()
+            logger.info("VADER sentiment fallback loaded")
+        except ImportError:
+            logger.warning("VADER not available; sentiment will return 0.0")
+            self._vader = None
+
+    def score_batch(self, texts: list[str]) -> list[float]:
+        """Score a batch of texts, returning values in [-1, 1].
+
+        Uses RoBERTa pipeline with GPU batching if available,
+        else VADER, else returns 0.0 for all.
+        """
+        self._ensure_pipeline()
+        results: list[float] = [0.0] * len(texts)
+
+        # Check cache
+        uncached_indices: list[int] = []
+        uncached_texts: list[str] = []
+        for i, text in enumerate(texts):
+            key = hashlib.sha256(text.encode()).hexdigest()
+            if key in self._cache:
+                results[i] = self._cache[key]
+            else:
+                uncached_indices.append(i)
+                uncached_texts.append(text)
+
+        if not uncached_texts:
+            return results
+
+        if self._pipeline is not None:
+            try:
+                batch_results = self._pipeline(
+                    uncached_texts, batch_size=64, truncation=True, max_length=512
+                )
+                for idx, text, r in zip(uncached_indices, uncached_texts, batch_results):
+                    label = r["label"]
+                    prob = r["score"]
+                    # Map 3-class to continuous [-1, +1]:
+                    # positive → +prob, negative → -prob, neutral → 0
+                    if label == "positive":
+                        score = prob
+                    elif label == "negative":
+                        score = -prob
+                    else:  # neutral
+                        score = 0.0
+                    results[idx] = score
+                    key = hashlib.sha256(text.encode()).hexdigest()
+                    self._cache[key] = score
+            except Exception as e:
+                logger.warning(
+                    f"RoBERTa batch failed ({type(e).__name__}), "
+                    f"falling back to VADER for {len(uncached_texts)} texts"
+                )
+                self._pipeline = None  # don't retry neural; go straight to VADER
+                self._ensure_vader()
+                for idx, text in zip(uncached_indices, uncached_texts):
+                    scores = self._vader.polarity_scores(text)
+                    results[idx] = scores["compound"]
+                    key = hashlib.sha256(text.encode()).hexdigest()
+                    self._cache[key] = scores["compound"]
+        elif self._vader is not None:
+            for idx, text in zip(uncached_indices, uncached_texts):
+                scores = self._vader.polarity_scores(text)
+                results[idx] = scores["compound"]
+                key = hashlib.sha256(text.encode()).hexdigest()
+                self._cache[key] = scores["compound"]
+        else:
+            # No classifier available — return 0.0 (neutral)
+            for idx, text in zip(uncached_indices, uncached_texts):
+                key = hashlib.sha256(text.encode()).hexdigest()
+                self._cache[key] = 0.0
+
+        return results
+
+    def score(self, text: str) -> float:
+        """Score a single text in [-1, 1]."""
+        return self.score_batch([text])[0]
+
+
+# Singleton classifier — loaded once, reused across calls
+_sentiment_classifier: RoBERTaSentimentClassifier | None = None
+
+
+def get_sentiment_classifier(device: int | None = None) -> RoBERTaSentimentClassifier:
+    """Get or create the global sentiment classifier."""
+    global _sentiment_classifier
+    if _sentiment_classifier is None:
+        _sentiment_classifier = RoBERTaSentimentClassifier(device=device)
+    return _sentiment_classifier
+
+
+def _per_message_sentiment(text: str) -> float:
+    """Context-aware sentiment score per message.
+
+    Returns value in [-1, 1]. Uses RoBERTa (GPU) by default,
+    falls back to VADER if model load fails.
     """
-    tokens = re.findall(r"\b\w+\b", text.lower())
-    if not tokens:
+    if not text.strip():
         return 0.0
-    pos = sum(1 for t in tokens if t in POSITIVE_WORDS)
-    neg = sum(1 for t in tokens if t in NEGATIVE_WORDS)
-    return (pos - neg) / len(tokens)
+    classifier = get_sentiment_classifier()
+    return classifier.score(text)
 
 
 def sentiment_trajectory_shape(messages: list[Message]) -> dict[str, float]:
@@ -164,7 +513,10 @@ def sentiment_trajectory_shape(messages: list[Message]) -> dict[str, float]:
     if len(messages) < 2:
         return {"variance": 0.0, "trend_slope": 0.0, "oscillation_freq": 0.0, "range": 0.0}
 
-    scores = np.array([_per_message_sentiment(m.text) for m in messages])
+    # Batch score for efficiency (GPU batching)
+    texts = [m.text for m in messages]
+    classifier = get_sentiment_classifier()
+    scores = np.array(classifier.score_batch(texts))
 
     variance = float(np.var(scores))
 
@@ -214,59 +566,62 @@ def sentiment_trajectory_similarity(
     return max(0.0, (cosine + 1.0) / 2.0)
 
 
-def speech_act_ratio(messages: list[Message]) -> dict[str, float]:
+async def speech_act_ratio(
+    messages: list[Message],
+    classifier: LLMSpeechActClassifier | None = None,
+) -> dict[str, float]:
     """Classify messages into speech act categories.
 
     Categories: assertive, directive, commissive, expressive.
     Returns proportion of each category.
+    Primary: local RoBERTa model (fast, free, no API).
+    Optional: LLM classifier for higher quality (slower, costs API calls).
     """
     if not messages:
         return {"assertive": 0.25, "directive": 0.25, "commissive": 0.25, "expressive": 0.25}
 
     counts = {"assertive": 0, "directive": 0, "commissive": 0, "expressive": 0}
 
-    for msg in messages:
-        text = msg.text.strip()
-        if not text:
-            counts["assertive"] += 1
-            continue
-
-        # Expressive: exclamations
-        if text.endswith("!") or text.endswith("!!"):
-            counts["expressive"] += 1
-            continue
-
-        # Directive: questions or imperatives
-        if text.endswith("?"):
-            counts["directive"] += 1
-            continue
-
-        if _BASE_VERBS_LEAD.match(text):
-            counts["directive"] += 1
-            continue
-
-        # Commissive: first-person commitment
-        if _COMMISSIVE_PATTERNS.search(text):
-            counts["commissive"] += 1
-            continue
-
-        # Default: assertive
-        counts["assertive"] += 1
+    if classifier is not None:
+        # LLM path: higher quality, slower, costs API calls
+        categories = await classifier.classify_batch(messages)
+        for cat in categories:
+            counts[cat] += 1
+    else:
+        # Primary path: local RoBERTa model (fast, free)
+        # Batch classify for efficiency
+        pipe = _get_local_speech_act_pipeline()
+        if pipe is not False and pipe is not None:
+            texts = [m.text for m in messages]
+            try:
+                results = pipe(texts, batch_size=64, truncation=True, max_length=512)
+                for r in results:
+                    cat = _QUANTOR_TO_FOUR.get(r["label"], "assertive")
+                    counts[cat] += 1
+            except Exception:
+                for msg in messages:
+                    cat = _speech_act_local(msg.text)
+                    counts[cat] += 1
+        else:
+            for msg in messages:
+                cat = _speech_act_local(msg.text)
+                counts[cat] += 1
 
     total = sum(counts.values())
     return {cat: count / total for cat, count in counts.items()}
 
 
-def speech_act_similarity(
+async def speech_act_similarity(
     sim_messages: list[Message],
     real_messages: list[Message],
+    classifier: LLMSpeechActClassifier | None = None,
 ) -> float:
     """Similarity of speech act distributions (1 - normalized L1 distance).
 
     Returns score in [0, 1]. 1 = identical distributions.
     """
-    sim_acts = speech_act_ratio(sim_messages)
-    real_acts = speech_act_ratio(real_messages)
+    sim_acts = await speech_act_ratio(sim_messages, classifier=classifier)
+    real_acts = await speech_act_ratio(real_messages, classifier=classifier)
 
     cats = set(sim_acts) | set(real_acts)
     l1 = sum(abs(sim_acts.get(c, 0.0) - real_acts.get(c, 0.0)) for c in cats)
@@ -399,14 +754,15 @@ class LinguisticMetrics:
     """
 
     @staticmethod
-    def compute(
+    async def compute(
         sim_messages: list[Message],
         real_messages: list[Message],
+        classifier: LLMSpeechActClassifier | None = None,
     ) -> dict[str, float]:
         result = {
-            "discourse_marker_match": discourse_marker_match(sim_messages, real_messages),
+            "discourse_relation_match": discourse_relation_match(sim_messages, real_messages),
             "sentiment_trajectory_similarity": sentiment_trajectory_similarity(sim_messages, real_messages),
-            "speech_act_similarity": speech_act_similarity(sim_messages, real_messages),
+            "speech_act_similarity": await speech_act_similarity(sim_messages, real_messages, classifier=classifier),
         }
         try:
             result["sip"] = semantic_information_preservation(sim_messages, real_messages)
@@ -554,21 +910,13 @@ def verify_orthogonality_to_expression_dna(
 def _speech_act_assertive_proxy(text: str) -> float:
     """Single-value proxy for speech-act distribution used in orthogonality check.
 
-    Returns the assertive bias of the message: 0 if the message triggers a
-    directive / commissive / expressive cue, 1 if it falls through to the
-    assertive default. This mirrors ``speech_act_ratio``'s classification
-    priority without expanding to a 4-vector (sufficient for a correlation
-    sanity check).
+    Returns the assertive bias of the message: punctuation-only heuristic
+    (structural, not regex-based). 0 if the message ends with ? or !
+    (likely directive/expressive), 1 otherwise (assertive default).
     """
     text_s = text.strip()
     if not text_s:
         return 1.0
-    if text_s.endswith("!") or text_s.endswith("!!"):
-        return 0.0
-    if text_s.endswith("?"):
-        return 0.0
-    if _BASE_VERBS_LEAD.match(text_s):
-        return 0.0
-    if _COMMISSIVE_PATTERNS.search(text_s):
+    if text_s.endswith("!") or text_s.endswith("?"):
         return 0.0
     return 1.0

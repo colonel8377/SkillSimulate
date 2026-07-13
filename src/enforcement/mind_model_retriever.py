@@ -8,45 +8,136 @@ dialogue state:
   - topic domain (extracted keywords)
 
 Relevance = Sentence-BERT cosine similarity between a dialogue-state query
-and each mind model's (name + description + application) document, plus a
-keyword-overlap bonus for stance/conflict alignment.
+and each mind model's (name + description + application) document.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from src.skill.schema import MindModel
 
+if TYPE_CHECKING:
+    from src.llm.client import LLMClient
 
-# Keyword lexicons for dialogue-state inference
-_SUPPORTIVE_WORDS = {
-    "agree", "agreeing", "agreed", "support", "supporting", "true", "correct",
-    "right", "exactly", "absolutely", "indeed", "concur", "endorse", "delta",
-    "convinced", "persuaded", "fair point", "good point",
-}
-_OPPOSITIONAL_WORDS = {
-    "disagree", "disagreeing", "disagree", "wrong", "incorrect", "false",
-    "no", "not", "however", "but", "counter", "rebut", "refute", "oppose",
-    "object", "challenge", "dispute", "contradict", "flawed", "mistake",
-}
-_CONFLICT_WORDS = {
-    "attack", "insult", "hostile", "angry", "frustrated", "ridiculous",
-    "stupid", "ignorant", "troll", "ban", "report", "revert", "vandal",
-    "threaten", "abuse", "harass", "offensive",
-}
-_CONSENSUS_WORDS = {
-    "consensus", "compromise", "middle ground", "common ground", "agree to",
-    "settle", "mediate", "reconcile", "bridge", "accommodate",
-}
+
+# DELETED 2026-07-13: _SUPPORTIVE_WORDS, _OPPOSITIONAL_WORDS,
+# _CONFLICT_WORDS, _CONSENSUS_WORDS keyword lexicons.
+# Context-blind word-lists cannot reliably infer dialogue state.
+# LLM classifier is the primary path; fallback returns neutral.
 
 # How many recent messages to scan for dialogue-state inference
 _CONTEXT_WINDOW = 8
 
+
+
+# ---------------------------------------------------------------------------
+# LLM-based dialogue state classification (replaces context-blind word-lists)
+# ---------------------------------------------------------------------------
+_DIALOGUE_STATE_PROMPT = """Analyze the following recent dialogue messages and classify the dialogue state.
+
+Respond with a JSON object with these fields:
+- "stance": one of "supportive", "oppositional", "neutral"
+- "conflict_intensity": a float between 0.0 and 1.0
+- "is_consensus_seeking": true or false
+
+Recent messages:
+{messages_text}"""
+
+
+class LLMDialogueStateClassifier:
+    """LLM-based dialogue state classification with neutral fallback."""
+
+    def __init__(self, llm_client: LLMClient, model_name: str):
+        self._client = llm_client
+        self._model = model_name
+
+    async def classify(self, messages: list[dict[str, str]]) -> DialogueState:
+        """Classify dialogue state from recent messages via LLM.
+
+        Falls back to neutral DialogueState on LLM failure.
+        """
+        recent = [m for m in messages if m.get("content", "").strip()][-_CONTEXT_WINDOW:]
+        if not recent:
+            return DialogueState(
+                stance="neutral",
+                conflict_intensity=0.0,
+                topic="",
+                is_consensus_seeking=False,
+            )
+
+        messages_text = "\n".join(
+            f"- {m.get('role', 'user')}: {m.get('content', '')}"
+            for m in recent
+        )
+        prompt = _DIALOGUE_STATE_PROMPT.format(messages_text=messages_text)
+
+        try:
+            result = await self._client.chat_completion_json(
+                messages=[{"role": "user", "content": prompt}],
+                model_name=self._model,
+                temperature=0.0,
+                max_tokens=256,
+                default=None,
+            )
+            if isinstance(result, dict):
+                stance = result.get("stance", "neutral")
+                if stance not in ("supportive", "oppositional", "neutral"):
+                    stance = "neutral"
+                conflict = result.get("conflict_intensity", 0.0)
+                if not isinstance(conflict, (int, float)):
+                    conflict = 0.0
+                conflict = max(0.0, min(1.0, float(conflict)))
+                consensus = result.get("is_consensus_seeking", False)
+                if not isinstance(consensus, bool):
+                    consensus = False
+                # topic extraction stays regex-based (structural)
+                topic = _extract_topic_fallback(messages)
+                return DialogueState(
+                    stance=stance,
+                    conflict_intensity=conflict,
+                    topic=topic,
+                    is_consensus_seeking=consensus,
+                )
+        except Exception:
+            pass
+
+        # Fallback to word-list heuristic
+        return _dialogue_state_fallback(messages)
+
+
+def _extract_topic_fallback(messages: list[dict[str, str]]) -> str:
+    """Extract topic from messages — delegates to MindModelRetriever._extract_topic."""
+    return MindModelRetriever._extract_topic(messages)
+
+
+_dialogue_state_fallback_warned: bool = False
+
+
+def _dialogue_state_fallback(messages: list[dict[str, str]]) -> DialogueState:
+    """Neutral default when LLM classifier unavailable.
+
+    Returns neutral stance, zero conflict, no consensus seeking.
+    Does not attempt context-blind keyword inference.
+    """
+    global _dialogue_state_fallback_warned
+    if not _dialogue_state_fallback_warned:
+        from loguru import logger
+        logger.warning(
+            "Dialogue state fallback used — LLM classifier unavailable. "
+            "Returning neutral state."
+        )
+        _dialogue_state_fallback_warned = True
+    topic = _extract_topic_fallback(messages)
+    return DialogueState(
+        stance="neutral",
+        conflict_intensity=0.0,
+        topic=topic,
+        is_consensus_seeking=False,
+    )
 
 @dataclass
 class DialogueState:
@@ -69,11 +160,20 @@ class DialogueState:
 class MindModelRetriever:
     """Dynamic top-k retrieval of Mind Models given dialogue state."""
 
-    def __init__(self, top_k: int = 5):
+    def __init__(
+        self,
+        top_k: int = 5,
+        llm_client: LLMClient | None = None,
+        model_name: str | None = None,
+    ):
         self.top_k = max(1, top_k)
         self._embedder = None
         # Cache: mind model doc string -> embedding (doc is stable per model)
         self._doc_cache: dict[str, np.ndarray] = {}
+        # LLM-based dialogue state classifier (optional)
+        self._llm_classifier: LLMDialogueStateClassifier | None = None
+        if llm_client is not None and model_name is not None:
+            self._llm_classifier = LLMDialogueStateClassifier(llm_client, model_name)
 
     @property
     def embedder(self):
@@ -86,40 +186,14 @@ class MindModelRetriever:
     # Dialogue-state inference
     # ------------------------------------------------------------------
 
-    def infer_dialogue_state(self, messages: list[dict[str, str]]) -> DialogueState:
-        """Infer stance / conflict intensity / topic from recent messages."""
-        recent = [m for m in messages if m.get("content", "").strip()][-_CONTEXT_WINDOW:]
-        text = " ".join(m.get("content", "") for m in recent).lower()
-        # Word-level token set (punctuation-stripped) so the lexicon checks
-        # below are whole-word membership, not substring — otherwise
-        # "support" matches "supportive", "agree" matches "disagree", etc.
-        tokens = set(re.findall(r"\w+", text))
+    async def infer_dialogue_state(self, messages: list[dict[str, str]]) -> DialogueState:
+        """Infer stance / conflict intensity / topic from recent messages.
 
-        n_support = sum(1 for w in _SUPPORTIVE_WORDS if w in tokens)
-        n_oppose = sum(1 for w in _OPPOSITIONAL_WORDS if w in tokens)
-
-        if n_support > n_oppose and n_support > 0:
-            stance = "supportive"
-        elif n_oppose > n_support and n_oppose > 0:
-            stance = "oppositional"
-        else:
-            stance = "neutral"
-
-        # Conflict intensity: density of conflict + oppositional markers
-        n_conflict = sum(1 for w in _CONFLICT_WORDS if w in tokens)
-        token_count = max(len(text.split()), 1)
-        conflict_intensity = min(1.0, (n_conflict * 3 + n_oppose) / (token_count * 0.1 + 1))
-
-        is_consensus_seeking = any(w in tokens for w in _CONSENSUS_WORDS)
-
-        topic = self._extract_topic(messages)
-
-        return DialogueState(
-            stance=stance,
-            conflict_intensity=conflict_intensity,
-            topic=topic,
-            is_consensus_seeking=is_consensus_seeking,
-        )
+        Uses LLM classifier if available, else returns neutral state.
+        """
+        if self._llm_classifier is not None:
+            return await self._llm_classifier.classify(messages)
+        return _dialogue_state_fallback(messages)
 
     @staticmethod
     def _extract_topic(messages: list[dict[str, str]]) -> str:
@@ -164,8 +238,7 @@ class MindModelRetriever:
             doc = self._mm_doc(mm)
             doc_emb = self._doc_embedding(mm, doc)
             sim = float(np.dot(query_emb, doc_emb))
-            bonus = self._keyword_bonus(mm, state)
-            scored.append((sim + bonus, mm))
+            scored.append((sim, mm))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [mm for _, mm in scored[: self.top_k]]
@@ -211,28 +284,3 @@ class MindModelRetriever:
             f"reasoning for {goal} stance {state.stance} "
             f"conflict intensity {intensity} topic {state.topic}".lower()
         )
-
-    @staticmethod
-    def _keyword_bonus(mm: MindModel, state: DialogueState) -> float:
-        """Heuristic bonus for explicit stance/conflict/consensus alignment."""
-        doc = MindModelRetriever._mm_doc(mm)
-        bonus = 0.0
-
-        if state.stance == "oppositional" and any(
-            w in doc for w in ("argument", "counter", "rebuttal", "oppos", "critique")
-        ):
-            bonus += 0.15
-        if state.stance == "supportive" and any(
-            w in doc for w in ("support", "endorse", "agree", "consensus")
-        ):
-            bonus += 0.15
-        if state.conflict_intensity > 0.4 and any(
-            w in doc for w in ("conflict", "escalat", "de-escalat", "dispute", "attack")
-        ):
-            bonus += 0.15
-        if state.is_consensus_seeking and any(
-            w in doc for w in ("consensus", "compromise", "mediate", "bridge")
-        ):
-            bonus += 0.15
-
-        return bonus

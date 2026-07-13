@@ -126,7 +126,7 @@ class AlphaSensitivityRunner(Experiment1Runner):
             seed=self.config.seed + repeat,
         )
 
-        report = self.metrics_agg.evaluate(result, threads)
+        report = await self.metrics_agg.evaluate(result, threads)
         return report.to_dict()
 
     # ------------------------------------------------------------------
@@ -223,7 +223,7 @@ class AlphaSensitivityRunner(Experiment1Runner):
     def find_optimal(
         self,
         cells: list[AlphaCell],
-        metric_key: str = "pred_predictive_fidelity",
+        metric_key: str = "action_matrix_similarity",
     ) -> AlphaCell | None:
         """Find the α configuration maximizing the given metric."""
         def _score(cell: AlphaCell) -> float:
@@ -236,7 +236,7 @@ class AlphaSensitivityRunner(Experiment1Runner):
     def check_robustness(
         self,
         cells: list[AlphaCell],
-        metric_key: str = "pred_predictive_fidelity",
+        metric_key: str = "action_matrix_similarity",
         tolerance: float = 0.05,
     ) -> dict[str, Any]:
         """Check whether the optimum is a plateau (robust) or sharp peak.
@@ -281,7 +281,7 @@ class AlphaSensitivityRunner(Experiment1Runner):
     def find_optimal_per_dataset(
         self,
         sweep_results: dict[str, dict[str, list[AlphaCell]]],
-        metric_key: str = "pred_predictive_fidelity",
+        metric_key: str = "action_matrix_similarity",
     ) -> dict[str, dict[str, Any]]:
         """Find optimal α per dataset across all sweep pairs.
 

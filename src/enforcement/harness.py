@@ -99,6 +99,8 @@ class EnforcementHarness:
         self.tier2 = Tier2MindModelInjection(
             alpha=self.alpha_tier2 if enable_tier2 else 0.0,
             rng=rng_t2,
+            llm_client=llm_client,
+            llm_model_name=model_name,
         )
         self.tier3 = Tier3AntiPatternBlock(
             alpha=self.alpha_tier3 if enable_tier3 else 0.0,

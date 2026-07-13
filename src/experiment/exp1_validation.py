@@ -31,6 +31,8 @@ class Experiment1Runner(ExperimentRunner):
             held_out_events_dir=str(settings.held_out_events_dir),
             role_labels_dir=str(settings.role_labels_dir),
             model_provenance=self.llm.get_all_provenance(),
+            llm_client=self.llm,
+            llm_model_name=self.classification_model or config.models[0],
         )
         # Cache compiled skills per (dataset, distiller) — distiller is
         # None for pipeline-A/bare-file conditions, "colleague"/"nuwa" for
@@ -113,7 +115,7 @@ class Experiment1Runner(ExperimentRunner):
         )
 
         # Evaluate
-        report = self.metrics_agg.evaluate(result, threads)
+        report = await self.metrics_agg.evaluate(result, threads)
 
         return report.to_dict()
 
@@ -137,20 +139,13 @@ class Experiment1Runner(ExperimentRunner):
         (default 10×) so that enough multi-user threads survive.
         """
         if dataset not in self._data_cache:
-            # Inflate the utterance cap so filtering still yields
-            # enough threads.  The loader's limit is utterance-level;
-            # ~95% of utterances land in single-msg threads, so we
-            # need ~10× oversampling to hit the target thread count
-            # after filtering.
-            oversample = getattr(self.config, "thread_filter_oversample", 10)
-            effective_limit = (
-                self.config.max_threads * oversample
-                if self.config.max_threads is not None
-                else None
-            )
+            # Loader reads year-by-year and stops once enough multi-user
+            # threads accumulate.  No oversample factor needed — the
+            # loader is thread-count-driven, not utterance-count-driven.
             loader = self.get_dataset_loader(dataset)
-            if hasattr(loader, "limit"):
-                loader.limit = effective_limit
+            if hasattr(loader, "target_threads"):
+                loader.target_threads = self.config.max_threads
+                loader.min_messages = 2
             threads = loader.load()
 
             # Filter to threads with actual interaction structure

@@ -52,7 +52,7 @@ def action_matrix_similarity(
 def representational_similarity(
     sim_profiles: np.ndarray,
     real_profiles: np.ndarray,
-) -> float:
+) -> float | None:
     """RSA via eigenvalue spectrum of similarity matrices.
 
     Compares the *sorted eigenvalue spectra* of the within-group profile
@@ -65,10 +65,24 @@ def representational_similarity(
         real_profiles: Real user behavioral profiles.
 
     Returns:
-        RSA score in [-1, 1]. Higher = better representational match.
+        RSA score in [-1, 1], or None if either side has < 10 agents
+        (metric has no discriminative power below this threshold due
+        to eigenvalue spectrum dominance by the principal component).
     """
     if len(sim_profiles) < 2 or len(real_profiles) < 2:
-        return 0.0
+        return None
+
+    # Agent count guard: with < 10 agents, the principal eigenvalue
+    # dominates the spectrum regardless of behavioral differences,
+    # making RSA ≈ 1.0 for any pair of conditions (no discriminative power).
+    if len(sim_profiles) < 10 or len(real_profiles) < 10:
+        from loguru import logger
+        logger.warning(
+            f"RSA skipped: agent count below threshold "
+            f"(sim={len(sim_profiles)}, real={len(real_profiles)}, min=10). "
+            f"Metric has no discriminative power at this scale."
+        )
+        return None
 
     def _spectrum(profiles: np.ndarray) -> np.ndarray:
         norms = np.linalg.norm(profiles, axis=1, keepdims=True)
@@ -227,7 +241,9 @@ class MicroMetrics:
             result["action_matrix_similarity"] = action_matrix_similarity(sim_matrix, real_matrix)
 
         if sim_profiles is not None and real_profiles is not None:
-            result["rsa"] = representational_similarity(sim_profiles, real_profiles)
+            rsa_val = representational_similarity(sim_profiles, real_profiles)
+            if rsa_val is not None:
+                result["rsa"] = rsa_val
 
         if sim_action_counts is not None and real_action_counts is not None:
             result["uniformity_sim"] = behavior_uniformity(sim_action_counts)

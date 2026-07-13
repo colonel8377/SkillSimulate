@@ -49,7 +49,7 @@ class Experiment2Runner(ExperimentRunner):
         # (G5 — previously real data served only as ground truth, the
         # arm itself was unscheduled.)
         if is_replay_only_condition(cell.condition):
-            return self._run_real_history_cell(cell, scenario_threads)
+            return await self._run_real_history_cell(cell, scenario_threads)
 
         # Cluster (cached per dataset — same threads produce same clusters)
         cluster_result = self._get_or_compute_clusters(cell.dataset, scenario_threads)
@@ -108,7 +108,7 @@ class Experiment2Runner(ExperimentRunner):
                 seed=self.config.seed + cell.repeat,
             )
 
-            report = self.metrics_agg.evaluate(result, scenario_threads)
+            report = await self.metrics_agg.evaluate(result, scenario_threads)
 
             # Extract temporal trajectory analysis (outline §6.4)
             temporal = self._extract_temporal_analysis(result)
@@ -127,7 +127,7 @@ class Experiment2Runner(ExperimentRunner):
             "scale_results": results,
         }
 
-    def _run_real_history_cell(
+    async def _run_real_history_cell(
         self,
         cell: ExperimentCell,
         scenario_threads: list,
@@ -188,7 +188,7 @@ class Experiment2Runner(ExperimentRunner):
             per_round_metrics=[],
         )
 
-        report = self.metrics_agg.evaluate(replay_result, scenario_threads)
+        report = await self.metrics_agg.evaluate(replay_result, scenario_threads)
         temporal = self._extract_temporal_analysis(replay_result)
 
         return {

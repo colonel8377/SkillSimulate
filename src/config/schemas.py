@@ -108,7 +108,7 @@ class ExperimentConfig:
     style_umap_dim: int = 15
     top_n_threads: int = 20      # representative threads for skill compilation
     max_threads: int | None = None  # cap on threads loaded per dataset (None = no cap)
-    thread_filter_oversample: int = 100  # inflate utterance cap before filtering single-msg threads
+    thread_filter_oversample: int = 1  # deprecated — loader now thread-count-driven
     max_sim_threads: int = 5     # cap on threads used per simulation cell
     checkpoint_every: int = 5    # save state every N rounds
     max_concurrency: int = 4     # parallel LLM calls

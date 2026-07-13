@@ -19,7 +19,7 @@ conditions:
   # --- Mechanism ablation + permutation (nuwa only) ---------------------
   - cadp_minus_ap         # C7: drops anti-patterns layer → filter-retry Tier 3 off
   - cadp_shuffled         # C8: permutation test — same skill tokens, wrong cluster
-num_repeats: 5
+num_repeats: 1
 num_rounds: 50
 population_size: 30
 # α (outline §4.4.3). Per-tier path is the named methodological contribution;

@@ -99,6 +99,25 @@ models:
     snapshot_date: ""
     commit_hash: ""
 
+  # Classification — speech act / dialogue state / annotation
+  # Lighter endpoint for labeling tasks. Override via
+  # CADP_ENDPOINTS_CLASSIFICATION env var (same format as deepseek-v4-flash).
+  # When unset, falls back to CADP_ENDPOINTS_DEEPSEEK_V4_FLASH + warning.
+  - name: classification
+    model: deepseek-v4-flash
+    base_url: ""
+    api_key: ""
+    api_type: auto
+    supports_json_mode: false
+    temperature: 0.0          # deterministic labeling
+    max_tokens: 2048
+    max_total_tokens: 131072
+    max_thinking_tokens: 0    # no reasoning needed for classification
+    cost_per_1k_input: 0.10
+    cost_per_1k_output: 0.40
+    snapshot_date: "2025-06-26"
+    commit_hash: "DeepSeek-V4-Flash"
+
   # DeepSeek — OpenAI-compatible endpoint at https://api.deepseek.com
   # deepseek-v4-flash: fast / cheap, preferred for simulation runs.
   # deepseek-v4-pro: higher quality, reserved for skill compilation.

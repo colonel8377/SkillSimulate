@@ -33,12 +33,22 @@ _REPORT_PATTERNS = (
 
 class WikipediaLoader(DatasetLoader):
 
-    def __init__(self, data_path: str, limit: int | None = None):
+    def __init__(
+        self,
+        data_path: str,
+        limit: int | None = None,
+        target_threads: int | None = None,
+        min_messages: int = 2,
+    ):
         super().__init__(data_path)
-        # Max base utterances to ingest across the corpus (None = all). The full
-        # 2001-2014 WikiConv is ~80M+ utterances — far too large to materialise.
-        # A few-million sample is statistically ample for archetype clustering.
+        # Max base utterances to ingest across the corpus (None = all). Safety
+        # cap only — the full 2001-2018 WikiConv is ~80M+ utterances.
         self.limit = limit
+        # Stop loading after accumulating this many qualifying threads (>= min_messages
+        # messages).  Avoids loading the entire corpus when only a small sample
+        # is needed.  None = no thread-level cap (rely on ``limit`` only).
+        self.target_threads = target_threads
+        self.min_messages = min_messages
 
     def get_platform(self) -> Platform:
         return Platform.WIKIPEDIA
@@ -106,6 +116,14 @@ class WikipediaLoader(DatasetLoader):
             if (self.limit is not None and corpus_dirs) else None
         )
         for cdir in corpus_dirs:
+            # Early termination: stop if we already have enough qualifying threads.
+            if self.target_threads is not None:
+                qualifying = sum(
+                    1 for t in threads_map.values()
+                    if len(t.messages) >= self.min_messages
+                )
+                if qualifying >= self.target_threads:
+                    break
             if self.limit is not None and n_utts >= self.limit:
                 break
             logger.info(f"Loading {cdir.name} …")
@@ -140,9 +158,15 @@ class WikipediaLoader(DatasetLoader):
                             threads_map[msg.thread_id] = thread
                         thread.add_message(msg)
 
+        qualifying = sum(
+            1 for t in threads_map.values()
+            if len(t.messages) >= self.min_messages
+        )
         logger.info(
-            f"Loaded {n_utts} utterances → {len(threads_map)} threads"
+            f"Loaded {n_utts} utterances → {len(threads_map)} threads "
+            f"({qualifying} with >= {self.min_messages} msgs)"
             + (f" (limit={self.limit}, ~{per_dir}/year)" if self.limit else "")
+            + (f" (target_threads={self.target_threads})" if self.target_threads else "")
         )
         return list(threads_map.values())
 

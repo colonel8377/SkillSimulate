@@ -92,40 +92,44 @@ class AntiPatternDetector:
         all_patterns = gap_patterns + llm_patterns
         unique = self._deduplicate(all_patterns)
 
-        # Fallback: every cluster should have at least one basic anti-pattern
-        # so the constraint track is not empty and Tier-3 has something to enforce.
+        # Fallback: if detection produced zero patterns, inject a
+        # toxicity-based anti-pattern using a pretrained classifier
+        # instead of hardcoded keyword regex. This ensures every cluster
+        # has at least one Category A/B constraint for Tier-3.
         if not unique:
             logger.warning(
-                "AntiPattern detection produced zero patterns; injecting a generic "
-                "civility anti-pattern as fallback."
+                "AntiPattern detection produced zero patterns for this cluster. "
+                "Injecting toxicity-classifier fallback anti-pattern."
             )
-            unique = [self._generic_civility_pattern()]
+            unique = [_toxicity_fallback_pattern()]
 
         return unique
 
-    def _generic_civility_pattern(self) -> AntiPattern:
-        """Generic fallback anti-pattern: no personal attacks or harassment."""
+    @staticmethod
+    def _toxicity_fallback_pattern() -> AntiPattern:
+        """Fallback anti-pattern using toxicity classifier (not hardcoded keywords).
+
+        Instead of matching specific keywords (e.g. "stupid", "idiot"), this
+        anti-pattern uses a BERT-based toxicity classifier (Jigsaw-trained)
+        as a Category B semantic trigger. The classifier scores each message
+        for toxicity probability — context-aware, not keyword-based.
+        """
         return AntiPattern(
-            description="Avoid personal attacks, insults, or harassment toward other users.",
+            description="Avoid toxic, hostile, or harassing language toward other users.",
             trigger_conditions=[
                 "When responding to a user you disagree with",
                 "When frustrated by another user's actions",
             ],
-            trigger_keywords=[
-                "idiot", "stupid", "moron", "loser", "jerk", "asshole",
-                "damn you", "shut up", "fuck", "shit", "bitch",
-            ],
-            trigger_regex=[
-                r"\b(you\s+(are|re)\s+)?(stupid|idiot|moron|loser)\b",
-                r"\b(shut\s+up|get\s+lost)\b",
-            ],
+            trigger_keywords=[],  # No keyword triggers — classifier-based
+            trigger_regex=[],     # No regex triggers
             trigger_semantic_phrases=[
                 "you are an idiot",
-                "personal insult",
-                "hostile attack",
+                "personal attack and insult",
+                "hostile threatening language",
+                "harassment and abuse",
             ],
             trigger_action_patterns=[],
-            reason="Basic civility baseline that applies to every community participant.",
+            reason="Basic civility baseline via semantic toxicity detection (not keyword matching).",
         )
 
     def _quantitative_gap_analysis(

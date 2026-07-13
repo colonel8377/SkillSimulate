@@ -474,13 +474,8 @@ DEFAULT_LAYER_METRICS: dict[str, list[str]] = {
         "complexity_sim", "complexity_real",
     ],
     "linguistics": [
-        "discourse_marker_match", "sentiment_trajectory_similarity",
+        "discourse_relation_match", "sentiment_trajectory_similarity",
         "speech_act_similarity",
-    ],
-    "predictive": [
-        "pred_conflict_accuracy", "pred_conflict_f1",
-        "pred_persuasion_accuracy", "pred_persuasion_f1",
-        "pred_escalation_accuracy", "pred_escalation_f1",
     ],
 }
 
@@ -502,7 +497,7 @@ DEFAULT_METRIC_DIRECTION: dict[str, bool] = {
     "uniformity_gap": False,       # |sim-real| → lower better
     "complexity_sim": True,
     "complexity_real": True,
-    "discourse_marker_match": True,
+    "discourse_relation_match": True,
     "sentiment_trajectory_similarity": True,
     "speech_act_similarity": True,
 }

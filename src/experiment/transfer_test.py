@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
+import numpy as np
 from loguru import logger
 
 from src.clustering.clusterer import BehavioralClusterer, ClusterResult
@@ -27,9 +28,6 @@ from src.evaluation.aggregator import MetricsAggregator
 from src.experiment.runner import ExperimentCell, ExperimentRunner
 from src.simulation.population import PopulationBuilder
 from src.simulation.sandbox import SimulationSandbox
-
-# Generic anti-pattern descriptions that are platform-agnostic
-_GENERIC_AP_KEYWORDS = {"personal attack", "insult", "harass", "threat", "spam", "off-topic"}
 
 
 class CrossDatasetTransferRunner(ExperimentRunner):
@@ -144,7 +142,7 @@ class CrossDatasetTransferRunner(ExperimentRunner):
         )
 
         # Evaluate against target ground truth
-        report = self.metrics_agg.evaluate(result, target_threads)
+        report = await self.metrics_agg.evaluate(result, target_threads)
 
         # Also run native (target→target) for comparison
         native_skills = await self._compile_native(
@@ -186,7 +184,7 @@ class CrossDatasetTransferRunner(ExperimentRunner):
             checkpoint_every=self.config.checkpoint_every,
             seed=self.config.seed,
         )
-        native_report = self.metrics_agg.evaluate(native_result, target_threads)
+        native_report = await self.metrics_agg.evaluate(native_result, target_threads)
 
         # Compare transfer vs native fidelity
         transfer_metrics = report.metrics
@@ -417,12 +415,24 @@ class CrossDatasetTransferRunner(ExperimentRunner):
     def _is_generic_antipattern(ap) -> bool:
         """Check if an anti-pattern is platform-agnostic (generic).
 
-        Generic anti-patterns are those whose description/keywords match
+        Generic anti-patterns are those whose description mentions
         universal behavioral norms (e.g. "no personal attacks") rather than
         platform-specific rules (e.g. "no revert warring").
+
+        Uses SBERT semantic similarity against a reference phrase instead
+        of keyword matching, to avoid context-blind keyword inference.
         """
-        text = (ap.description + " " + " ".join(getattr(ap, "trigger_keywords", []))).lower()
-        return any(kw in text for kw in _GENERIC_AP_KEYWORDS)
+        from src.config.settings import get_shared_embedder
+        embedder = get_shared_embedder()
+        desc = ap.description.lower()
+        if not desc.strip():
+            return False
+        # Reference phrase for "generic civility/harassment anti-pattern"
+        ref = "personal attack insult harassment threat spam off-topic"
+        desc_emb = embedder.encode([desc], show_progress_bar=False)[0]
+        ref_emb = embedder.encode([ref], show_progress_bar=False)[0]
+        cos_sim = float(np.dot(desc_emb, ref_emb) / (np.linalg.norm(desc_emb) * np.linalg.norm(ref_emb) + 1e-10))
+        return cos_sim > 0.5
 
     def _map_skills_cross_domain(
         self,
