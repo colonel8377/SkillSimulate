@@ -184,6 +184,10 @@ class ExperimentRunner:
 
         try:
             for cell in tqdm(cells, desc="Experiment cells"):
+                # Reset circuit breaker between cells so a tripped breaker
+                # (e.g. from evaluation in the previous cell) doesn't
+                # silently kill the next cell's simulation.
+                reset_global_breaker()
                 seed_everything(self.config.seed + cell.repeat)
                 try:
                     result = await self.run_cell(cell)
