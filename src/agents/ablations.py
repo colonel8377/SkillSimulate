@@ -103,10 +103,11 @@ class CADPMinusMindModelsAgent(CADPAgent):
 
 
 class CADPMinusAntiPatternsAgent(CADPAgent):
-    """Baseline 8: CADP without Anti-patterns (Tier 3 disabled).
+    """Baseline 8: CADP without Anti-patterns (Tier 3 LLM judge disabled).
 
     Tests whether anti-patterns are critical for overcoming RLHF
-    compromise tendencies.
+    compromise tendencies. Post-2026-07-17 simplification: Tier 3 is the
+    LLM judge only, so "no anti-patterns" = no judge.
     """
 
     def __init__(self, *args, **kwargs):
@@ -130,7 +131,7 @@ class CADPMinusAntiPatternsAgent(CADPAgent):
 class CADPConstraintOnlyAgent(CADPAgent):
     """Ablation: CADP with only the Constraint Track (Anti-patterns).
 
-    No Expression DNA, no Mind Models. Only Tier-3 anti-pattern enforcement.
+    No Expression DNA, no Mind Models. Only Tier-3 LLM judge enforcement.
     Tests whether the Constraint Track alone is sufficient, or whether the
     dual-track design (Capability + Constraint) is necessary.
     """
@@ -148,6 +149,7 @@ class CADPConstraintOnlyAgent(CADPAgent):
             alpha_tier2=self._alpha_tier2,
             alpha_tier3=self._alpha_tier3,
             seed=self._seed,
+            tier3_llm_judge=self.enforcement_harness.tier3_llm_judge,
         )
         # Hide Capability Track from role description
         self.show_expression_dna = False

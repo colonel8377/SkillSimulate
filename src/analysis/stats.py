@@ -471,7 +471,8 @@ DEFAULT_LAYER_METRICS: dict[str, list[str]] = {
     "micro": [
         "action_matrix_similarity", "rsa",
         "uniformity_sim", "uniformity_real", "uniformity_gap",
-        "complexity_sim", "complexity_real",
+        "complexity_sim", "complexity_real", "complexity_gap",
+        "caricature_index_sim", "caricature_index_real", "caricature_gap",
     ],
     "linguistics": [
         "discourse_relation_match", "sentiment_trajectory_similarity",
@@ -497,6 +498,10 @@ DEFAULT_METRIC_DIRECTION: dict[str, bool] = {
     "uniformity_gap": False,       # |sim-real| → lower better
     "complexity_sim": True,
     "complexity_real": True,
+    "complexity_gap": False,
+    "caricature_index_sim": True,
+    "caricature_index_real": True,
+    "caricature_gap": False,
     "discourse_relation_match": True,
     "sentiment_trajectory_similarity": True,
     "speech_act_similarity": True,

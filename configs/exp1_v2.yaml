@@ -1,54 +1,64 @@
-# Experiment 1 v2 — Digital Habitus Distillation headline grid
-# Reframe v1 (2026-07-08): distilled behavioral skill + filter-retry headline.
-# 8 main conditions × 2 datasets × 2 models × 5 repeats = 160 runs.
-# Reduced-grid appendix conditions (segmentation, capability-only, layer-5
-# ablations, length-matched, etc.) live in exp1_appendix.yaml.
+# Experiment 1 v2 — single-model methodological feasibility gate.
+# Scope: DeepSeek Flash × Wikipedia only. This is an exploratory GO/STOP
+# study, not confirmatory evidence of cross-model or cross-community validity.
 name: exp1_v2
 datasets: [wikipedia]
 models: [deepseek-v4-flash]
-compile_model: deepseek-v4-pro
+compile_model: deepseek-v4-flash
+
+# C3/C4 are the causal comparison: identical Nuwa skill content, with versus
+# without dynamic retrieval and filter/retry. C1/C2 contextualize the result.
 conditions:
-  # --- Lever-1 baseline ladder (escalating description richness) ---------
-  - vanilla               # C1: no persona
-  - descriptive           # C2: terse demographic-style persona
-  - pop_aligned           # C3: cluster-stat-aligned descriptive persona
-  - rich_narrative        # C4: lever-1 CEILING — kill condition
-  # --- Headline conditions (nuwa-primary per reframe v1) ----------------
-  - cadp_full_nuwa        # C5: paper headline — CADP Full, nuwa 5-layer base
-  - cadp_full_colleague   # C6: methodology comparison — CADP Full, colleague 6-layer
-  # --- Mechanism ablation + permutation (nuwa only) ---------------------
-  - cadp_minus_ap         # C7: drops anti-patterns layer → filter-retry Tier 3 off
-  - cadp_shuffled         # C8: permutation test — same skill tokens, wrong cluster
-num_repeats: 1
-num_rounds: 50
-population_size: 30
-# α (outline §4.4.3). Per-tier path is the named methodological contribution;
-# headline 8-condition run drives constraint enforcement through per-tier
-# (not scalar shortcut). `alpha` remains as fallback when any tier is null.
+  - descriptive
+  - rich_narrative
+  - cadp_advisory_nuwa
+  - cadp_full_nuwa
+num_repeats: 3
+num_rounds: 8
+population_size: 18
+population_allocation: balanced  # exactly 3 agents per locked skill
+
+# Full CADP enforcement. Both post-generation paths use the documented
+# three-attempt retry budget.
 alpha: 1.0
-alpha_tier1: 1.0   # Expression DNA  (Tier 1 post-gen embedding filter)
-alpha_tier2: 1.0   # Mind Models     (Tier 2 retrieval injection)
-alpha_tier3: 1.0   # Anti-patterns   (Tier 3 two-stage enforcement)
+alpha_tier1: 1.0
+alpha_tier2: 1.0
+max_reformulation_retries: 3
+tier1_max_retries: 3
+
+# Locked clustering is an engineering partition for this feasibility study;
+# its failed stability threshold is disclosed and not treated as a finding.
 num_clusters: 8
 cluster_method: kmeans
-# Locked K=8 clustering (reframe v1, 2026-07-08): canonical cluster IDs
-# match the distilled skill files (0,2,3,4,6,7 after merge 1→0, 5→4).
-# Without these, runner re-fits live → IDs diverge → CADP conditions
-# silently load wrong skills.
 clustering_pickle_path: outputs/stream_cache/clustering_k8_final_quantile.pkl
 cluster_merge_map_path: outputs/skill_corpus_k8_quantile/wikiconv/cluster_map.json
 top_n_threads: 20
-checkpoint_every: 5
+
+checkpoint_every: 2
 max_threads: 2000
-max_sim_threads: 20
+max_sim_threads: 8
 max_concurrency: 8
 seed: 42
-# Long-horizon context budget (B3). Raising both vs defaults improves
-# long-horizon signal retention; applied uniformly across all conditions
-# → neutral for CADP-vs-baseline ranking.
+seed_min_toxicity: 0.6
 max_context_items: 12
 max_thread_messages: 10
-# Issue 1: token-aware sliding window (default). 50 rounds gives enough
-# headroom for persona collapse to fully develop in lever-1 baselines
-# (outline §5.6.7).
 memory_strategy: sliding
+reflection_interval: 10  # intentionally inactive in the 8-round feasibility gate
+
+# Three non-redundant lower-is-better families. GO means "worth a larger
+# confirmatory study", not a publication-level significance claim.
+viability_enabled: true
+viability_treatment: cadp_full_nuwa
+viability_control: cadp_advisory_nuwa
+viability_primary_metrics:
+  - action_fidelity_distance
+  - interaction_structure_distance
+  - linguistic_fidelity_distance
+viability_min_pairs: 3
+viability_min_metric_wins: 2
+viability_min_repeat_win_fraction: 0.6666666667
+viability_min_relative_improvement: 0.05
+viability_max_family_regression: 0.10
+viability_min_message_ratio: 0.95
+viability_max_safe_template_rate: 0.10
+viability_min_action_text_consistency: 0.90

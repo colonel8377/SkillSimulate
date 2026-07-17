@@ -28,6 +28,25 @@
 #   max_input_tokens. Verify the context-window values against your
 #   actual endpoint / proxy before paper-scale runs.
 models:
+  # MiniMax-M3 — cross-family Tier 3 judge (self-evaluation bias mitigation).
+  # Override base_url and api_key via CADP_ENDPOINTS_MINIMAX_M3 env var
+  # (same multi-endpoint format as deepseek-v4-flash). Falls back to
+  # CADP_OPENAI_BASE_URL / CADP_OPENAI_API_KEY when env var is unset.
+  - name: minimax-m3
+    model: MiniMax-M3
+    base_url: ""
+    api_key: ""
+    api_type: auto
+    supports_json_mode: true
+    temperature: 0.0          # deterministic judging
+    max_tokens: 4096
+    max_total_tokens: 131072
+    max_thinking_tokens: 0    # non-reasoning model
+    cost_per_1k_input: 0.50
+    cost_per_1k_output: 1.00
+    snapshot_date: ""
+    commit_hash: ""
+
   - name: gpt-4o
     model: gpt-4o
     base_url: ""         # uses CADP_OPENAI_BASE_URL env
@@ -100,7 +119,7 @@ models:
     commit_hash: ""
 
   # Classification — speech act / dialogue state / annotation
-  # Lighter endpoint for labeling tasks. Override via
+  # Flash endpoint for fast/cheap labels. Override via
   # CADP_ENDPOINTS_CLASSIFICATION env var (same format as deepseek-v4-flash).
   # When unset, falls back to CADP_ENDPOINTS_DEEPSEEK_V4_FLASH + warning.
   - name: classification
@@ -110,13 +129,13 @@ models:
     api_type: auto
     supports_json_mode: false
     temperature: 0.0          # deterministic labeling
-    max_tokens: 2048
+    max_tokens: 8192          # ensure JSON output fits after thinking budget
     max_total_tokens: 131072
-    max_thinking_tokens: 0    # no reasoning needed for classification
+    max_thinking_tokens: 2048
     cost_per_1k_input: 0.10
     cost_per_1k_output: 0.40
     snapshot_date: "2025-06-26"
-    commit_hash: "DeepSeek-V4-Flash"
+    commit_hash: ""
 
   # DeepSeek — OpenAI-compatible endpoint at https://api.deepseek.com
   # deepseek-v4-flash: fast / cheap, preferred for simulation runs.

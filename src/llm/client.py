@@ -455,6 +455,20 @@ class LLMClient:
                 except Exception as exc:
                     pool.record_failure(ep_state, error=str(exc))
                     last_error = str(exc)
+                    # Diagnostic: log the underlying exception type and any
+                    # status_code / API body so endpoint-death investigations
+                    # have a paper trail (see logs/*_llm_debug.log).
+                    _status = getattr(exc, "status_code", None)
+                    _body = getattr(exc, "body", None) or getattr(exc, "response", None)
+                    logger.warning(
+                        f"LLM call failed on EndpointPool[{model_name}]#"
+                        f"{ep_state.idx} (model={ep_state.model}): "
+                        f"type={type(exc).__name__} status={_status} "
+                        f"consecutive={ep_state.consecutive_failures}/"
+                        f"{pool.failure_threshold} "
+                        f"alive_remaining={pool.alive_count} "
+                        f"msg={str(exc)[:200]!r} body={str(_body)[:300]!r}"
+                    )
                     if pool.all_dead:
                         logger.error(
                             f"All endpoints dead for model '{model_name}' "
@@ -486,6 +500,13 @@ class LLMClient:
             # non-retryable exceptions (auth, bad request) on attempt 1
             # AND retryable exceptions (rate limit, timeout) that burnt
             # all 5 attempts.
+            _status = getattr(exc, "status_code", None)
+            _body = getattr(exc, "body", None) or getattr(exc, "response", None)
+            logger.warning(
+                f"LLM call failed (legacy path, model='{model_name}'): "
+                f"type={type(exc).__name__} status={_status} "
+                f"msg={str(exc)[:200]!r} body={str(_body)[:300]!r}"
+            )
             await self._breaker.record_failure(last_error=str(exc))
             raise
 
@@ -516,6 +537,17 @@ class LLMClient:
             return self._mock.route(messages, model_name)
 
         ep = self.models[model_name]
+        # Validate the request before resolving a configured API client. This
+        # keeps prompt-budget failures deterministic even when a legacy model
+        # has no credential/client in the current environment.
+        if ep.max_input_tokens > 0:
+            estimated = estimate_messages_tokens(messages, model=ep.model)
+            if estimated > ep.max_input_tokens:
+                raise PromptBudgetExceeded(
+                    model=ep.model,
+                    requested=estimated,
+                    budget=ep.max_input_tokens,
+                )
         # When routed through an endpoint pool, use the endpoint's
         # client and per-endpoint model name.
         if endpoint_state is not None:
@@ -531,15 +563,6 @@ class LLMClient:
         # Refuse to send prompts that would overflow the input budget.
         # Uses a conservative tiktoken estimate (1.15× multiplier); when
         # max_total_tokens is 0 the guard is skipped (legacy behaviour).
-        if ep.max_input_tokens > 0:
-            estimated = estimate_messages_tokens(messages, model=ep.model)
-            if estimated > ep.max_input_tokens:
-                raise PromptBudgetExceeded(
-                    model=ep.model,
-                    requested=estimated,
-                    budget=ep.max_input_tokens,
-                )
-
         # --- thinking-budget passthrough (Issue 1) --------------------
         # DeepSeek-V4 reasoning models use a separate ``reasoning_content``
         # field for chain-of-thought output. The thinking budget is controlled
@@ -568,10 +591,17 @@ class LLMClient:
         # Track cost
         usage = response.usage
         if usage:
+            prompt_tokens = usage.prompt_tokens or 0
+            completion_tokens = usage.completion_tokens or 0
+            # DeepSeek reasoning models bill thinking tokens separately
+            reasoning_tokens = getattr(
+                getattr(usage, 'completion_tokens_details', None),
+                'reasoning_tokens', 0
+            ) or 0
             self.cost_tracker.record(
                 model_name=model_name,
-                input_tokens=usage.prompt_tokens,
-                output_tokens=usage.completion_tokens,
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens + reasoning_tokens,
                 cost_per_1k_input=ep.cost_per_1k_input,
                 cost_per_1k_output=ep.cost_per_1k_output,
             )
@@ -580,9 +610,16 @@ class LLMClient:
         # return a response with ``choices=None`` on transient errors.
         # Raising TransientResponseError here triggers the @retry backoff.
         if not response.choices:
+            _rid = getattr(response, "id", "?")
+            _usage = getattr(response, "usage", None)
+            logger.warning(
+                f"Empty choices from model '{effective_model}' "
+                f"(response.id={_rid}, usage={_usage!r}, "
+                f"endpoint_model={getattr(endpoint_state, 'model', '?')})"
+            )
             raise TransientResponseError(
                 f"API returned empty choices for model '{effective_model}' "
-                f"(response.id={getattr(response, 'id', '?')})"
+                f"(response.id={_rid})"
             )
 
         content = response.choices[0].message.content
@@ -602,9 +639,24 @@ class LLMClient:
         # a valid response structure but with empty or None content.
         # Raising TransientResponseError here triggers the @retry backoff.
         if not content or not content.strip():
+            _rid = getattr(response, "id", "?")
+            _usage = getattr(response, "usage", None)
+            _rtoks = (
+                getattr(_usage.completion_tokens_details, "reasoning_tokens", None)
+                if _usage and getattr(_usage, "completion_tokens_details", None)
+                else None
+            )
+            _ctoks = getattr(_usage, "completion_tokens", None) if _usage else None
+            _rc = getattr(response.choices[0].message, "reasoning_content", None)
+            logger.warning(
+                f"Empty content from model '{effective_model}' "
+                f"(response.id={_rid}): completion_tokens={_ctoks} "
+                f"reasoning_tokens={_rtoks} "
+                f"reasoning_content_preview={(_rc or '')[:120]!r}"
+            )
             raise TransientResponseError(
                 f"API returned empty content for model '{effective_model}' "
-                f"(response.id={getattr(response, 'id', '?')})"
+                f"(response.id={_rid})"
             )
 
         return content

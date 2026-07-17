@@ -66,7 +66,6 @@ COLLEAGUE_DIR = PROJECT_ROOT / "data" / "colleague_skills"
 NUWA_DIR = PROJECT_ROOT / "data" / "nuwa_skills"
 CORPUS_DIR = PROJECT_ROOT / "outputs" / "skill_corpus_k8_quantile" / "wikiconv"
 CLUSTER_MAP_PATH = CORPUS_DIR / "cluster_map.json"
-TOXIC_KEYWORDS_PATH = PROJECT_ROOT / "data" / "cluster_toxic_keywords.json"
 
 # slug (as used in data/colleague_skills, data/nuwa_skills) -> cluster_id
 # (as used in outputs/skill_corpus_k8_quantile/wikiconv/cluster_map.json).
@@ -83,157 +82,6 @@ SLUG_TO_CLUSTER_ID = {
 def _load_archetype_labels() -> dict[str, str]:
     data = json.loads(CLUSTER_MAP_PATH.read_text())
     return {cid: info["label"] for cid, info in data["skills"].items()}
-
-
-# ---------------------------------------------------------------------------
-# Trigger extraction for Tier 3 enforcement
-# ---------------------------------------------------------------------------
-
-# Toxic keywords are derived from the corpus, not hardcoded. See
-# data/cluster_toxic_keywords.json (pre-computed from ConvoKit toxicity labels).
-_CLUSTER_TOXIC_KEYWORDS: dict[str, list[str]] = json.loads(
-    TOXIC_KEYWORDS_PATH.read_text()
-)
-
-# Description fragments that indicate hostile/violating content.
-# When matched, attach the cluster's corpus-derived toxic keywords (Category A).
-# Not limited to profanity — covers edit-warring, vandalism, personal attacks,
-# and other hostile behaviors that the corpus toxic-keyword extraction captures.
-_HOSTILE_DESCRIPTION_FRAGMENTS = [
-    "profanity", "slur", "hate speech", "bigot", "insult",
-    "ad hominem", "personal attack", "incivility", "uncivil",
-    "vandalism", "vandal", "edit warring", "edit war", "revert war",
-    "harassment", "hounding", "baiting", "trolling", "troll",
-    "attack", "hostile", "aggressive", "threat",
-    "disruptive", "disruption", "blatant",
-]
-
-
-def _load_corpus_evidence(cluster_id: str) -> list[str]:
-    """Load Rejected-behavior evidence lines from the corpus pack.
-
-    Used as fallback when the nuwa SKILL.md anti-patterns section
-    contains only short labels without embedded quotes.
-    """
-    corpus_md = CORPUS_DIR / f"cluster_{cluster_id}" / "for_colleague.md"
-    if not corpus_md.exists():
-        return []
-    text = corpus_md.read_text()
-    evidence_section = _section(text, r"^## Rejected-behavior evidence", r"^##")
-    return [l.strip() for l in evidence_section.splitlines() if l.strip().startswith("- [")]
-
-
-def _extract_triggers(
-    description: str,
-    evidence: list[str],
-    cluster_id: str,
-    ap_index: int = 0,
-    n_anti_patterns: int = 1,
-) -> dict:
-    """Extract Tier 3 trigger fields from anti-pattern description + evidence.
-
-    Strategy:
-      - **Category B (semantic)**: Quoted phrases from evidence text.
-        They are real utterances from the corpus, suitable for Sentence-BERT
-        cosine matching. When evidence yields no semantic phrases (e.g. nuwa
-        anti-patterns with terse labels and no quotes), falls back to the
-        cluster's corpus rejected-behavior evidence from for_colleague.md.
-        When using fallback, **partitions** the corpus phrases across APs
-        via round-robin so each AP gets a distinct subset (fixes the
-        all-APs-get-identical-phrases bug).
-      - **Category A (keywords)**: If the description indicates hostile
-        behavior (profanity, vandalism, edit-warring, personal attacks, etc.),
-        attach the cluster-specific toxic keywords derived from ConvoKit
-        toxicity labels via log-odds extraction. Keywords are **partitioned**
-        across hostile APs via round-robin so each AP gets a distinct subset
-        (fixes the all-hostile-APs-get-identical-keywords bug).
-      - **Category C (action patterns)**: Not extracted here — action patterns
-        like "revert->revert->revert" require domain knowledge of the
-        simulation's action vocabulary and are set manually if needed.
-
-    Args:
-        description: Anti-pattern label/description text.
-        evidence: Inline evidence lines (from SKILL.md or for_colleague.md).
-        cluster_id: Cluster ID for per-cluster toxic keywords.
-        ap_index: Index of this AP within the skill (0-based), used for
-            partitioning fallback evidence and keywords across APs.
-        n_anti_patterns: Total number of APs in this skill, used for
-            partitioning.
-
-    Returns:
-        Dict with keys matching AntiPattern fields:
-        trigger_keywords, trigger_semantic_phrases, trigger_regex.
-    """
-    trigger_keywords: list[str] = []
-    trigger_semantic_phrases: list[str] = []
-    trigger_regex: list[str] = []
-
-    # --- Category B: semantic phrases from evidence ---
-    # Corpus evidence lines (from for_colleague.md/for_nuwa.md) start with "- ["
-    # and contain the full utterance text after the tag. Extract the text content.
-    # Nuwa SKILL.md evidence uses double-quoted phrases — extract those too.
-    all_semantic_candidates: list[str] = []
-    for ev in evidence:
-        # Corpus evidence format: "- [label] text content"
-        if ev.strip().startswith("- ["):
-            # Remove the leading tag "- [label] " and keep the text
-            m = re.match(r"^-\s*\[[^\]]+\]\s*(.+)$", ev.strip())
-            if m:
-                text = m.group(1).strip()
-                if 10 <= len(text) <= 200:
-                    all_semantic_candidates.append(text)
-        else:
-            # Nuwa SKILL.md format: double-quoted phrases within evidence text
-            quotes = re.findall(r'"([^"]+)"', ev)
-            for q in quotes:
-                if 10 <= len(q) <= 200:
-                    all_semantic_candidates.append(q)
-
-    # Fallback: if no semantic phrases extracted from inline evidence,
-    # use the cluster's corpus rejected-behavior evidence.
-    if not all_semantic_candidates:
-        corpus_evidence = _load_corpus_evidence(cluster_id)
-        for ev in corpus_evidence:
-            m = re.match(r"^-\s*\[[^\]]+\]\s*(.+)$", ev.strip())
-            if m:
-                text = m.group(1).strip()
-                if 10 <= len(text) <= 200:
-                    all_semantic_candidates.append(text)
-
-    # Round-robin partition: AP i gets phrases at indices i, i+n, i+2n, ...
-    # This ensures each anti-pattern gets a DISTINCT subset rather than all
-    # APs sharing identical phrases (which made Tier 3 Cat B useless).
-    trigger_semantic_phrases = all_semantic_candidates[ap_index::max(n_anti_patterns, 1)]
-
-    # --- Category A: keywords for hostile/violating anti-patterns ---
-    # Strategy: if the cluster has corpus-derived toxic keywords AND the
-    # anti-pattern description is even loosely hostile/conflict-adjacent,
-    # attach them. The toxic keywords came from high-toxicity utterances
-    # in this cluster — they ARE the cluster's toxic vocabulary regardless
-    # of which anti-pattern label they sit under.
-    #
-    # Partition keywords across hostile APs via round-robin so each AP
-    # gets a distinct subset rather than all hostile APs sharing the
-    # same full list.
-    cluster_kw = _CLUSTER_TOXIC_KEYWORDS.get(cluster_id, [])
-    desc_lower = description.lower()
-    # Broad match: any hostile/conflict/quality-violation language
-    _BROAD_HOSTILE = _HOSTILE_DESCRIPTION_FRAGMENTS + [
-        "unsourced", "unverifiable", "unverified", "original research",
-        "biased", "promotional", "advertorial", "coi", "conflict of interest",
-        "loaded", "opinionated", "subjective", "pov", "point of view",
-        "vandal", "disrupt", "low-quality", "unreliable", "off-topic",
-        "trivia", "fancruft", "contradiction", "inconsisten",
-    ]
-    if cluster_kw and any(frag in desc_lower for frag in _BROAD_HOSTILE):
-        # Round-robin partition: AP i gets keywords at indices i, i+n, i+2n, ...
-        trigger_keywords = sorted(cluster_kw[ap_index::max(n_anti_patterns, 1)])
-
-    return {
-        "trigger_keywords": trigger_keywords,
-        "trigger_semantic_phrases": trigger_semantic_phrases,
-        "trigger_regex": trigger_regex,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -402,16 +250,9 @@ def parse_colleague(md_path: Path, cluster_id: str) -> dict:
             label, reason = m.group(1), m.group(2)
         else:
             label, reason = reject, ""
-        triggers = _extract_triggers(
-            label, corpus_evidence, cluster_id,
-            ap_index=ap_i, n_anti_patterns=n_aps,
-        )
         anti_patterns.append(AntiPattern(
             description=label,
             trigger_conditions=[],
-            trigger_keywords=triggers["trigger_keywords"],
-            trigger_semantic_phrases=triggers["trigger_semantic_phrases"],
-            trigger_regex=triggers["trigger_regex"],
             reason=reason,
         ))
 
@@ -576,16 +417,9 @@ def parse_nuwa(md_path: Path, cluster_id: str) -> dict:
             if nline:
                 evidence.append(nline)
 
-        triggers = _extract_triggers(
-            label.strip(), evidence, cluster_id,
-            ap_index=ap_i, n_anti_patterns=n_aps,
-        )
         anti_patterns.append(AntiPattern(
             description=label.strip(),
             trigger_conditions=[],
-            trigger_keywords=triggers["trigger_keywords"],
-            trigger_semantic_phrases=triggers["trigger_semantic_phrases"],
-            trigger_regex=triggers["trigger_regex"],
             evidence=evidence,
         ))
 

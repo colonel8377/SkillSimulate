@@ -51,6 +51,7 @@ class ExperimentRunner:
         models_config: str = "configs/models.yaml",
     ):
         self.config = config
+        self.models_config_path = Path(models_config)
         self.llm = LLMClient(models_config)
         self.classification_model = self._resolve_classification_model()
         self.checkpoint_dir = settings.simulations_dir / config.name
@@ -196,7 +197,11 @@ class ExperimentRunner:
                     # Mark complete with the *real* result file path so
                     # the integrity check in is_completed passes. Clear
                     # any stale FAILED marker from a prior attempt.
-                    self.checkpoint.mark_completed(cell.cell_id, result_path)
+                    self.checkpoint.mark_completed(
+                        cell.cell_id,
+                        result_path,
+                        run_fingerprint=str(result.get("run_fingerprint", "")),
+                    )
                     self.checkpoint.clear_failed(cell.cell_id)
                     logger.info(f"Completed cell: {cell.cell_id}")
                 except CircuitBreakerOpen as exc:

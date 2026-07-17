@@ -43,9 +43,13 @@ class ExpressionDNA:
     # (nuwa 表达DNA / colleague Layer-2). Injected into the prompt verbatim.
     expression_rules: list[str] = field(default_factory=list)
 
-    # Embedding centroid for Tier-1 filter
+    # Embedding centroid + cosine-distance threshold for Tier-1 filter
+    # (2026-07-17 refactor: replaced embedding_std/embedding_max_z_threshold
+    # Bonferroni-corrected per-dim-max z filter with a single cosine-distance
+    # threshold calibrated to the 95th percentile of 1 − cos(u, centroid) on
+    # held-out cluster utterances).
     embedding_centroid: list[float] | None = None
-    embedding_std: list[float] | None = None
+    embedding_cosine_threshold: float | None = None
 
 
 @dataclass
@@ -82,25 +86,10 @@ class DecisionHeuristic:
 
 @dataclass
 class AntiPattern:
-    """A prohibited behavior pattern with trigger conditions."""
+    """A prohibited behavior pattern evaluated by the Tier-3 LLM judge."""
     description: str                    # what is prohibited
-    trigger_conditions: list[str]       # when this pattern would activate
-    trigger_regex: list[str] = field(default_factory=list)      # Category A: regex patterns
-    trigger_keywords: list[str] = field(default_factory=list)   # Category A: keyword triggers
-    # Category B: semantic-level triggers (Sentence-BERT cosine similarity)
-    trigger_semantic_phrases: list[str] = field(default_factory=list)  # reference phrases
-    trigger_semantic_threshold: float = 0.85  # θ_sem (calibrated on held-out data)
-    # Category C: behavioral-level triggers (action pattern matching)
-    trigger_action_patterns: list[str] = field(default_factory=list)  # e.g. "disagree->revert->report"
-    # Per-pattern Category-C classifier threshold (outline §4.4.1). When the
-    # behavioral trigger classifier is attached, this overrides the global
-    # ``Tier3AntiPatternBlock.behavioral_threshold`` so each anti-pattern
-    # can carry its own calibrated decision boundary. ``None`` = fall back
-    # to the global default (G7).
-    trigger_behavioral_threshold: float | None = None
-    reason: str = ""                    # why this is prohibited
-    # Grounding (both reference repos carry these): evidence from the corpus
-    # and the correct behaviour to do instead.
+    trigger_conditions: list[str]       # when it activates (used by LLM judge prompt)
+    reason: str = ""                    # why prohibited
     evidence: list[str] = field(default_factory=list)
     correct_alternative: str = ""
 

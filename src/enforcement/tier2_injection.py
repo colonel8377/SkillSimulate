@@ -1,23 +1,19 @@
 """Tier 2: Pre-generation Mind Models injection (retrieval-augmented).
 
-Dynamically selects the 3-5 most relevant reasoning templates from the
-cluster's Mind Models based on the current dialogue state (stance
-direction, conflict intensity, topic domain), then injects them into the
-LLM prompt before generation (outline §4.4).
+Dynamically selects the top-k most relevant reasoning templates from the
+cluster's Mind Models via direct SBERT retrieval on the recent dialogue,
+then injects them into the LLM prompt before generation (outline §4.4).
 """
 
 from __future__ import annotations
 
 import random
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from src.enforcement.base import EnforcementResult, EnforcementStrategy
 from src.enforcement.mind_model_retriever import MindModelRetriever
 from src.skill.schema import MindModel
 from src.config.embedder import run_embed_in_executor
-
-if TYPE_CHECKING:
-    from src.llm.client import LLMClient
 
 
 INJECTION_TEMPLATE = """You are participating in an online discussion. Follow these reasoning guidelines strictly:
@@ -31,9 +27,8 @@ class Tier2MindModelInjection(EnforcementStrategy):
     """Pre-generation context injection for Mind Models.
 
     Uses retrieval-augmented rule conditioning: per turn, the retriever
-    scores each Mind Model against the inferred dialogue state and only
-    the top-k most relevant templates are injected. This contrasts with
-    Descriptive Persona's static identity-tag system prompt.
+    scores each Mind Model against the recent dialogue via SBERT cosine
+    similarity, and only the top-k most relevant templates are injected.
     """
 
     def __init__(
@@ -41,15 +36,9 @@ class Tier2MindModelInjection(EnforcementStrategy):
         alpha: float = 1.0,
         top_k: int = 5,
         rng: random.Random | None = None,
-        llm_client: LLMClient | None = None,
-        llm_model_name: str | None = None,
     ):
         super().__init__(alpha, rng=rng)
-        self.retriever = MindModelRetriever(
-            top_k=top_k,
-            llm_client=llm_client,
-            model_name=llm_model_name,
-        )
+        self.retriever = MindModelRetriever(top_k=top_k)
         self.top_k = top_k
 
     async def check_pre_generation(
@@ -57,15 +46,7 @@ class Tier2MindModelInjection(EnforcementStrategy):
         messages: list[dict[str, str]],
         context: dict[str, Any],
     ) -> EnforcementResult:
-        """Inject the most relevant mind models into messages before generation.
-
-        Args:
-            messages: Current LLM message list.
-            context: Must contain "mind_models" (list[MindModel]).
-
-        Returns:
-            EnforcementResult with modified messages.
-        """
+        """Inject the most relevant mind models into messages before generation."""
         if not self._should_enforce():
             return EnforcementResult(passed=True, tier="none", modified_messages=messages)
 
@@ -73,10 +54,8 @@ class Tier2MindModelInjection(EnforcementStrategy):
         if not mind_models:
             return EnforcementResult(passed=True, tier="none", modified_messages=messages)
 
-        # Retrieval-augmented selection: only the top-k relevant models
-        state = await self.retriever.infer_dialogue_state(messages)
         selected = await run_embed_in_executor(
-            self.retriever.retrieve, mind_models, state
+            self.retriever.retrieve_for_messages, mind_models, messages
         )
 
         injection_text = self._format_mind_models(selected)
@@ -124,3 +103,4 @@ class Tier2MindModelInjection(EnforcementStrategy):
                 lines.append(f"- Evidence: {'; '.join(mm.evidence[:2])}")
             lines.append("")
         return "\n".join(lines)
+

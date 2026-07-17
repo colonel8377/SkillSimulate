@@ -6,6 +6,22 @@ from src.config.schemas import ConditionName
 
 ALL_CONDITIONS = [c.value for c in ConditionName]
 
+# Paper-facing names. Stable condition IDs remain unchanged for checkpoints
+# and code compatibility; these labels avoid claiming faithful reproduction
+# of external population-alignment / scaling-law pipelines.
+CONDITION_DISPLAY_NAMES = {
+    "descriptive": "Descriptive Persona",
+    "pop_aligned": "Cluster-Stat Aligned Persona",
+    "rich_narrative": "Rich Cluster Narrative",
+    "cadp_advisory_nuwa": "Nuwa Skill (Advisory Only)",
+    "cadp_full_nuwa": "CADP Full (Nuwa)",
+    "cadp_full_colleague": "CADP Full (Colleague)",
+}
+
+
+def condition_display_name(condition: str) -> str:
+    return CONDITION_DISPLAY_NAMES.get(condition, condition)
+
 
 def validate_conditions(conditions: list[str]) -> list[str]:
     """Validate condition names."""
@@ -49,7 +65,10 @@ def distiller_suffix(condition: str) -> str | None:
     """
     if condition == "cadp_full_colleague":
         return "colleague"
-    if condition in {"cadp_full_nuwa", "cadp_minus_ap", "cadp_shuffled"}:
+    if condition in {
+        "cadp_full_nuwa", "cadp_advisory_nuwa",
+        "cadp_minus_ap", "cadp_shuffled",
+    }:
         return "nuwa"
     return None
 

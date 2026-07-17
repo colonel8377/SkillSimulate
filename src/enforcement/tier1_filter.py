@@ -1,16 +1,20 @@
-"""Tier 1: Post-generation Expression DNA filter.
+"""Tier 1: post-generation Expression DNA filter.
 
-Checks generated text embedding against cluster's expression distribution.
-Rejects + regenerates if outside 2σ boundary.
+2026-07-17 simplification: cosine-distance-from-centroid with empirical
+95th-percentile threshold. Replaces the Bonferroni-corrected per-dim-max
+z-score filter, which (at d=1024) pushed the effective threshold to ~4.13σ
+and never fired in v3 runs. Cosine distance answers the intended question
+"does this vector belong to the cluster?" rather than "is any single dim
+extreme?".
 """
 
 from __future__ import annotations
 
 import random
+from typing import Any
 
 import numpy as np
 from loguru import logger
-from typing import Any
 
 from src.enforcement.base import EnforcementResult, EnforcementStrategy
 from src.llm.client import LLMClient
@@ -18,58 +22,8 @@ from src.skill.schema import ExpressionDNA
 from src.config.embedder import run_embed_in_executor
 
 
-def _bonferroni_threshold(per_dim_sigma: float, dim: int) -> float:
-    """Bonferroni-corrected per-dim-max z threshold for dim dimensions.
-
-    B1 reproducibility fix: the original code rejected when the per-dim
-    max z-score exceeded ``sigma_threshold``. For high-dim embeddings
-    (production: d=1024 for ``bge-large-en-v1.5``; debug: d=384 for
-    ``all-MiniLM-L6-v2``), the expected max of |z| over d independent
-    standard normals is ≈ sqrt(2 ln d) (d=1024: ≈ 3.79; d=384: ≈ 3.45)
-    — well above the legacy 2.0 threshold — so the filter would
-    systematically over-flag and inflate CADP-Full's safe-template
-    fallback rate (g5 over-alignment distortion).
-
-    Fix: treat "outside 2σ" as a multiple-comparison problem. Holding
-    the family-wise error rate at the same tail probability as a single
-    2σ two-sided test (P(|z|>2) ≈ 0.0455), the per-dim significance
-    required to flag *any* of d dimensions is alpha/d. The corrected
-    per-dim threshold is the (1 - alpha/d / 2) standard-normal quantile:
-    d=1024 → ≈ 4.13σ; d=384 → ≈ 3.84σ. Both are well above their
-    respective E[max|z|], preventing systematic over-rejection.
-
-    Args:
-        per_dim_sigma: User-facing σ boundary (e.g. 2.0).
-        dim: Embedding dimensionality.
-
-    Returns:
-        Effective per-dim-max z-score threshold.
-    """
-    if dim <= 1:
-        return float(per_dim_sigma)
-    try:
-        from scipy.stats import norm
-    except Exception:
-        # Fallback (no scipy): Gumbel approximation E[max|z|] ≈ sqrt(2 ln d)
-        # scaled by per_dim_sigma / 2 (so d=2 gives ~2σ, d→∞ grows slowly).
-        import math
-        return float(per_dim_sigma) * max(1.0, math.sqrt(2.0 * math.log(dim)) / 1.177)
-    # Family-wise two-sided tail probability at ``per_dim_sigma``
-    alpha_family = 2.0 * (1.0 - norm.cdf(per_dim_sigma))
-    alpha_per_dim = alpha_family / dim
-    # Guard against numerical underflow at very large d
-    alpha_per_dim = max(alpha_per_dim, 1e-12)
-    return float(norm.ppf(1.0 - alpha_per_dim / 2.0))
-
-
 class Tier1ExpressionFilter(EnforcementStrategy):
-    """Post-generation embedding filter for Expression DNA compliance.
-
-    B1 fix: the per-dim-max z-score is compared against a dimension-aware
-    Bonferroni-corrected threshold (see :func:`_bonferroni_threshold`),
-    not the raw ``sigma_threshold``. This preserves the 1-D 2σ family-wise
-    error rate as embedding dimensionality grows.
-    """
+    """Post-generation cosine-distance filter for Expression DNA compliance."""
 
     def __init__(
         self,
@@ -77,8 +31,6 @@ class Tier1ExpressionFilter(EnforcementStrategy):
         llm_client: LLMClient | None = None,
         model_name: str = "gpt-4o",
         max_retries: int = 1,
-        sigma_threshold: float = 2.0,
-        dimension_aware: bool = True,
         rng: random.Random | None = None,
     ):
         super().__init__(alpha, rng=rng)
@@ -88,10 +40,6 @@ class Tier1ExpressionFilter(EnforcementStrategy):
         # budget. Tier 1 mirrors this so both post-gen tiers use the same
         # regeneration budget (G6).
         self.max_retries = max_retries
-        self.sigma_threshold = sigma_threshold
-        # B1: when True, apply Bonferroni correction to the per-dim-max
-        # statistic so high-dim embeddings do not systematically over-flag.
-        self.dimension_aware = dimension_aware
         self._embedder = None
 
     @property
@@ -114,11 +62,12 @@ class Tier1ExpressionFilter(EnforcementStrategy):
         text: str,
         context: dict[str, Any],
     ) -> EnforcementResult:
-        """Check if generated text is within Expression DNA boundary.
+        """Check if generated text is within the cluster's cosine boundary.
 
         Args:
             text: Generated text.
-            context: Must contain "expression_dna" with embedding_centroid and embedding_std.
+            context: Must contain "expression_dna" with embedding_centroid and
+                embedding_cosine_threshold.
 
         Returns:
             EnforcementResult indicating pass/fail.
@@ -163,51 +112,28 @@ class Tier1ExpressionFilter(EnforcementStrategy):
             self.embedder.encode, text, show_progress_bar=False
         )
 
-        centroid = np.array(edna.embedding_centroid)
-        if edna.embedding_std:
-            std = np.array(edna.embedding_std)
-        else:
-            # Tier-1 z-score filter degrades to raw embedding delta (std=1)
-            # when the skill lacks per-dim std. Log loudly so a skill-
-            # compilation regression cannot silently turn this filter into a
-            # near-no-op.
+        centroid = np.asarray(edna.embedding_centroid, dtype=float)
+        text_emb = np.asarray(text_embedding, dtype=float)
+        text_norm = text_emb / (np.linalg.norm(text_emb) + 1e-10)
+        centroid_norm = centroid / (np.linalg.norm(centroid) + 1e-10)
+        cosine = float(np.dot(text_norm, centroid_norm))
+        distance = 1.0 - cosine
+
+        threshold = float(edna.embedding_cosine_threshold)
+        if not (0.0 < threshold < 1.0):
+            # Skill not yet recompiled with cosine threshold — fall back to a
+            # permissive default so the filter is not silently a no-op.
             logger.warning(
-                "ExpressionDNA.embedding_std is missing for this skill — "
-                "Tier-1 z-score filter degrading to raw embedding delta "
-                "(std=1). Recompile the skill to populate embedding_std."
+                "ExpressionDNA.embedding_cosine_threshold missing or invalid; "
+                "using fallback 0.4. Recompile the skill to calibrate the threshold."
             )
-            std = np.ones_like(centroid)
+            threshold = 0.4
 
-        # Compute z-score distance (cosine distance from centroid, normalized)
-        diff = text_embedding - centroid
-        # Avoid division by zero
-        std_safe = np.where(std > 1e-8, std, 1.0)
-        z_scores = np.abs(diff) / std_safe
-        max_z = float(np.max(z_scores))
-
-        # B1: dimension-aware threshold. The user-facing ``sigma_threshold``
-        # (e.g. 2σ) is interpreted family-wise: the per-dim-max z-score is
-        # compared against a Bonferroni-corrected threshold so the
-        # probability of flagging any in-distribution embedding stays at
-        # the 1-D σ level rather than growing with d. ``effective_threshold``
-        # degrades gracefully to ``sigma_threshold`` when dimension_aware
-        # is False (legacy behaviour).
-        dim = int(centroid.shape[0])
-        effective_threshold = (
-            _bonferroni_threshold(self.sigma_threshold, dim)
-            if self.dimension_aware
-            else float(self.sigma_threshold)
-        )
-
-        if max_z <= effective_threshold:
-            return EnforcementResult(
-                passed=True,
-                tier="tier1",
-                original_text=text,
-            )
+        if distance <= threshold:
+            return EnforcementResult(passed=True, tier="tier1", original_text=text)
 
         # Beyond boundary — apply distance-proportional rejection (outline §4.4.3)
-        distance_ratio = max_z / effective_threshold
+        distance_ratio = distance / threshold
         if not self._rejection_probability(distance_ratio):
             # α-gated: probabilistically let this pass
             return EnforcementResult(
@@ -215,18 +141,17 @@ class Tier1ExpressionFilter(EnforcementStrategy):
                 tier="tier1",
                 original_text=text,
                 reason=(
-                    f"Expression DNA beyond boundary (z={max_z:.2f}, "
-                    f"threshold={effective_threshold:.2f}) but α-gate passed"
+                    f"Expression DNA beyond boundary (cos_dist={distance:.3f}, "
+                    f"threshold={threshold:.3f}) but α-gate passed"
                 ),
             )
 
-        # Failed — need regeneration
         return EnforcementResult(
             passed=False,
             tier="tier1",
             reason=(
-                f"Expression DNA violation: max z-score {max_z:.2f} > "
-                f"{effective_threshold:.2f} (dim-aware threshold for d={dim})"
+                f"Expression DNA violation: cosine distance {distance:.3f} > "
+                f"threshold {threshold:.3f}"
             ),
             original_text=text,
         )
@@ -241,17 +166,11 @@ class Tier1ExpressionFilter(EnforcementStrategy):
         """Check and regenerate if necessary.
 
         Outline §4.4.2 specifies a safe-template fallback after N_retry
-        exhausted. Tier 1 mirrors this: when regeneration budget is spent
-        and the text is still outside the 2σ boundary, fall back to a
-        neutral safe template (caller-supplied) rather than silently
-        accepting the off-boundary text. When no ``safe_template`` is
-        provided, fall back to the prior behaviour (accept the last
-        attempt) so legacy callers and unit tests are unaffected.
-
-        Returns:
-            Tuple of (final_text, enforcement_result). ``result.passed``
-            is False when the safe-template fallback was used so the
-            harness can count it as a violation in metrics.
+        exhausted. When regeneration budget is spent and the text is still
+        outside the boundary, fall back to a neutral safe template
+        (caller-supplied) rather than silently accepting the off-boundary
+        text. When no ``safe_template`` is provided, fall back to the prior
+        behaviour (accept the last attempt).
         """
         for attempt in range(self.max_retries + 1):
             result = await self.check_post_generation(text, context)
@@ -259,7 +178,6 @@ class Tier1ExpressionFilter(EnforcementStrategy):
                 return text, result
 
             if attempt < self.max_retries and self.llm is not None:
-                # Add regeneration hint
                 regen_messages = list(original_messages)
                 regen_messages.append({
                     "role": "assistant",
@@ -269,15 +187,14 @@ class Tier1ExpressionFilter(EnforcementStrategy):
                     "role": "user",
                     "content": (
                         "Your previous response doesn't match the expected communication style. "
-                        "Please rewrite it to be more consistent with the following style guidelines: "
+                        "Rewrite only the response text. Preserve the selected action, reply target, "
+                        "stance direction, and factual meaning stated in the context. Make it more "
+                        "consistent with the following style guidelines: "
                         + self._format_style_hints(context.get("expression_dna"))
                     ),
                 })
                 text = await self.llm.chat_completion(regen_messages, self.model_name)
             else:
-                # Out of retries — apply safe-template fallback when the
-                # caller supplied one; otherwise preserve legacy
-                # "accept the best attempt" semantics (G6).
                 if safe_template is not None:
                     return safe_template, EnforcementResult(
                         passed=False,

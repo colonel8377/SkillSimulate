@@ -40,6 +40,13 @@ class PopulationBuilder:
         per_msg_token_floor: int = 60,
         max_thread_messages: int = 5,
         reflection_interval: int = 10,
+        population_allocation: str = "proportional",
+        max_reformulation_retries: int = 1,
+        tier1_max_retries: int = 1,
+        tier3_llm_judge_enabled: bool = False,
+        tier3_llm_judge_model: str = "classification",
+        tier3_llm_judge_audit_only: bool = False,
+        tier3_llm_judge_output_dir: str = "outputs/results/tier3_llm_judgments",
     ):
         """Initialize population builder.
 
@@ -62,6 +69,10 @@ class PopulationBuilder:
             per_msg_token_floor: per-msg token floor.
             max_thread_messages: recent thread messages in planner prompt.
             reflection_interval: periodic reflection every N rounds.
+            tier3_llm_judge_enabled: Enable LLM-as-judge Tier 3.
+            tier3_llm_judge_model: Model name for LLM judge.
+            tier3_llm_judge_audit_only: If True, judge logs but does not block.
+            tier3_llm_judge_output_dir: Directory to save judgment logs.
         """
         self.llm = llm_client
         self.model_name = model_name
@@ -78,6 +89,18 @@ class PopulationBuilder:
         self.per_msg_token_floor = per_msg_token_floor
         self.max_thread_messages = max_thread_messages
         self.reflection_interval = reflection_interval
+        if population_allocation not in {"proportional", "balanced"}:
+            raise ValueError(
+                "population_allocation must be 'proportional' or 'balanced', "
+                f"got {population_allocation!r}"
+            )
+        self.population_allocation = population_allocation
+        self.max_reformulation_retries = max_reformulation_retries
+        self.tier1_max_retries = tier1_max_retries
+        self.tier3_llm_judge_enabled = tier3_llm_judge_enabled
+        self.tier3_llm_judge_model = tier3_llm_judge_model
+        self.tier3_llm_judge_audit_only = tier3_llm_judge_audit_only
+        self.tier3_llm_judge_output_dir = tier3_llm_judge_output_dir
         # Issue 1: derive the per-agent memory token budget from the
         # model endpoint's input-token cap. We reserve ~30% of the
         # input budget for system prompt + thread context + planner
@@ -128,6 +151,8 @@ class PopulationBuilder:
         cluster_ids = cluster_result.get_cluster_ids()
         if cluster_proportions:
             allocations = self._allocate_by_proportions(size, cluster_proportions)
+        elif self.population_allocation == "balanced":
+            allocations = self._allocate_balanced(size, cluster_ids)
         else:
             allocations = self._allocate_proportional(size, cluster_result, cluster_ids)
 
@@ -160,6 +185,22 @@ class PopulationBuilder:
 
         rng.shuffle(agents)
         return agents[:size]
+
+    @staticmethod
+    def _allocate_balanced(size: int, cluster_ids: list[int]) -> dict[int, int]:
+        """Allocate agents evenly across locked skills for feasibility tests."""
+        if not cluster_ids:
+            return {}
+        if size < len(cluster_ids):
+            raise ValueError(
+                f"Balanced population needs at least one agent per cluster: "
+                f"size={size}, clusters={len(cluster_ids)}"
+            )
+        base, remainder = divmod(size, len(cluster_ids))
+        return {
+            cid: base + int(index < remainder)
+            for index, cid in enumerate(sorted(cluster_ids))
+        }
 
     def _allocate_proportional(
         self,
@@ -229,6 +270,7 @@ class PopulationBuilder:
             sample_individual_attributes,
         )
         from src.agents.cadp import CADPAgent
+        from src.agents.cadp_advisory import CADPAdvisoryAgent
         from src.agents.ablations import (
             CADPShuffledAgent,
             CADPMinusExpressionDNAAgent,
@@ -279,6 +321,7 @@ class PopulationBuilder:
             per_msg_token_floor=self.per_msg_token_floor,
             max_thread_messages=self.max_thread_messages,
             reflection_interval=self.reflection_interval,
+            max_reformulation_retries=self.max_reformulation_retries,
         )
 
         # Per-tier alpha + backend kwargs for CADP agents
@@ -289,6 +332,11 @@ class PopulationBuilder:
             alpha_tier3=self.alpha_tier3,
             backend=self.backend,
             seed=agent_seed,
+            tier1_max_retries=self.tier1_max_retries,
+            tier3_llm_judge_enabled=self.tier3_llm_judge_enabled,
+            tier3_llm_judge_model=self.tier3_llm_judge_model,
+            tier3_llm_judge_audit_only=self.tier3_llm_judge_audit_only,
+            tier3_llm_judge_output_dir=self.tier3_llm_judge_output_dir,
         )
 
         if condition == "vanilla":
@@ -332,8 +380,8 @@ class PopulationBuilder:
             )
 
         elif condition == "pop_aligned":
-            # Population-Aligned Persona (arXiv:2509.10127):
-            # Match attribute distribution, not behavioral rules
+            # Internal Cluster-Stat Aligned Persona: samples the project's
+            # cluster attributes; not a reproduction of arXiv:2509.10127.
             cluster_stats, sampled = _pop_attributes(cluster_id, rng)
             return PopAlignedPersonaAgent(
                 cluster_attributes=cluster_stats,
@@ -343,12 +391,11 @@ class PopulationBuilder:
 
         elif condition == "rich_narrative":
             # Lever-1 ceiling / kill condition (reframe v1, 2026-07-08):
-            # maximalist narrative persona from the SAME cluster stats as
-            # the descriptive condition, rendered as multi-paragraph
+            # maximalist narrative persona from aggregate cluster stats,
+            # rendered as multi-paragraph
             # narrative with concrete episodes and example moves. NO
-            # compiled .skill rules, NO filter-retry. Same data source
-            # as cadp_full_nuwa → isolates "rules vs description" as
-            # the sole variable in the kill comparison.
+            # compiled .skill rules, NO filter-retry. This tests overall
+            # package viability; it does not isolate one causal variable.
             members = cluster_result.get_cluster_members(int(cluster_id))
             member_features = [
                 cluster_result.user_features[uid]
@@ -388,6 +435,14 @@ class PopulationBuilder:
             # distiller_suffix for the fail-fast loading behavior.
             skill = self._get_skill_or_raise(cluster_id, condition)
             return CADPAgent(skill=skill, **alpha_kwargs, **common_kwargs)
+
+        elif condition == "cadp_advisory_nuwa":
+            skill = self._get_skill_or_raise(cluster_id, condition)
+            return CADPAdvisoryAgent(
+                skill=skill,
+                backend=self.backend,
+                **common_kwargs,
+            )
 
         elif condition == "cadp_shuffled":
             if not self.skills:
@@ -483,14 +538,16 @@ class PopulationBuilder:
         if not member_features:
             return {}
 
-        vectors = np.array([f.to_vector() for f in member_features])
-        attr_names = [
-            "reply_depth", "edit_frequency",
-            "stance_shift_rate", "conflict_engagement_ratio",
-        ]
+        attr_accessors = {
+            "reply_depth": "mean_indentation",
+            "verbosity": "verbosity",
+            "question_rate": "question_rate",
+            "wp_citation_rate": "wp_citation_rate",
+            "conflict_engagement_ratio": "conflict_engagement_ratio",
+        }
         stats = {}
-        for i, name in enumerate(attr_names):
-            col = vectors[:, i]
+        for name, field_name in attr_accessors.items():
+            col = np.array([getattr(f, field_name) for f in member_features], dtype=float)
             stats[name] = float(np.mean(col))
         msg_counts = [f.message_count for f in member_features]
         thread_counts = [f.thread_count for f in member_features]
@@ -507,8 +564,10 @@ class PopulationBuilder:
     ) -> float:
         """Sample per-agent engagement ratio from cluster's real activity distribution.
 
-        Maps user message_count to [0.1, 1.0] engagement ratio, producing
-        heterogeneous participation (long-tail) rather than uniform 0.5.
+        Samples an empirical within-cluster activity quantile and maps it to a
+        bounded, nonlinear participation probability. Quantile mapping avoids
+        the previous global min/max collapse where a few extreme power users
+        forced every sampled agent to the 0.1 floor.
         """
         import numpy as np
 
@@ -522,25 +581,18 @@ class PopulationBuilder:
         if not msg_counts:
             return 0.5
 
-        msg_arr = np.array(msg_counts, dtype=float)
-        msg_min = float(np.min(msg_arr))
-        msg_max = float(np.max(msg_arr))
-
-        # Sample from log-normal-ish distribution matching real data
-        log_counts = np.log1p(msg_arr)
-        log_mean = float(np.mean(log_counts))
-        log_std = float(np.std(log_counts))
-
-        sampled_log = rng.gauss(log_mean, max(log_std, 0.1))
-        sampled_count = np.expm1(sampled_log)
-
-        # Normalize to [0.1, 1.0]
-        if msg_max > msg_min:
-            ratio = (sampled_count - msg_min) / (msg_max - msg_min)
-        else:
-            ratio = 0.5
-
-        return float(max(0.1, min(1.0, ratio)))
+        msg_arr = np.sort(np.asarray(msg_counts, dtype=float))
+        sampled_count = float(msg_arr[rng.randrange(len(msg_arr))])
+        left = int(np.searchsorted(msg_arr, sampled_count, side="left"))
+        right = int(np.searchsorted(msg_arr, sampled_count, side="right"))
+        # Randomized tie rank prevents the many minimum-activity users from
+        # receiving one identical engagement probability.
+        rank = rng.uniform(left, max(left + 1, right))
+        quantile = (rank + 0.5) / len(msg_arr)
+        # A convex map preserves a long tail: many agents sit near zero while
+        # high empirical quantiles engage up to half of the available threads.
+        ratio = 0.05 + 0.45 * quantile * quantile
+        return float(max(0.05, min(0.50, ratio)))
 
     def _build_descriptive_persona(
         self,
@@ -571,9 +623,9 @@ class PopulationBuilder:
             stats["conflict_engagement_ratio"],
             low=0.15, high=0.4,
         )
-        flexibility = _level(
-            stats["stance_shift_rate"],
-            low=0.15, high=0.4,
+        inquisitiveness = _level(
+            stats["question_rate"],
+            low=0.05, high=0.2,
         )
 
         lines = [
@@ -582,10 +634,11 @@ class PopulationBuilder:
             f"{stats['avg_threads']:.0f} threads participated)",
             f"Conflict involvement: {conflict} "
             f"(engages in {stats['conflict_engagement_ratio']:.1%} of contested discussions)",
-            f"Opinion flexibility: {flexibility} "
-            f"(stance shift rate: {stats['stance_shift_rate']:.2f})",
+            f"Inquisitiveness: {inquisitiveness} "
+            f"(question rate: {stats['question_rate']:.2f})",
             f"Typical reply depth: {stats['reply_depth']:.1f}",
-            f"Editing tendency: {stats['edit_frequency']:.2f} edits per message",
+            f"Message verbosity (log characters): {stats['verbosity']:.2f}",
+            f"Wikipedia policy citation rate: {stats['wp_citation_rate']:.2f}",
             f"Community group: {stats['n_members']} users with similar behavioral patterns",
         ]
         return "\n".join(lines)
@@ -627,7 +680,7 @@ class PopulationBuilder:
 
         activity = _level(stats["avg_messages"], low=2, high=10)
         conflict = _level(stats["conflict_engagement_ratio"], low=0.15, high=0.4)
-        flexibility = _level(stats["stance_shift_rate"], low=0.15, high=0.4)
+        inquisitiveness = _level(stats["question_rate"], low=0.05, high=0.2)
 
         # Activity narrative
         if activity == "high":
@@ -686,43 +739,41 @@ class PopulationBuilder:
                 f"question, not a bare objection."
             )
 
-        # Stance-flexibility narrative
-        stance = stats["stance_shift_rate"]
-        if flexibility == "high":
+        # Inquisitiveness narrative (an observed linguistic rate, not an
+        # inferred claim about private opinion change).
+        question_rate = stats["question_rate"]
+        if inquisitiveness == "high":
             stance_passage = (
-                f"You change your mind in public. In about {stance:.0%} of "
-                f"disputes you've been part of, you've shifted position at "
-                f"least once after hearing counter-arguments, and you're "
-                f"willing to say so — 'fair point, I was wrong about that' "
-                f"is something you'll actually write."
+                f"You ask questions frequently (about {question_rate:.0%} of "
+                f"your messages contain one). You probe definitions, request "
+                f"sources, and use questions to expose the exact point of disagreement."
             )
-        elif flexibility == "low":
+        elif inquisitiveness == "low":
             stance_passage = (
-                f"You hold your positions. Your stance shift rate is only "
-                f"{stance:.0%}; once you've laid out a view you tend to "
-                f"defend it, and you rarely concede in-thread even if you "
-                f"privately revise later."
+                f"You rarely phrase contributions as questions (about "
+                f"{question_rate:.0%} of messages). You usually state the "
+                f"relevant fact, policy, or proposed change directly."
             )
         else:
             stance_passage = (
-                f"You're persuadable but not wishy-washy — you revise your "
-                f"position in about {stance:.0%} of disputes, usually when "
-                f"someone brings a source or a point you hadn't considered."
+                f"You mix direct claims with focused questions; about "
+                f"{question_rate:.0%} of your messages contain a question, "
+                f"usually to clarify evidence or the next concrete step."
             )
 
         # Depth + editing
         depth_passage = (
             f"You tend to reply about {stats['reply_depth']:.1f} levels deep "
-            f"in a thread before you feel a point is settled, and you edit "
-            f"your own messages about {stats['edit_frequency']:.2f} times "
-            f"each — small fixes for wording, sources, or formatting, not "
-            f"full rewrites."
+            f"in a thread before you feel a point is settled. Your typical "
+            f"verbosity is {stats['verbosity']:.2f} on the log-character "
+            f"scale, and about {stats['wp_citation_rate']:.0%} of your "
+            f"messages explicitly cite Wikipedia policy."
         )
 
         # Typical opening move — derived from conflict × flexibility combo.
         # Stays descriptive ("you tend to..."), never prescriptive, so it
         # remains lever-1 narrative rather than drifting into lever-2 rules.
-        if conflict == "high" and flexibility != "low":
+        if conflict == "high" and inquisitiveness != "low":
             opening_passage = (
                 f"Your typical opening move is to identify one concrete "
                 f"problem with the previous post — an unsourced claim, an "
@@ -823,14 +874,14 @@ class PopulationBuilder:
         # Determine segment archetype
         conflict_val = stats["conflict_engagement_ratio"]
         activity_val = stats["avg_messages"]
-        flexibility_val = stats["stance_shift_rate"]
+        question_val = stats["question_rate"]
 
-        if conflict_val > 0.35 and flexibility_val < 0.2:
+        if conflict_val > 0.35 and question_val < 0.05:
             archetype = "Confrontational Defenders"
         elif conflict_val < 0.15 and activity_val > 8:
             archetype = "Active Contributors"
-        elif flexibility_val > 0.35:
-            archetype = "Flexible Mediators"
+        elif question_val > 0.2:
+            archetype = "Inquisitive Discussants"
         elif activity_val < 3:
             archetype = "Occasional Observers"
         else:
@@ -849,15 +900,14 @@ class PopulationBuilder:
             f"Average activity: {activity_val:.0f} messages across "
             f"{stats['avg_threads']:.0f} threads\n"
             f"Average reply depth: {stats['reply_depth']:.1f}\n"
-            f"Editing frequency: {stats['edit_frequency']:.2f} per message"
+            f"Message verbosity (log characters): {stats['verbosity']:.2f}\n"
+            f"Policy citation rate: {stats['wp_citation_rate']:.1%}"
         )
 
         psychographics = (
             f"Conflict engagement: {conflict_val:.1%} of messages in contested discussions\n"
-            f"Stance flexibility: {flexibility_val:.2f} stance shift rate\n"
+            f"Inquisitiveness: {question_val:.1%} question rate\n"
             f"Behavioral archetype: {archetype}\n"
-            f"Tendency to defend positions vs. adapt: "
-            f"{'defends' if flexibility_val < 0.2 else 'adapts' if flexibility_val > 0.35 else 'balanced'}\n"
             f"Interaction style: "
             f"{'confrontational' if conflict_val > 0.35 else 'collaborative' if conflict_val < 0.15 else 'mixed'}"
         )

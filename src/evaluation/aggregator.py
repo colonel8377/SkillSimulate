@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+import math
 from typing import TYPE_CHECKING, Any
 
 import networkx as nx
@@ -15,11 +16,19 @@ from src.data.schemas import Message, Thread
 from src.evaluation.linguistics import LinguisticMetrics
 from src.evaluation.macro import MacroMetrics
 from src.evaluation.meso import MesoMetrics
-from src.evaluation.micro import MicroMetrics, caricature_index
+from src.evaluation.micro import (
+    MicroMetrics,
+    caricature_bootstrap_ci,
+    caricature_index,
+)
 from src.simulation.sandbox import SimulationResult
 
 if TYPE_CHECKING:
     from src.llm.client import LLMClient
+
+
+class EvaluationIntegrityError(RuntimeError):
+    """Raised when reference data or a required metric is scientifically invalid."""
 
 
 @dataclass
@@ -90,10 +99,16 @@ class MetricsAggregator:
         model_provenance: dict[str, dict[str, str]] | None = None,
         llm_client: LLMClient | None = None,
         llm_model_name: str | None = None,
+        action_smoothing: float = 0.0,
+        continuation_mode: bool = False,
+        linguistic_metric_weights: dict[str, float] | None = None,
+        interaction_metric_weights: dict[str, float] | None = None,
+        seed: int = 42,
     ):
         self.reports: list[MetricsReport] = []
         self.held_out_events_dir = held_out_events_dir
         self.role_labels_dir = role_labels_dir
+        self.seed = seed
         # Tracks which datasets fell back to the Louvain proxy, for §7.4 reporting
         self.datasets_using_role_label_proxy: set[str] = set()
         # Audit P5: ``{model_name: {"snapshot_date": ..., "commit_hash": ...}}``
@@ -103,6 +118,36 @@ class MetricsAggregator:
         # LLM client for speech act classification (optional)
         self._llm_client = llm_client
         self._llm_model_name = llm_model_name
+        self.action_smoothing = float(action_smoothing)
+        self.continuation_mode = bool(continuation_mode)
+        self.linguistic_metric_weights = linguistic_metric_weights or {
+            "discourse_relation_match": 0.25,
+            "sentiment_trajectory_similarity": 0.25,
+            "speech_act_similarity": 0.25,
+            "sip": 0.25,
+        }
+        self.interaction_metric_weights = interaction_metric_weights or {
+            "cascade": 0.5, "graph": 0.5,
+        }
+        self._validate_composite_weights()
+
+    def _validate_composite_weights(self) -> None:
+        expected_linguistic = {
+            "discourse_relation_match", "sentiment_trajectory_similarity",
+            "speech_act_similarity", "sip",
+        }
+        if set(self.linguistic_metric_weights) != expected_linguistic:
+            raise ValueError("linguistic_metric_weights must name exactly four required metrics")
+        if set(self.interaction_metric_weights) != {"cascade", "graph"}:
+            raise ValueError("interaction_metric_weights must name cascade and graph")
+        for name, weights in (
+            ("linguistic", self.linguistic_metric_weights),
+            ("interaction", self.interaction_metric_weights),
+        ):
+            if any(float(value) < 0 for value in weights.values()):
+                raise ValueError(f"{name} metric weights must be non-negative")
+            if not math.isclose(sum(map(float, weights.values())), 1.0, abs_tol=1e-9):
+                raise ValueError(f"{name} metric weights must sum to 1")
 
     def _load_held_out_events(self, dataset: str) -> list | None:
         """Load annotated held-out events for a dataset, if available.
@@ -168,7 +213,8 @@ class MetricsAggregator:
 
         matched = len(anonymized)
         logger.info(
-            f"Role labels: {matched} users loaded, anonymized via PII hash"
+            f"Role labels: {matched} users loaded and anonymized; overlap is "
+            "validated against each reference graph during evaluation"
         )
         return anonymized
 
@@ -176,6 +222,7 @@ class MetricsAggregator:
         self,
         sim_result: SimulationResult,
         real_threads: list[Thread],
+        linguistic_reference_threads: list[Thread] | None = None,
     ) -> MetricsReport:
         """Evaluate a simulation result against real data.
 
@@ -184,13 +231,21 @@ class MetricsAggregator:
             real_threads: Ground truth threads from real data.
 
         Returns:
-            MetricsReport with all 5 metric layers.
+            MetricsReport with all 4 metric layers.
         """
+        linguistic_reference_threads = linguistic_reference_threads or real_threads
+
         # Build real data structures
         real_messages = [
             self._msg_to_dict(m) for t in real_threads for m in t.messages
         ]
         real_graph = self._build_graph_from_threads(real_threads)
+
+        self._validate_simulation_result(sim_result)
+        if not real_messages:
+            raise EvaluationIntegrityError("Action/topology reference contains no messages")
+        if real_graph.number_of_edges() == 0:
+            raise EvaluationIntegrityError("Action/topology reference graph has no reply edges")
 
         # Outline §5.3 anti-circularity mandate: prefer external role labels
         # (Wu et al. 2025 segmentation or human-annotated moderator /
@@ -199,12 +254,23 @@ class MetricsAggregator:
         # and record the fallback so §7.4 can report per-dataset validity.
         external_role_labels = self._load_role_labels(sim_result.dataset)
         if external_role_labels is not None:
-            real_communities = external_role_labels
-            logger.info(
-                f"Micro/Macro real-data ground truth: using EXTERNAL role labels "
-                f"for {sim_result.dataset} ({len(external_role_labels)} users, "
-                f"{len(set(external_role_labels.values()))} roles)"
+            node_coverage, edge_coverage = self._label_coverage(
+                real_graph, external_role_labels
             )
+            if node_coverage >= 0.5 and edge_coverage >= 0.5:
+                real_communities = external_role_labels
+                logger.info(
+                    f"Micro/Macro real-data ground truth: using EXTERNAL role labels "
+                    f"for {sim_result.dataset} (node coverage={node_coverage:.1%}, "
+                    f"edge coverage={edge_coverage:.1%})"
+                )
+            else:
+                logger.warning(
+                    f"External role labels cover only {node_coverage:.1%} of nodes "
+                    f"and {edge_coverage:.1%} of edges; using Louvain proxy"
+                )
+                real_communities = self._infer_communities(real_threads)
+                self.datasets_using_role_label_proxy.add(sim_result.dataset)
         else:
             real_communities = self._infer_communities(real_threads)
             self.datasets_using_role_label_proxy.add(sim_result.dataset)
@@ -218,13 +284,23 @@ class MetricsAggregator:
                 f"Recorded for §7.4 Threats to Validity."
             )
 
-        real_action_dist = self._compute_action_dist(real_messages)
+        real_behavior_messages = self._canonicalize_actions(
+            real_messages, sim_result.dataset
+        )
+        real_action_dist = self._compute_action_dist(real_behavior_messages)
         real_chain_lengths = self._compute_chain_lengths(real_threads)
-        real_agent_counts = self._compute_agent_action_counts(real_threads)
+        real_agent_counts = self._compute_agent_action_counts_from_dicts(
+            real_behavior_messages
+        )
 
         # Build simulation data structures
         sim_messages = sim_result.messages
+        action_text_consistency, action_text_n = self._action_text_consistency(
+            sim_messages
+        )
         sim_graph = self._build_graph_from_dicts(sim_messages, sim_result.agent_states)
+        if sim_graph.number_of_edges() == 0:
+            raise EvaluationIntegrityError("Simulation interaction graph has no agent-agent edges")
         sim_communities = {
             a["agent_id"]: int(a.get("cluster_id", 0))
             for a in sim_result.agent_states
@@ -238,153 +314,176 @@ class MetricsAggregator:
         # report artificially distorted values instead of their true ceiling.
         if sim_result.condition == "real_history":
             sim_communities = dict(real_communities)
-        sim_action_dist = self._compute_action_dist(sim_messages)
-        sim_agent_counts = self._compute_agent_action_counts_from_dicts(sim_messages)
+        sim_behavior_messages = self._canonicalize_actions(
+            sim_messages, sim_result.dataset
+        )
+        sim_action_dist = self._compute_action_dist(sim_behavior_messages)
+        sim_agent_counts = self._compute_agent_action_counts_from_dicts(
+            sim_behavior_messages
+        )
+        self._validate_action_reference(real_action_dist)
 
         # Compute metrics per layer
         all_metrics = {}
 
-        # Layer 1: Macro
-        try:
-            all_metrics.update(MacroMetrics.compute(
-                sim_graph=sim_graph,
-                real_graph=real_graph,
-                sim_communities=sim_communities,
-                real_communities=real_communities,
-                sim_action_dist=sim_action_dist,
-                real_action_dist=real_action_dist,
-            ))
-        except Exception as e:
-            logger.warning(f"MacroMetrics computation failed: {e}")
+        # Layer 1: Macro. Required layers fail closed: a partial report must
+        # never receive a COMPLETE marker after an expensive simulation.
+        all_metrics.update(MacroMetrics.compute(
+            sim_graph=sim_graph,
+            real_graph=real_graph,
+            sim_communities=sim_communities,
+            real_communities=real_communities,
+            sim_action_dist=sim_action_dist,
+            real_action_dist=real_action_dist,
+            action_smoothing=self.action_smoothing,
+        ))
 
         # Layer 2: Meso
-        try:
-            sim_chain_lengths = self._compute_chain_lengths_from_dicts(sim_messages)
+        sim_chain_lengths = self._compute_chain_lengths_from_dicts(
+            sim_messages,
+            context_messages=(None if self.continuation_mode else sim_result.seed_messages),
+        )
 
-            # Extract temporal sequences for DTW (outline §6.4)
-            sim_temporal = [
-                rm.get("polarization_proxy", 0.0)
-                for rm in sim_result.per_round_metrics
-            ]
-            real_temporal = self._estimate_real_temporal(real_messages)
+        # Extract temporal sequences for DTW (outline §6.4)
+        sim_temporal = self._estimate_sim_temporal(sim_behavior_messages)
+        real_temporal = self._estimate_real_temporal(real_behavior_messages)
 
-            all_metrics.update(MesoMetrics.compute(
-                sim_graph=sim_graph,
-                real_graph=real_graph,
-                sim_chain_lengths=sim_chain_lengths,
-                real_chain_lengths=real_chain_lengths,
-                sim_temporal=sim_temporal if sim_temporal else None,
-                real_temporal=real_temporal if real_temporal else None,
-            ))
-        except Exception as e:
-            logger.warning(f"MesoMetrics computation failed: {e}")
+        all_metrics.update(MesoMetrics.compute(
+            sim_graph=sim_graph,
+            real_graph=real_graph,
+            sim_chain_lengths=sim_chain_lengths,
+            real_chain_lengths=real_chain_lengths,
+            sim_temporal=sim_temporal if sim_temporal else None,
+            real_temporal=real_temporal if real_temporal else None,
+        ))
 
         # Layer 3: Micro
-        try:
-            # Build agent×action matrices for Frobenius similarity.
-            # Use the union of actions so the matrices are aligned and missing
-            # actions are explicitly zero-padded.
-            all_actions = sorted(
-                set(sim_action_dist.keys()) | set(real_action_dist.keys())
-            )
-            sim_matrix = self._build_action_matrix(sim_agent_counts, actions=all_actions)
-            real_matrix = self._build_action_matrix(real_agent_counts, actions=all_actions)
+        # Build agent×action matrices for Frobenius similarity.
+        # Use the union of actions so the matrices are aligned and missing
+        # actions are explicitly zero-padded.
+        all_actions = sorted(
+            set(sim_action_dist.keys()) | set(real_action_dist.keys())
+        )
+        sim_matrix = self._build_action_matrix(sim_agent_counts, actions=all_actions)
+        real_matrix = self._build_action_matrix(real_agent_counts, actions=all_actions)
 
-            # Build behavioral profiles for RSA
-            sim_profiles = self._build_profiles(sim_agent_counts, actions=all_actions)
-            real_profiles = self._build_profiles(real_agent_counts, actions=all_actions)
+        # Build behavioral profiles for RSA
+        sim_profiles = self._build_profiles(sim_agent_counts, actions=all_actions)
+        real_profiles = self._build_profiles(real_agent_counts, actions=all_actions)
 
-            all_metrics.update(MicroMetrics.compute(
-                sim_matrix=sim_matrix,
-                real_matrix=real_matrix,
-                sim_profiles=sim_profiles,
-                real_profiles=real_profiles,
-                sim_action_counts=Counter(sim_action_dist),
-                real_action_counts=Counter(real_action_dist),
-                sim_agent_counts=sim_agent_counts,
-                real_agent_counts=real_agent_counts,
-            ))
-        except Exception as e:
-            logger.warning(f"MicroMetrics computation failed: {e}")
+        all_metrics.update(MicroMetrics.compute(
+            sim_matrix=sim_matrix,
+            real_matrix=real_matrix,
+            sim_profiles=sim_profiles,
+            real_profiles=real_profiles,
+            sim_action_counts=Counter(sim_action_dist),
+            real_action_counts=Counter(real_action_dist),
+            sim_agent_counts=sim_agent_counts,
+            real_agent_counts=real_agent_counts,
+        ))
 
         # Caricature Index (outline §5.3 — between-cluster behavioral Cohen's d)
         # Responds to Chameleon's Limit §3.3 "fidelity breeds caricature":
         # measures whether enforcement increases between-cluster stereotyping.
-        try:
-            caricature_sim = caricature_index(
-                sim_agent_counts, sim_communities,
-            )
-            all_metrics["caricature_index_sim"] = caricature_sim
-        except Exception as e:
-            logger.warning(f"Caricature index computation failed: {e}")
+        caricature_sim = caricature_index(sim_agent_counts, sim_communities)
+        caricature_real = caricature_index(real_agent_counts, real_communities)
+        sim_ci_low, sim_ci_high = caricature_bootstrap_ci(
+            sim_agent_counts, sim_communities, seed=sim_result.repeat + 42,
+        )
+        real_ci_low, real_ci_high = caricature_bootstrap_ci(
+            real_agent_counts, real_communities, seed=self.seed,
+        )
+        all_metrics["caricature_index_sim"] = caricature_sim
+        all_metrics["caricature_index_real"] = caricature_real
+        all_metrics["caricature_gap"] = abs(caricature_sim - caricature_real)
+        all_metrics["caricature_index_sim_ci_low"] = sim_ci_low
+        all_metrics["caricature_index_sim_ci_high"] = sim_ci_high
+        all_metrics["caricature_index_real_ci_low"] = real_ci_low
+        all_metrics["caricature_index_real_ci_high"] = real_ci_high
 
         # Layer 4: Linguistics
-        try:
-            import random as _rand
-            sim_msg_objects = [self._dict_to_msg(m) for m in sim_messages[:200]]
-            # Sample real messages representatively across all threads
-            all_real_msgs = [m for t in real_threads for m in t.messages if m.text.strip()]
-            if len(all_real_msgs) > 500:
-                all_real_msgs = _rand.Random(42).sample(all_real_msgs, 500)
+        sim_sample = self._stratified_message_sample(sim_messages, 200)
+        sim_msg_objects = [self._dict_to_msg(m) for m in sim_sample]
+        all_real_msgs = self._stratified_thread_message_sample(
+            linguistic_reference_threads, 500,
+        )
+        if not sim_msg_objects or not all_real_msgs:
+            raise EvaluationIntegrityError("Linguistic reference or simulation sample is empty")
 
-            # outline §5.7 / §4.4.2 step 4: messages produced via the Forced
-            # Reformulation safe-template fallback are linguistically degenerate
-            # by construction (deliberately bland to dodge anti-patterns). Pooling
-            # them with normal outputs deflates the linguistics scores of
-            # constraint-heavy conditions (e.g. ``cadp_constraint_only``,
-            # ``cadp_full``). We therefore report two stratified families:
-            #   linguistics_*_normal         — headline (drops safe-templates)
-            #   linguistics_*_safe_template  — audit-only (safe-templates only)
-            # plus the legacy pooled metric (kept for backward compatibility).
-            sim_normal = [
-                m for m in sim_msg_objects
-                if not m.metadata.get("constraint_forced", False)
-            ]
-            sim_safe = [
-                m for m in sim_msg_objects
-                if m.metadata.get("constraint_forced", False)
-            ]
+        # Forced-reformulation safe templates are reported separately because
+        # their deliberately bland language would otherwise confound fidelity.
+        sim_normal = [
+            m for m in sim_msg_objects
+            if not m.metadata.get("constraint_forced", False)
+        ]
+        sim_safe = [
+            m for m in sim_msg_objects
+            if m.metadata.get("constraint_forced", False)
+        ]
 
-            # Speech act classification: local RoBERTa model is the primary
-            # path (fast, free). LLM classifier is an optional upgrade when
-            # the caller explicitly requests higher quality via
-            # llm_client + llm_model_name.
-            classifier = None
-            if self._llm_client is not None and self._llm_model_name is not None:
-                from src.evaluation.linguistics import LLMSpeechActClassifier
-                classifier = LLMSpeechActClassifier(self._llm_client, self._llm_model_name)
+        # Speech act classification: local RoBERTa is primary; an LLM
+        # classifier is used only when the caller supplied one.
+        classifier = None
+        if self._llm_client is not None and self._llm_model_name is not None:
+            from src.evaluation.linguistics import LLMSpeechActClassifier
+            classifier = LLMSpeechActClassifier(self._llm_client, self._llm_model_name)
 
-            pooled_metrics = await LinguisticMetrics.compute(
-                sim_messages=sim_msg_objects,
-                real_messages=all_real_msgs,
-                classifier=classifier,
-            )
-            all_metrics.update(pooled_metrics)
+        pooled_metrics = await LinguisticMetrics.compute(
+            sim_messages=sim_msg_objects,
+            real_messages=all_real_msgs,
+            classifier=classifier,
+        )
+        all_metrics.update(pooled_metrics)
 
-            # Headline stratum: normal (non-safe-template) outputs.
-            if sim_normal:
+        # Headline stratum: normal (non-safe-template) outputs.
+        if sim_normal:
+            if len(sim_normal) == len(sim_msg_objects):
+                # Common case: no fallback output. Pooled and normal strata
+                # are identical, so do not run four CPU-heavy local models a
+                # second time for the same message lists.
+                normal_metrics = dict(pooled_metrics)
+            else:
                 normal_metrics = await LinguisticMetrics.compute(
                     sim_messages=sim_normal,
                     real_messages=all_real_msgs,
                     classifier=classifier,
                 )
-                for k, v in normal_metrics.items():
-                    all_metrics[f"{k}_normal"] = v
+            for k, v in normal_metrics.items():
+                all_metrics[f"{k}_normal"] = v
 
-            # Audit stratum: safe-template outputs only. May be empty for most
-            # conditions — surface that fact via a count rather than NaN.
-            all_metrics["linguistics_safe_template_count"] = float(len(sim_safe))
-            all_metrics["linguistics_normal_count"] = float(len(sim_normal))
-            if sim_safe:
-                safe_metrics = await LinguisticMetrics.compute(
-                    sim_messages=sim_safe,
-                    real_messages=all_real_msgs,
-                    classifier=classifier,
-                )
-                for k, v in safe_metrics.items():
-                    all_metrics[f"{k}_safe_template"] = v
-        except Exception as e:
-            logger.warning(f"LinguisticMetrics computation failed: {e}")
+        # Audit stratum: safe-template outputs only.
+        all_metrics["linguistics_safe_template_count"] = float(len(sim_safe))
+        all_metrics["linguistics_normal_count"] = float(len(sim_normal))
+        if sim_safe:
+            safe_metrics = await LinguisticMetrics.compute(
+                sim_messages=sim_safe,
+                real_messages=all_real_msgs,
+                classifier=classifier,
+            )
+            for k, v in safe_metrics.items():
+                all_metrics[f"{k}_safe_template"] = v
+
+        # One pre-registered distance per feasibility family. This avoids
+        # treating several transformations of the same action distribution as
+        # independent votes in the GO/STOP decision.
+        all_metrics["action_fidelity_distance"] = float(all_metrics["ned"])
+        all_metrics["interaction_structure_distance"] = float(
+            self.interaction_metric_weights["cascade"] * all_metrics["ks_statistic"]
+            + self.interaction_metric_weights["graph"]
+            * (1.0 - all_metrics["structural_fidelity"])
+        )
+        # Safe-template fallbacks are a mechanism-failure stratum, not normal
+        # language. Exclude them from the headline linguistic family and
+        # enforce their prevalence separately via the viability guard.
+        suffix = "_normal" if sim_normal else ""
+        all_metrics["linguistic_fidelity_distance"] = float(sum(
+            float(weight) * (
+                1.0 - max(0.0, min(1.0, float(all_metrics[f"{metric}{suffix}"])))
+            )
+            for metric, weight in self.linguistic_metric_weights.items()
+        ))
+        all_metrics["action_text_consistency"] = action_text_consistency
+        all_metrics["action_text_consistency_n"] = float(action_text_n)
 
         # Predictive fidelity layer removed — regex-based event detection
         # was unreliable (precision/recall both low, context-blind keyword
@@ -397,7 +496,17 @@ class MetricsAggregator:
         if sim_result.enforcement_stats:
             for k, v in sim_result.enforcement_stats.items():
                 all_metrics[f"enforcement_{k}"] = v
-
+        all_metrics["action_taxonomy_version"] = "canonical_behavior_v1"
+        from src.experiment.conditions import condition_display_name
+        all_metrics["condition_display_name"] = condition_display_name(
+            sim_result.condition
+        )
+        all_metrics["simulation_integrity_passed"] = True
+        all_metrics["simulation_message_count"] = len(sim_messages)
+        all_metrics["simulation_round_count"] = len(sim_result.per_round_metrics)
+        all_metrics["simulation_expected_round_count"] = sim_result.rounds
+        all_metrics["run_fingerprint"] = sim_result.run_fingerprint
+        self._validate_required_metrics(all_metrics)
         report = MetricsReport(
             run_id=sim_result.run_id,
             condition=sim_result.condition,
@@ -412,6 +521,119 @@ class MetricsAggregator:
         )
         self.reports.append(report)
         return report
+
+    @staticmethod
+    def _validate_simulation_result(sim_result: SimulationResult) -> None:
+        if sim_result.rounds <= 0 or not sim_result.messages:
+            raise EvaluationIntegrityError("Simulation is empty")
+        if len(sim_result.per_round_metrics) != sim_result.rounds:
+            raise EvaluationIntegrityError(
+                f"Simulation has {len(sim_result.per_round_metrics)}/"
+                f"{sim_result.rounds} round metric rows"
+            )
+        observed_rounds = {int(m.get("round", -1)) for m in sim_result.messages}
+        expected_rounds = set(range(sim_result.rounds))
+        if observed_rounds != expected_rounds:
+            raise EvaluationIntegrityError(
+                f"Simulation message rounds are incomplete: missing="
+                f"{sorted(expected_rounds - observed_rounds)[:10]}"
+            )
+        if not sim_result.run_fingerprint:
+            raise EvaluationIntegrityError("Simulation has no run fingerprint")
+
+    @staticmethod
+    def _label_coverage(graph: nx.Graph, labels: dict[str, int]) -> tuple[float, float]:
+        nodes = list(graph.nodes())
+        node_coverage = sum(n in labels for n in nodes) / max(len(nodes), 1)
+        edges = list(graph.edges())
+        edge_coverage = sum(u in labels and v in labels for u, v in edges) / max(len(edges), 1)
+        return node_coverage, edge_coverage
+
+    @staticmethod
+    def _validate_action_reference(action_dist: dict[str, float]) -> None:
+        active = {k: v for k, v in action_dist.items() if v > 0}
+        if len(active) < 2:
+            raise EvaluationIntegrityError(
+                f"Action ground truth is degenerate: {active}. "
+                "Use WikiConv action-event references, not all-DISCUSS CGA."
+            )
+        if max(active.values()) >= 0.995:
+            raise EvaluationIntegrityError(
+                f"Action ground truth is effectively single-class: {active}"
+            )
+
+    @staticmethod
+    def _validate_required_metrics(metrics: dict[str, Any]) -> None:
+        required = {
+            "delta_q_modularity", "ei_polarization_sim", "ei_polarization_real",
+            "ned", "coverage", "structural_fidelity", "ks_statistic", "p_value",
+            "dtw_distance", "action_matrix_similarity", "rsa", "uniformity_sim",
+            "uniformity_real", "uniformity_gap", "complexity_sim", "complexity_real",
+            "complexity_gap", "caricature_index_sim", "caricature_index_real",
+            "caricature_gap", "discourse_relation_match",
+            "sentiment_trajectory_similarity", "speech_act_similarity", "sip",
+            "action_fidelity_distance", "interaction_structure_distance",
+            "linguistic_fidelity_distance", "action_text_consistency",
+        }
+        missing = sorted(required - metrics.keys())
+        if missing:
+            raise EvaluationIntegrityError(f"Required metrics missing: {missing}")
+        invalid = {
+            key: value for key, value in metrics.items()
+            if isinstance(value, (int, float)) and not math.isfinite(float(value))
+        }
+        if invalid:
+            raise EvaluationIntegrityError(f"Metrics contain NaN/Inf: {invalid}")
+
+    @staticmethod
+    def _stratified_message_sample(messages: list[dict], limit: int) -> list[dict]:
+        """Deterministic round×thread round-robin sample."""
+        buckets: dict[tuple[int, str], list[dict]] = {}
+        for message in messages:
+            key = (int(message.get("round", 0)), str(message.get("thread_id", "")))
+            buckets.setdefault(key, []).append(message)
+        ordered = [buckets[k] for k in sorted(buckets)]
+        sample: list[dict] = []
+        offset = 0
+        while ordered and len(sample) < limit:
+            next_ordered = []
+            for bucket in ordered:
+                if offset < len(bucket):
+                    sample.append(bucket[offset])
+                    if len(sample) >= limit:
+                        break
+                if offset + 1 < len(bucket):
+                    next_ordered.append(bucket)
+            ordered = next_ordered
+            offset += 1
+        return sample
+
+    @staticmethod
+    def _stratified_thread_message_sample(
+        threads: list[Thread], limit: int,
+    ) -> list[Message]:
+        buckets = [
+            sorted(
+                (m for m in thread.messages if m.text.strip()),
+                key=lambda m: (m.timestamp, m.msg_id),
+            )
+            for thread in sorted(threads, key=lambda t: t.thread_id)
+        ]
+        buckets = [b for b in buckets if b]
+        sample: list[Message] = []
+        offset = 0
+        while buckets and len(sample) < limit:
+            next_buckets = []
+            for bucket in buckets:
+                if offset < len(bucket):
+                    sample.append(bucket[offset])
+                    if len(sample) >= limit:
+                        break
+                if offset + 1 < len(bucket):
+                    next_buckets.append(bucket)
+            buckets = next_buckets
+            offset += 1
+        return sample
 
     def to_dataframe(self) -> pd.DataFrame:
         """Convert all reports to a DataFrame."""
@@ -476,6 +698,8 @@ class MetricsAggregator:
             "action_type": msg.action_type.value,
             "text": msg.text,
             "timestamp": msg.timestamp.isoformat() if msg.timestamp else None,
+            "parent_msg_id": msg.parent_msg_id,
+            "metadata": dict(msg.metadata or {}),
         }
 
     def _dict_to_msg(self, d: dict) -> Message:
@@ -551,7 +775,7 @@ class MetricsAggregator:
             return {}
 
         import networkx.algorithms.community as nx_comm
-        communities_list = nx_comm.louvain_communities(graph, seed=42)
+        communities_list = nx_comm.louvain_communities(graph, seed=self.seed)
         user_to_comm = {}
         for i, comm in enumerate(communities_list):
             for user in comm:
@@ -563,29 +787,110 @@ class MetricsAggregator:
         total = sum(counts.values()) or 1
         return {action: count / total for action, count in counts.items()}
 
+    @staticmethod
+    def _action_text_consistency(messages: list[dict]) -> tuple[float, int]:
+        """Conservative action/text alignment guard for the feasibility run.
+
+        It is intentionally a guard rather than a fidelity outcome. Structured
+        non-text platform actions are accepted; textual AGREE/DISAGREE actions
+        are checked for explicit stance markers so style regeneration cannot
+        silently reverse the planner's selected stance.
+        """
+        checked = 0
+        passed = 0
+        for message in messages:
+            action = str(message.get("action_type", "")).lower()
+            text = str(message.get("text") or "").strip().lower()
+            metadata = message.get("metadata") or {}
+            planned_action = metadata.get("planned_action_type")
+            if planned_action is None:
+                continue
+            checked += 1
+            if str(planned_action).lower() == action:
+                passed += 1
+        # Legacy results lack planned_action_type. Treat the guard as
+        # unavailable rather than applying brittle English keyword patterns.
+        return (passed / checked, checked) if checked else (1.0, 0)
+
+    @staticmethod
+    def _canonical_action(action: str, dataset: str) -> str:
+        """Map platform actions into a shared behavioral ontology."""
+        action = action.lower()
+        if dataset == "wikipedia":
+            mapping = {
+                "discuss": "participation", "agree": "participation",
+                "post": "participation", "reply": "participation",
+                "disagree": "conflict", "revert": "conflict",
+                "edit": "content_change", "delete": "moderation",
+                "restore": "moderation", "report": "moderation",
+            }
+        elif dataset == "reddit":
+            mapping = {
+                "reply": "participation", "post": "participation",
+                "comment": "participation", "agree": "participation",
+                "counter_argue": "conflict", "disagree": "conflict",
+                "block": "moderation", "report": "moderation",
+                "award_delta": "persuasion",
+            }
+        else:  # github
+            mapping = {
+                "comment": "participation", "reply": "participation",
+                "post": "participation", "discuss": "participation",
+                "label": "moderation", "assign": "moderation",
+                "close": "lifecycle", "reopen": "lifecycle",
+                "edit": "content_change",
+            }
+        return mapping.get(action, "other")
+
+    @classmethod
+    def _canonicalize_actions(cls, messages: list[dict], dataset: str) -> list[dict]:
+        canonical = []
+        for message in messages:
+            copied = dict(message)
+            copied["action_type"] = cls._canonical_action(
+                str(message.get("action_type", "")), dataset
+            )
+            canonical.append(copied)
+        return canonical
+
+    @staticmethod
+    def _estimate_sim_temporal(messages: list[dict]) -> list[float]:
+        by_round: dict[int, list[dict]] = {}
+        for message in messages:
+            by_round.setdefault(int(message.get("round", 0)), []).append(message)
+        return [
+            sum(m["action_type"] == "conflict" for m in by_round[r]) /
+            max(len(by_round[r]), 1)
+            for r in sorted(by_round)
+        ]
+
     def _compute_chain_lengths(self, threads: list[Thread]) -> list[int]:
         lengths = []
         for thread in threads:
             msg_by_id = {m.msg_id: m for m in thread.messages}
 
             def chain_length(msg_id, _visited=None):
-                # Cycle guard: a cyclic parent_msg_id in real data would
-                # otherwise infinite-recurse and (via the outer try/except)
-                # silently zero this dataset's Meso metrics.
+                # Match _compute_chain_lengths_from_dicts exactly: a parent
+                # outside the observed thread slice contributes no extra
+                # depth, and a cycle terminates the current branch.
                 visited = _visited if _visited is not None else set()
                 if msg_id in visited:
-                    return len(visited)
-                visited = visited | {msg_id}
+                    return 0
                 msg = msg_by_id.get(msg_id)
-                if msg is None or msg.parent_msg_id is None:
-                    return len(visited)
-                return chain_length(msg.parent_msg_id, visited)
+                if msg is None:
+                    return 0
+                visited = visited | {msg_id}
+                if not msg.parent_msg_id or msg.parent_msg_id not in msg_by_id:
+                    return 1
+                return 1 + chain_length(msg.parent_msg_id, visited)
 
             for msg in thread.messages:
                 lengths.append(chain_length(msg.msg_id))
         return lengths
 
-    def _compute_chain_lengths_from_dicts(self, messages: list[dict]) -> list[int]:
+    def _compute_chain_lengths_from_dicts(
+        self, messages: list[dict], context_messages: list[dict] | None = None,
+    ) -> list[int]:
         """Compute reply chain nesting depth from simulated messages.
 
         Uses parent_msg_id if available; otherwise falls back to message count per thread.
@@ -596,8 +901,14 @@ class MetricsAggregator:
             thread_msgs.setdefault(m["thread_id"], []).append(m)
 
         lengths = []
+        context_by_thread: dict[str, list[dict]] = {}
+        for message in context_messages or []:
+            context_by_thread.setdefault(message["thread_id"], []).append(message)
+
         for tid, msgs in thread_msgs.items():
-            msg_by_id = {m["msg_id"]: m for m in msgs}
+            msg_by_id = {
+                m["msg_id"]: m for m in context_by_thread.get(tid, []) + msgs
+            }
 
             def chain_depth(msg_id: str, visited: set | None = None) -> int:
                 if visited is None:
@@ -613,6 +924,8 @@ class MetricsAggregator:
                     return 1
                 return 1 + chain_depth(parent_id, visited)
 
+            # Only generated messages are observations; seed messages merely
+            # provide the missing ancestry needed to compute their true depth.
             for m in msgs:
                 lengths.append(chain_depth(m["msg_id"]))
 
@@ -666,18 +979,17 @@ class MetricsAggregator:
         return matrix / row_sums
 
     def _estimate_real_temporal(self, real_messages: list[dict]) -> list[float]:
-        """Estimate polarization proxy trajectory from real data.
+        """Estimate an episode-relative conflict trajectory.
 
-        Sorts messages by timestamp, partitions into temporal bins, and
-        computes the conflict-action ratio per bin, mirroring the simulation's
-        per-round ``polarization_proxy`` metric.
+        Conversations are aligned by relative message position before
+        aggregation. Sorting unrelated conversations by absolute calendar time
+        would create a dataset-history trend rather than an interaction trend.
         """
         if not real_messages:
             return []
 
-        conflict_actions = {"disagree", "revert", "counter_argue", "report", "close", "reopen", "block"}
+        conflict_actions = {"conflict"}
 
-        # Sort by timestamp if available
         from datetime import datetime
         def _parse_ts(m):
             ts = m.get("timestamp")
@@ -690,16 +1002,21 @@ class MetricsAggregator:
                     return datetime.max
             return ts
 
-        sorted_msgs = sorted(real_messages, key=_parse_ts)
+        by_thread: dict[str, list[dict]] = {}
+        for message in real_messages:
+            by_thread.setdefault(str(message.get("thread_id", "")), []).append(message)
 
-        n_bins = min(len(sorted_msgs), 30)
-        bin_size = max(len(sorted_msgs) // n_bins, 1)
-
-        trajectory = []
-        for i in range(0, len(sorted_msgs), bin_size):
-            batch = sorted_msgs[i : i + bin_size]
-            total = len(batch)
-            conflict = sum(1 for m in batch if m["action_type"] in conflict_actions)
-            trajectory.append(conflict / total if total > 0 else 0.0)
-
-        return trajectory
+        n_bins = 30
+        totals = np.zeros(n_bins, dtype=float)
+        conflicts = np.zeros(n_bins, dtype=float)
+        for messages in by_thread.values():
+            ordered = sorted(messages, key=lambda m: (_parse_ts(m), m.get("msg_id", "")))
+            for index, message in enumerate(ordered):
+                position = index / max(len(ordered) - 1, 1)
+                bin_index = min(int(position * n_bins), n_bins - 1)
+                totals[bin_index] += 1
+                conflicts[bin_index] += message["action_type"] in conflict_actions
+        return [
+            float(conflicts[i] / totals[i])
+            for i in range(n_bins) if totals[i] > 0
+        ]

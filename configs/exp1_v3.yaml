@@ -1,0 +1,97 @@
+# Experiment 1 v3 — low-cost, single-model methodology feasibility pilot.
+# This config deliberately writes to a new output namespace; exp1_v2 remains
+# an immutable diagnostic pilot and its checkpoints are never reused.
+name: exp1_v3
+datasets: [wikipedia]
+models: [deepseek-v4-flash]
+compile_model: deepseek-v4-flash
+
+# Causal comparison only: identical Nuwa skill content, with versus without
+# dynamic retrieval and enforcement.
+conditions:
+  - cadp_advisory_nuwa
+  - cadp_full_nuwa
+num_repeats: 3
+num_rounds: 4
+# 30 agents allocated proportionally to the locked K8→6 cluster sizes
+# (cluster_map.json): Veteran 38.5%→12, Substantive 25.3%→8, Patroller
+# 10.9%→3, Niche 8.7%→3, Confrontational 7.0%→2, Fact-checker 9.6%→2
+# (last cluster takes the remainder). Every archetype keeps ≥2 agents.
+population_size: 30
+population_allocation: proportional
+
+alpha: 1.0
+alpha_tier1: 1.0
+alpha_tier2: 1.0
+alpha_tier3: 1.0
+max_reformulation_retries: 2
+tier1_max_retries: 2
+
+num_clusters: 8
+cluster_method: kmeans
+clustering_pickle_path: outputs/stream_cache/clustering_k8_final_quantile.pkl
+cluster_merge_map_path: outputs/skill_corpus_k8_quantile/wikiconv/cluster_map.json
+top_n_threads: 20
+
+checkpoint_every: 1
+max_threads: 2000
+max_sim_threads: 6
+max_concurrency: 8
+micro_batch_size: 3
+seed: 42
+max_context_items: 12
+max_thread_messages: 10
+memory_strategy: sliding
+reflection_interval: 3
+
+# Exact same-source counterfactual target: simulate from a real prefix and
+# evaluate against the held-out suffix of that very WikiConv thread.
+reference_strategy: observed_continuation
+continuation_min_messages: 20
+continuation_prefix_fraction: 0.5
+# Same-source counterfactual target: simulate from a real prefix and
+# evaluate against the held-out suffix of that very WikiConv thread.
+# Recent years chosen for sufficient platform-event density (revert/report
+# culture matured post-2010). Cached once per dataset across all cells.
+continuation_years: [2017, 2018]
+continuation_min_platform_events: 2
+continuation_event_strata_cap: 3
+
+# LLM-as-judge Tier 3 experimental layer: blocks and logs per-pattern verdicts
+# for human audit. Runs on every generated message in cadp_full_nuwa.
+tier3_llm_judge_enabled: true
+tier3_llm_judge_model: minimax-m3
+tier3_llm_judge_audit_only: false
+tier3_llm_judge_output_dir: outputs/results/exp1_v3/tier3_llm_judgments
+
+# Pre-registered family composites; weights must sum to one.
+linguistic_metric_weights:
+  discourse_relation_match: 0.25
+  sentiment_trajectory_similarity: 0.25
+  speech_act_similarity: 0.25
+  sip: 0.25
+interaction_metric_weights:
+  cascade: 0.5
+  graph: 0.5
+
+# Diagnostic pooled across all Advisory repeats. It does not block Full,
+# because dynamic retrieval changes Full's pre-generation prompt/output and
+# Advisory text is therefore not its valid counterfactual output.
+manipulation_min_potential_rate: 0.01
+
+# Three-repeat small pilot gate: useful only for deciding whether to scale up.
+viability_enabled: true
+viability_treatment: cadp_full_nuwa
+viability_control: cadp_advisory_nuwa
+viability_primary_metrics:
+  - action_fidelity_distance
+  - interaction_structure_distance
+  - linguistic_fidelity_distance
+viability_min_pairs: 3
+viability_min_metric_wins: 2
+viability_min_repeat_win_fraction: 0.6666666667
+viability_min_relative_improvement: 0.05
+viability_max_family_regression: 0.10
+viability_min_message_ratio: 0.95
+viability_max_safe_template_rate: 0.10
+viability_min_action_text_consistency: 0.90

@@ -89,10 +89,30 @@ class CheckpointManager:
 
         # Find latest checkpoint for this run
         pattern = f"{run_id}_round_*.json"
-        checkpoints = sorted(self.checkpoint_dir.glob(pattern))
+        checkpoints = list(self.checkpoint_dir.glob(pattern))
         if not checkpoints:
             return None
-        return load_json(checkpoints[-1])
+        def _round_number(path: Path) -> int:
+            try:
+                return int(path.stem.rsplit("_round_", 1)[1])
+            except (IndexError, ValueError):
+                return -1
+        for path in sorted(checkpoints, key=_round_number, reverse=True):
+            try:
+                checkpoint = load_json(path)
+            except Exception as exc:
+                logger.warning(
+                    f"Checkpoint {path} is corrupt ({exc}); trying previous snapshot"
+                )
+                continue
+            if not isinstance(checkpoint, dict) or checkpoint.get("run_id") != run_id:
+                logger.warning(f"Checkpoint {path} has invalid identity; trying previous snapshot")
+                continue
+            if checkpoint.get("round") != _round_number(path):
+                logger.warning(f"Checkpoint {path} has mismatched round; trying previous snapshot")
+                continue
+            return checkpoint
+        return None
 
     def get_latest_round(self, run_id: str) -> int | None:
         """Get the latest completed round for a run."""
@@ -209,6 +229,28 @@ class CheckpointManager:
                 f.write(line)
                 f.write("\n")
 
+    def truncate_turns_after_round(self, run_id: str, round_num: int) -> None:
+        """Keep only records from fully checkpointed rounds.
+
+        A partial later round is replayed in full on resume. This is safer than
+        guessing whether an unordered concurrent JSONL round is complete.
+        """
+        path = self._turns_path(run_id)
+        if not path.exists():
+            return
+        kept: list[str] = []
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if int(rec.get("round", -1)) <= round_num:
+                    kept.append(json.dumps(rec, ensure_ascii=False))
+        with path.open("w", encoding="utf-8") as f:
+            for line in kept:
+                f.write(line + "\n")
+
     def get_last_successful_turn(self, run_id: str) -> tuple[int, int] | None:
         """Return (round, turn_idx) of the last ``status="ok"`` turn.
 
@@ -272,15 +314,46 @@ class CheckpointManager:
                 f"empty/non-dict; treating as not-completed."
             )
             return False
+        if result_data.get("simulation_integrity_passed") is not True:
+            logger.warning(
+                f"CheckpointManager.is_completed({run_id}): result predates "
+                "simulation integrity validation; treating as not-completed."
+            )
+            return False
+        if int(result_data.get("simulation_message_count", 0)) <= 0:
+            logger.warning(
+                f"CheckpointManager.is_completed({run_id}): result contains no "
+                "simulation messages; treating as not-completed."
+            )
+            return False
+        actual_rounds = int(result_data.get("simulation_round_count", 0))
+        expected_rounds = int(result_data.get("simulation_expected_round_count", 0))
+        if actual_rounds <= 0 or actual_rounds != expected_rounds:
+            logger.warning(
+                f"CheckpointManager.is_completed({run_id}): round count "
+                f"{actual_rounds}/{expected_rounds}; treating as not-completed."
+            )
+            return False
+        marker_fingerprint = data.get("run_fingerprint")
+        result_fingerprint = result_data.get("run_fingerprint")
+        if not marker_fingerprint or marker_fingerprint != result_fingerprint:
+            logger.warning(
+                f"CheckpointManager.is_completed({run_id}): missing/mismatched "
+                "run fingerprint; treating as not-completed."
+            )
+            return False
         return True
 
-    def mark_completed(self, run_id: str, result_path: str | Path) -> None:
+    def mark_completed(
+        self, run_id: str, result_path: str | Path, run_fingerprint: str = "",
+    ) -> None:
         """Mark a run as complete."""
         marker = self.checkpoint_dir / f"{run_id}_COMPLETE.json"
         save_json({
             "run_id": run_id,
             "completed_at": datetime.now().isoformat(),
             "result_path": str(result_path),
+            "run_fingerprint": run_fingerprint,
         }, marker)
 
     # --- FAILED marker (Issue 2 — circuit-breaker trip) --------------

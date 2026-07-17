@@ -198,7 +198,17 @@ def caricature_index(
         cluster_profiles[cluster_id].append(profile)
 
     # Need at least 2 clusters with ≥ 2 agents each for meaningful d
-    valid_clusters = {k: v for k, v in cluster_profiles.items() if len(v) >= 2}
+    valid_clusters = {
+        k: np.asarray(v, dtype=float) for k, v in cluster_profiles.items()
+        if len(v) >= 2
+    }
+    return _caricature_from_cluster_profiles(valid_clusters)
+
+
+def _caricature_from_cluster_profiles(
+    valid_clusters: dict[int, np.ndarray],
+) -> float:
+    """Compute the pairwise standardized centroid separation."""
     if len(valid_clusters) < 2:
         return 0.0
 
@@ -207,8 +217,8 @@ def caricature_index(
     d_values = []
     for i in range(len(cluster_ids)):
         for j in range(i + 1, len(cluster_ids)):
-            profiles_i = np.array(valid_clusters[cluster_ids[i]])
-            profiles_j = np.array(valid_clusters[cluster_ids[j]])
+            profiles_i = valid_clusters[cluster_ids[i]]
+            profiles_j = valid_clusters[cluster_ids[j]]
             mean_i = profiles_i.mean(axis=0)
             mean_j = profiles_j.mean(axis=0)
             var_i = profiles_i.var(axis=0, ddof=1).mean()
@@ -219,6 +229,55 @@ def caricature_index(
                 d_values.append(d)
 
     return float(np.mean(d_values)) if d_values else 0.0
+
+
+def caricature_bootstrap_ci(
+    agent_action_counts: dict[str, Counter],
+    agent_clusters: dict[str, int],
+    n_resamples: int = 500,
+    confidence: float = 0.95,
+    seed: int = 42,
+) -> tuple[float, float]:
+    """Stratified agent bootstrap CI for :func:`caricature_index`.
+
+    Agents/users are resampled with replacement *within* each observed role or
+    archetype, preserving group sizes while estimating sampling uncertainty.
+    """
+    all_actions = sorted({
+        action for counts in agent_action_counts.values() for action in counts
+    })
+    if not all_actions:
+        return 0.0, 0.0
+    grouped: dict[int, list[np.ndarray]] = defaultdict(list)
+    for agent_id, counts in agent_action_counts.items():
+        cid = agent_clusters.get(agent_id, -1)
+        if cid < 0:
+            continue
+        profile = np.array([counts.get(a, 0) for a in all_actions], dtype=float)
+        total = profile.sum()
+        if total > 0:
+            profile /= total
+        grouped[cid].append(profile)
+    arrays = {
+        cid: np.asarray(rows, dtype=float) for cid, rows in grouped.items()
+        if len(rows) >= 2
+    }
+    if len(arrays) < 2:
+        return 0.0, 0.0
+
+    rng = np.random.default_rng(seed)
+    estimates = np.empty(n_resamples, dtype=float)
+    for i in range(n_resamples):
+        sampled = {
+            cid: rows[rng.integers(0, len(rows), size=len(rows))]
+            for cid, rows in arrays.items()
+        }
+        estimates[i] = _caricature_from_cluster_profiles(sampled)
+    alpha = (1.0 - confidence) / 2.0
+    return (
+        float(np.quantile(estimates, alpha)),
+        float(np.quantile(estimates, 1.0 - alpha)),
+    )
 
 
 class MicroMetrics:
@@ -242,8 +301,13 @@ class MicroMetrics:
 
         if sim_profiles is not None and real_profiles is not None:
             rsa_val = representational_similarity(sim_profiles, real_profiles)
-            if rsa_val is not None:
-                result["rsa"] = rsa_val
+            # RSA is diagnostic and intentionally unavailable below its
+            # minimum effective agent count. Preserve a numeric table schema
+            # without failing the whole expensive cell, and surface the
+            # availability flag so 0.0 is never interpreted as an observed
+            # scientific score.
+            result["rsa"] = float(rsa_val) if rsa_val is not None else 0.0
+            result["rsa_available"] = rsa_val is not None
 
         if sim_action_counts is not None and real_action_counts is not None:
             result["uniformity_sim"] = behavior_uniformity(sim_action_counts)
@@ -255,5 +319,8 @@ class MicroMetrics:
         if sim_agent_counts is not None and real_agent_counts is not None:
             result["complexity_sim"] = behavior_complexity(sim_agent_counts)
             result["complexity_real"] = behavior_complexity(real_agent_counts)
+            result["complexity_gap"] = abs(
+                result["complexity_sim"] - result["complexity_real"]
+            )
 
         return result

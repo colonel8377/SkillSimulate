@@ -351,8 +351,9 @@ class SkillCompiler:
     def _embed_messages(self, messages: list[Message]) -> np.ndarray:
         """Embed cluster messages with the shared SentenceTransformer.
 
-        Used to populate ExpressionDNA.embedding_centroid / embedding_std
-        when the caller did not supply pre-computed embeddings. Empty /
+        Used to populate ExpressionDNA.embedding_centroid /
+        embedding_cosine_threshold when the caller did not supply
+        pre-computed embeddings. Empty /
         whitespace-only texts are encoded as the model sees them — the
         shared embedder handles empty strings without raising.
         """

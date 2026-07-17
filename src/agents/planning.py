@@ -16,6 +16,7 @@ class ActionPlan:
     text: str
     target_user_id: str | None = None
     target_msg_id: str | None = None
+    stance: str = "neutral"
     reasoning: str = ""
 
 
@@ -27,7 +28,7 @@ Your role: {role_description}
 
 Available actions: {available_actions}
 
-Choose an action that fits the current situation and your role. Do not
+Choose a PLATFORM action that fits the current situation and your role. Do not
 automatically default to the safest action. For example, if you strongly
 disagree with another user's contribution or want to correct content, use
 an adversarial or corrective action when it is available. If you observe a
@@ -52,6 +53,7 @@ for top-level / non-reply actions.
 Respond as JSON:
 {{
   "action_type": "one of the available actions",
+  "stance": "supportive, oppositional, or neutral",
   "text": "your message text (empty for non-text actions)",
   "target_msg_id": "msg_id of the message you are replying to, or empty",
   "reasoning": "brief explanation of why"
@@ -142,7 +144,7 @@ class Planner:
             if attempt < 2:
                 messages = messages + [
                     {"role": "assistant", "content": str(response) if response else ""},
-                    {"role": "user", "content": "Your response was not valid JSON. Please respond with ONLY a valid JSON object containing: action_type, text, target_msg_id, reasoning."},
+                    {"role": "user", "content": "Your response was not valid JSON. Please respond with ONLY a valid JSON object containing: action_type, stance, text, target_msg_id, reasoning."},
                 ]
 
         # Fallback: if all retries failed, use defaults
@@ -166,6 +168,12 @@ class Planner:
             action_type=action_type,
             text=data.get("text", ""),
             target_msg_id=target_msg_id,
+            stance=(
+                str(data.get("stance", "neutral")).lower()
+                if str(data.get("stance", "neutral")).lower()
+                in {"supportive", "oppositional", "neutral"}
+                else "neutral"
+            ),
             reasoning=data.get("reasoning", ""),
         )
 
@@ -187,6 +195,7 @@ Rewrite your response to AVOID the violations above while staying on topic.
 Respond as JSON:
 {{
   "action_type": "{action_type}",
+  "stance": "{stance}",
   "text": "your revised message text",
   "reasoning": "brief explanation of what you changed"
 }}
@@ -203,6 +212,7 @@ Output ONLY the JSON."""
         prev_text: str = "",
         violation_feedback: str = "",
         prev_action_type: ActionType | None = None,
+        prev_stance: str = "neutral",
     ) -> ActionPlan:
         """Re-plan after a Tier-3 post-gen violation.
 
@@ -237,6 +247,7 @@ Output ONLY the JSON."""
             violation_feedback=violation_feedback,
             constraints=constraints or "",
             action_type=(prev_action_type or available_actions[0]).value,
+            stance=prev_stance,
         )
 
         messages = [
@@ -267,5 +278,11 @@ Output ONLY the JSON."""
             action_type=action_type,
             text=data.get("text", ""),
             target_msg_id=target_msg_id,
+            stance=(
+                str(data.get("stance", prev_stance)).lower()
+                if str(data.get("stance", prev_stance)).lower()
+                in {"supportive", "oppositional", "neutral"}
+                else prev_stance
+            ),
             reasoning=data.get("reasoning", ""),
         )

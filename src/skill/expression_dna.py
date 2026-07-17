@@ -78,19 +78,28 @@ class ExpressionDNAExtractor:
         # Vocabulary
         vocab = self._compute_vocabulary(texts, other_cluster_word_freq)
 
-        # Embedding centroid
+        # Embedding centroid + cosine-distance threshold (95th percentile of
+        # 1 − cos(u, centroid) on the held-out half of the cluster utterances).
         emb_centroid = None
-        emb_std = None
+        emb_cosine_threshold = None
         if embeddings is not None and len(embeddings) > 0:
-            emb_centroid = embeddings.mean(axis=0).tolist()
-            emb_std = embeddings.std(axis=0).tolist()
+            embs = np.asarray(embeddings, dtype=float)
+            centroid = embs.mean(axis=0)
+            centroid_norm = centroid / (np.linalg.norm(centroid) + 1e-10)
+            holdout = embs[len(embs) // 2:]
+            holdout_norm = holdout / (
+                np.linalg.norm(holdout, axis=1, keepdims=True) + 1e-10
+            )
+            dists = 1.0 - np.dot(holdout_norm, centroid_norm)
+            emb_centroid = centroid.tolist()
+            emb_cosine_threshold = float(np.percentile(dists, 95))
 
         return ExpressionDNA(
             **fingerprint,
             **style,
             **vocab,
             embedding_centroid=emb_centroid,
-            embedding_std=emb_std,
+            embedding_cosine_threshold=emb_cosine_threshold,
         )
 
     def _compute_fingerprint(self, texts: list[str]) -> dict:

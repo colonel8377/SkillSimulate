@@ -108,6 +108,7 @@ def ei_polarization_index(
 def normalized_entropy_distance(
     sim_action_dist: dict[str, float],
     real_action_dist: dict[str, float],
+    smoothing: float = 0.0,
 ) -> float:
     """Compute Normalized Entropy Distance (NED).
 
@@ -117,8 +118,10 @@ def normalized_entropy_distance(
         NED in [0, 1]. 0 = identical, 1 = maximally different.
     """
     all_actions = sorted(set(sim_action_dist) | set(real_action_dist))
-    p = np.array([sim_action_dist.get(a, 0) for a in all_actions])
-    q = np.array([real_action_dist.get(a, 0) for a in all_actions])
+    if smoothing < 0:
+        raise ValueError("Action-distribution smoothing must be non-negative")
+    p = np.array([sim_action_dist.get(a, 0) + smoothing for a in all_actions])
+    q = np.array([real_action_dist.get(a, 0) + smoothing for a in all_actions])
 
     # Normalize
     p = p / (p.sum() or 1)
@@ -158,12 +161,15 @@ class MacroMetrics:
         real_communities: dict[str, int],
         sim_action_dist: dict[str, float],
         real_action_dist: dict[str, float],
+        action_smoothing: float = 0.0,
     ) -> dict[str, float]:
         return {
             "delta_q_modularity": delta_q_modularity(sim_graph, real_graph, sim_communities, real_communities),
             "ei_polarization_sim": ei_polarization_index(sim_graph, sim_communities),
             "ei_polarization_real": ei_polarization_index(real_graph, real_communities),
-            "ned": normalized_entropy_distance(sim_action_dist, real_action_dist),
+            "ned": normalized_entropy_distance(
+                sim_action_dist, real_action_dist, smoothing=action_smoothing,
+            ),
             "coverage": behavior_coverage(
                 set(sim_action_dist.keys()),
                 set(real_action_dist.keys()),

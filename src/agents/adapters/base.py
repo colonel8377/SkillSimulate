@@ -51,6 +51,7 @@ class SkillAdapter(ABC):
         alpha_tier2: float | None = None,
         alpha_tier3: float | None = None,
         seed: int | None = None,
+        **kwargs,
     ) -> EnforcementHarness:
         """Build the enforcement harness configured for this skill."""
 
@@ -154,8 +155,8 @@ class BaseCADPAdapter(SkillAdapter):
         lines = ["You MUST avoid the following behaviors:"]
         for ap in self.skill.constraint.anti_patterns:
             lines.append(f"- {ap.description}")
-            if ap.trigger_keywords:
-                lines.append(f"  Avoid keywords: {', '.join(ap.trigger_keywords)}")
+            if ap.reason:
+                lines.append(f"  Reason: {ap.reason}")
 
         return "\n".join(lines)
 
@@ -171,6 +172,7 @@ class BaseCADPAdapter(SkillAdapter):
         alpha_tier2: float | None = None,
         alpha_tier3: float | None = None,
         seed: int | None = None,
+        **kwargs,
     ) -> EnforcementHarness:
         """Build enforcement harness for this skill."""
         return EnforcementHarness(
@@ -185,6 +187,7 @@ class BaseCADPAdapter(SkillAdapter):
             alpha_tier2=alpha_tier2,
             alpha_tier3=alpha_tier3,
             seed=seed,
+            tier3_llm_judge=kwargs.get("tier3_llm_judge"),
         )
 
     def get_tier_config(self) -> dict[str, bool]:
@@ -217,6 +220,7 @@ class ColleagueSkillAdapter(BaseCADPAdapter):
         alpha_tier2: float | None = None,
         alpha_tier3: float | None = None,
         seed: int | None = None,
+        **kwargs,
     ) -> EnforcementHarness:
         """Return an enforcement harness with all tiers disabled."""
         return EnforcementHarness(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from src.agents.base import BaseAgent
 from src.agents.adapters import get_adapter
+from src.enforcement.tier3_llm_judge import Tier3LLMJudge
 from src.skill.schema import SkillFile
 
 
@@ -23,6 +24,11 @@ class CADPAgent(BaseAgent):
         alpha_tier3: float | None = None,
         backend: str = "base",
         seed: int | None = None,
+        tier1_max_retries: int = 1,
+        tier3_llm_judge_enabled: bool = False,
+        tier3_llm_judge_model: str = "classification",
+        tier3_llm_judge_audit_only: bool = False,
+        tier3_llm_judge_output_dir: str = "outputs/results/tier3_llm_judgments",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -41,18 +47,32 @@ class CADPAgent(BaseAgent):
 
         self.adapter = get_adapter(backend, skill)
 
+        tier3_llm_judge = None
+        if tier3_llm_judge_enabled and self.llm is not None:
+            tier3_llm_judge = Tier3LLMJudge(
+                llm_client=self.llm,
+                model_name=tier3_llm_judge_model,
+                output_dir=tier3_llm_judge_output_dir,
+                audit_only=tier3_llm_judge_audit_only,
+            )
+            tier3_llm_judge.set_run_id(self.agent_id)
+
         self.enforcement_harness = self.adapter.build_enforcement_harness(
             alpha=alpha,
             llm_client=self.llm,
             model_name=self.model_name,
             enable_tier1=True,
             enable_tier2=True,
-            enable_tier3=True,
+            enable_tier3=tier3_llm_judge is not None,
             alpha_tier1=alpha_tier1,
             alpha_tier2=alpha_tier2,
             alpha_tier3=alpha_tier3,
             seed=seed,
+            tier3_llm_judge=tier3_llm_judge,
         )
+        # Keep Tier-1 and Tier-3 retry budgets explicit in experiment
+        # provenance. Tier 3 is owned by BaseAgent; Tier 1 by the harness.
+        self.enforcement_harness.tier1.max_retries = int(tier1_max_retries)
 
     def get_role_description(self) -> str:
         """Build role description via adapter."""

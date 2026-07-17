@@ -13,7 +13,7 @@ from typing import Any
 from src.enforcement.base import EnforcementResult, EnforcementStrategy
 from src.enforcement.tier1_filter import Tier1ExpressionFilter
 from src.enforcement.tier2_injection import Tier2MindModelInjection
-from src.enforcement.tier3_block import Tier3AntiPatternBlock
+from src.enforcement.tier3_llm_judge import Tier3LLMJudge
 from src.llm.client import LLMClient
 from src.skill.schema import SkillFile
 
@@ -27,6 +27,7 @@ class EnforcementLog:
     tier1_post: EnforcementResult | None = None
     total_violations: int = 0
     regenerated: bool = False
+    tier3_llm_post: EnforcementResult | None = None
     # True when the post-gen Forced Reformulation Protocol (outline §4.4.2)
     # was invoked — i.e. a Tier 3 post-gen violation triggered replanning.
     # This is the "hard-block-with-regeneration" event the paper reports as
@@ -41,6 +42,7 @@ class EnforcementLog:
             "tier3_pre": {"tier": self.tier3_pre.tier, "passed": self.tier3_pre.passed, "reason": self.tier3_pre.reason} if self.tier3_pre else None,
             "tier2_pre": {"tier": self.tier2_pre.tier, "passed": self.tier2_pre.passed} if self.tier2_pre else None,
             "tier3_post": {"tier": self.tier3_post.tier, "passed": self.tier3_post.passed, "reason": self.tier3_post.reason} if self.tier3_post else None,
+            "tier3_llm_post": {"tier": self.tier3_llm_post.tier, "passed": self.tier3_llm_post.passed, "reason": self.tier3_llm_post.reason} if self.tier3_llm_post else None,
             "tier1_post": {"tier": self.tier1_post.tier, "passed": self.tier1_post.passed, "reason": self.tier1_post.reason} if self.tier1_post else None,
             "total_violations": self.total_violations,
             "regenerated": self.regenerated,
@@ -65,6 +67,7 @@ class EnforcementHarness:
         alpha_tier2: float | None = None,
         alpha_tier3: float | None = None,
         seed: int | None = None,
+        tier3_llm_judge: Tier3LLMJudge | None = None,
     ):
         self.alpha = alpha
         self.alpha_tier1 = alpha_tier1 if alpha_tier1 is not None else alpha
@@ -73,6 +76,14 @@ class EnforcementHarness:
         self.skill = skill
         self.llm = llm_client
         self.model_name = model_name
+        self.enable_tier3 = enable_tier3
+        if enable_tier3 and tier3_llm_judge is None:
+            raise ValueError(
+                "enable_tier3=True requires tier3_llm_judge — the rule-based "
+                "Tier-3 path was removed in the 2026-07-17 enforcement simplification."
+            )
+        self.tier3_llm_judge = tier3_llm_judge
+        self.enable_tier3_llm_judge = tier3_llm_judge is not None
 
         # R1 reproducibility: derive three independent sub-RNGs from the
         # caller-supplied seed so each tier's stochastic gate is decoupled
@@ -88,6 +99,9 @@ class EnforcementHarness:
             rng_t3 = random.Random(t3_seed)
         else:
             rng_t1 = rng_t2 = rng_t3 = None
+        # Tier 3's LLM judge is not an EnforcementStrategy, so its α-gate
+        # lives here in the harness (see enforce_output).
+        self._rng_t3 = rng_t3
 
         # Initialize tiers (disabled tiers use alpha=0)
         self.tier1 = Tier1ExpressionFilter(
@@ -99,17 +113,10 @@ class EnforcementHarness:
         self.tier2 = Tier2MindModelInjection(
             alpha=self.alpha_tier2 if enable_tier2 else 0.0,
             rng=rng_t2,
-            llm_client=llm_client,
-            llm_model_name=model_name,
-        )
-        self.tier3 = Tier3AntiPatternBlock(
-            alpha=self.alpha_tier3 if enable_tier3 else 0.0,
-            rng=rng_t3,
         )
 
         self.enable_tier1 = enable_tier1
         self.enable_tier2 = enable_tier2
-        self.enable_tier3 = enable_tier3
 
     def _build_context(self) -> dict[str, Any]:
         """Build enforcement context from skill file."""
@@ -126,11 +133,15 @@ class EnforcementHarness:
         messages: list[dict[str, str]],
         draft_action: str = "",
     ) -> tuple[list[dict[str, str]], EnforcementLog, str]:
-        """Run pre-generation enforcement (Tier 3 → Tier 2).
+        """Run pre-generation enforcement (Tier 2 only).
+
+        Tier 3 is post-generation only after the 2026-07-17 simplification:
+        the rule-based pre-gen advisory path was dead code (0/74 manipulation
+        audit hits in v3 runs) and is removed. The LLM judge runs post-gen.
 
         Args:
             messages: LLM messages to be sent for generation.
-            draft_action: Optional draft action for anti-pattern checking.
+            draft_action: Optional draft action (unused, kept for API compat).
 
         Returns:
             Tuple of (modified_messages, enforcement_log, enforcement_context).
@@ -140,24 +151,6 @@ class EnforcementHarness:
         ctx["draft_action"] = draft_action
         log = EnforcementLog()
         enforcement_context = ""
-
-        # Tier 3: Anti-pattern block (pre-generation, advisory injection stage)
-        # Per outline §4.4: pre-gen Tier 3 propagates a reformulation
-        # instruction into the planner context and records the violation
-        # for metrics. The actual hard-block-with-regeneration runs at
-        # post-gen via enforce_output → Forced Reformulation Protocol (§4.4.2).
-        if self.enable_tier3:
-            result = await self.tier3.check_pre_generation(messages, ctx)
-            log.tier3_pre = result
-            if result.modified_messages:
-                messages = result.modified_messages
-            if result.injection_text:
-                enforcement_context += result.injection_text + "\n\n"
-            # Pre-gen Tier-3 is advisory (reformulation injection into the
-            # planner context), NOT a real output violation — do not count it
-            # in total_violations (would inflate the violation-rate metric
-            # used in §5.8/§7.1). The advisory event is still recorded in
-            # log.tier3_pre.passed for diagnostics.
 
         # Tier 2: Mind model injection (pre-generation)
         if self.enable_tier2:
@@ -175,6 +168,8 @@ class EnforcementHarness:
         text: str,
         original_messages: list[dict[str, str]],
         safe_template: str | None = None,
+        context_messages: list[dict[str, Any]] | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> tuple[str, EnforcementLog, str | None]:
         """Run post-generation enforcement (Tier 1) with regeneration.
 
@@ -187,6 +182,10 @@ class EnforcementHarness:
                 exhausted instead of silently accepting the last
                 off-boundary attempt (G6). When ``None``, Tier 1 preserves
                 the legacy "accept best attempt" behaviour.
+            context_messages: Recent thread messages for the LLM judge context.
+            meta: Optional annotation metadata (agent_id / round / action_type /
+                thread_id / attempt) forwarded to the Tier-3 judge log so its
+                JSONL records are self-contained for later human labeling.
 
         Returns:
             Tuple of (final_text, enforcement_log, replan_feedback).
@@ -194,6 +193,7 @@ class EnforcementHarness:
             and the caller should re-plan.
         """
         ctx = self._build_context()
+        ctx["recent_messages"] = context_messages or []
         log = EnforcementLog()
         replan_feedback: str | None = None
 
@@ -210,17 +210,29 @@ class EnforcementHarness:
         if not text or not text.strip():
             return text, log, replan_feedback
 
-        # Tier 3 post-gen safety check (outline §4.4.2 — Forced Reformulation
-        # Protocol entry point). A `passed=False` here signals the agent loop
-        # to drive constrained regeneration up to N_retry, then fall back to
-        # the safe template. This is the structural RLHF-override event.
-        if self.enable_tier3:
-            result3 = await self.tier3.check_post_generation(text, ctx)
-            log.tier3_post = result3
-            if not result3.passed:
-                log.total_violations += 1
-                log.tier3_hard_block_triggered = True
-                replan_feedback = result3.reason
+        # Tier 3: LLM judge post-generation. Single call per message; the
+        # rule-based anti-pattern block was removed in the 2026-07-17
+        # enforcement simplification (zero hits in v3 runs).
+        if self.enable_tier3 and self.tier3_llm_judge is not None:
+            ctx_messages = ctx.get("recent_messages", [])
+            result_llm = await self.tier3_llm_judge.judge(
+                text, self.skill, ctx_messages, meta=meta
+            )
+            log.tier3_llm_post = result_llm
+            if not result_llm.passed:
+                # α-gate the block: the judge detects, the harness decides.
+                # At alpha_tier3=1.0 every detected violation blocks; below
+                # 1.0 a detected violation is enforced with probability α
+                # (deterministic per cell via the seeded tier-3 sub-RNG).
+                if self.alpha_tier3 >= 1.0:
+                    enforce_block = True
+                else:
+                    gate_rng = self._rng_t3 or random
+                    enforce_block = gate_rng.random() < self.alpha_tier3
+                if enforce_block:
+                    log.total_violations += 1
+                    log.tier3_hard_block_triggered = True
+                    replan_feedback = f"LLM judge: {result_llm.reason}"
 
         # Tier 1: Expression DNA filter (post-generation)
         if self.enable_tier1:

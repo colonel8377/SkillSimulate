@@ -41,7 +41,9 @@ class ActionType(str, Enum):
 
     @classmethod
     def for_platform(cls, platform: Platform) -> list["ActionType"]:
-        wiki = {cls.EDIT, cls.REVERT, cls.DISCUSS, cls.REPORT, cls.DELETE, cls.RESTORE, cls.AGREE, cls.DISAGREE}
+        # Agree/disagree are stances expressed inside a discussion, not
+        # Wikipedia platform events.
+        wiki = {cls.EDIT, cls.REVERT, cls.DISCUSS, cls.REPORT, cls.DELETE, cls.RESTORE}
         reddit = {cls.REPLY, cls.AWARD_DELTA, cls.COUNTER_ARGUE, cls.BLOCK}
         github = {cls.COMMENT, cls.LABEL, cls.CLOSE, cls.REOPEN, cls.ASSIGN}
         mapping = {

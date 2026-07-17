@@ -71,7 +71,7 @@ def discourse_relation_distribution(messages: list[Message]) -> dict[str, float]
     """
     pipe = _get_pdtb_pipeline()
     if pipe is False or pipe is None:
-        return {cat: 0.25 for cat in _PDTB_CATEGORIES}
+        raise LinguisticModelUnavailable("Required PDTB discourse model is unavailable")
 
     if not messages:
         return {cat: 0.0 for cat in _PDTB_CATEGORIES}
@@ -83,8 +83,9 @@ def discourse_relation_distribution(messages: list[Message]) -> dict[str, float]
     try:
         results = pipe(texts, batch_size=64, truncation=True, max_length=512)
     except Exception as e:
-        logger.warning(f"PDTB2 batch classification failed: {e}")
-        return {cat: 0.25 for cat in _PDTB_CATEGORIES}
+        raise LinguisticModelUnavailable(
+            f"PDTB2 batch classification failed: {e}"
+        ) from e
 
     counts = {cat: 0 for cat in _PDTB_CATEGORIES}
     for r in results:
@@ -92,11 +93,10 @@ def discourse_relation_distribution(messages: list[Message]) -> dict[str, float]
         if label in counts:
             counts[label] += 1
         else:
-            # Map lowercase or partial matches
-            for cat in _PDTB_CATEGORIES:
-                if cat.lower() == label.lower():
-                    counts[cat] += 1
-                    break
+            matches = [cat for cat in _PDTB_CATEGORIES if cat.lower() == label.lower()]
+            if not matches:
+                raise LinguisticModelUnavailable(f"Unknown PDTB label: {label!r}")
+            counts[matches[0]] += 1
 
     total = sum(counts.values()) or 1
     return {cat: count / total for cat, count in counts.items()}
@@ -126,7 +126,7 @@ DISCOURSE_MARKERS = {
 # ---------------------------------------------------------------------------
 # Speech act cues — DELETED: regex patterns removed 2026-07-13.
 # Context-blind regex cannot reliably infer speech act category.
-# LLM classifier is the primary path; fallback returns "assertive".
+# The local classifier is required; failures invalidate the metric.
 # ---------------------------------------------------------------------------
 
 
@@ -230,7 +230,11 @@ class LLMSpeechActClassifier:
                 messages=[{"role": "user", "content": prompt}],
                 model_name=self._model,
                 temperature=0.0,
-                max_tokens=1024,
+                # DeepSeek-V4-flash is a reasoning model: reasoning_content
+                # tokens count against max_tokens. Batch of 20 messages
+                # needing JSON array → reasoning + answer can exceed 1024.
+                # 4096 leaves headroom and prevents empty-content cascades.
+                max_tokens=4096,
                 default=None,
             )
             if isinstance(result, list) and len(result) == len(texts):
@@ -253,6 +257,10 @@ class LLMSpeechActClassifier:
 _local_speech_act_pipeline = None
 
 
+class LinguisticModelUnavailable(RuntimeError):
+    """A required local evaluator is unavailable or failed inference."""
+
+
 def _get_local_speech_act_pipeline():
     """Lazy-load the local speech act classification pipeline."""
     global _local_speech_act_pipeline
@@ -272,10 +280,7 @@ def _get_local_speech_act_pipeline():
             f"(quantor-project/speech-act-classification, device={device})"
         )
     except Exception as e:
-        logger.warning(
-            f"Failed to load local speech act model: {e}. "
-            f"Will return 'assertive' as neutral default."
-        )
+        logger.error(f"Failed to load required local speech act model: {e}")
         _local_speech_act_pipeline = False  # sentinel: tried and failed
     return _local_speech_act_pipeline
 
@@ -283,17 +288,21 @@ def _get_local_speech_act_pipeline():
 def _speech_act_local(text: str) -> str:
     """Local RoBERTa speech act classification.
 
-    Falls back to "assertive" only if model load fails entirely.
+    Evaluation fails closed if the required model is unavailable.
     """
     pipe = _get_local_speech_act_pipeline()
     if pipe is False or pipe is None:
-        return "assertive"
+        raise LinguisticModelUnavailable("Required local speech-act model is unavailable")
     try:
         result = pipe(text, truncation=True, max_length=512)
         label = result[0]["label"]
-        return _QUANTOR_TO_FOUR.get(label, "assertive")
-    except Exception:
-        return "assertive"
+        if label not in _QUANTOR_TO_FOUR:
+            raise LinguisticModelUnavailable(f"Unknown speech-act label: {label!r}")
+        return _QUANTOR_TO_FOUR[label]
+    except Exception as exc:
+        raise LinguisticModelUnavailable(
+            f"Local speech-act inference failed: {exc}"
+        ) from exc
 
 
 def _speech_act_fallback(text: str) -> str:
@@ -358,15 +367,14 @@ discourse_marker_match = discourse_relation_match
 # ---------------------------------------------------------------------------
 # RoBERTa-based sentiment classification (replaces lexicon)
 # Uses cardiffnlp/twitter-roberta-base-sentiment-latest for contextual
-# scoring with negation awareness. Falls back to VADER if model load fails.
+# scoring with negation awareness. Evaluation fails if the model is unavailable.
 # ---------------------------------------------------------------------------
 
 class RoBERTaSentimentClassifier:
-    """Batch sentiment scoring via cardiffnlp RoBERTa, with VADER fallback."""
+    """Required contextual sentiment scorer; failures invalidate evaluation."""
 
     def __init__(self, device: int | None = None):
         self._pipeline = None
-        self._vader = None
         self._device = device
         self._cache: dict[str, float] = {}
 
@@ -389,30 +397,16 @@ class RoBERTaSentimentClassifier:
                 f"RoBERTaSentimentClassifier loaded on device={device}"
             )
         except Exception as e:
-            logger.warning(
-                f"Failed to load RoBERTa sentiment model: {e}. "
-                f"Falling back to VADER."
-            )
-            self._pipeline = None
-            self._ensure_vader()
-
-    def _ensure_vader(self):
-        """Lazy-load VADER as fallback."""
-        if self._vader is not None:
-            return
-        try:
-            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-            self._vader = SentimentIntensityAnalyzer()
-            logger.info("VADER sentiment fallback loaded")
-        except ImportError:
-            logger.warning("VADER not available; sentiment will return 0.0")
-            self._vader = None
+            self._pipeline = False
+            raise LinguisticModelUnavailable(
+                f"Required RoBERTa sentiment model failed to load: {e}"
+            ) from e
 
     def score_batch(self, texts: list[str]) -> list[float]:
         """Score a batch of texts, returning values in [-1, 1].
 
-        Uses RoBERTa pipeline with GPU batching if available,
-        else VADER, else returns 0.0 for all.
+        Uses the required RoBERTa pipeline. No lexicon or zero-valued fallback
+        is allowed for a headline metric.
         """
         self._ensure_pipeline()
         results: list[float] = [0.0] * len(texts)
@@ -431,7 +425,7 @@ class RoBERTaSentimentClassifier:
         if not uncached_texts:
             return results
 
-        if self._pipeline is not None:
+        if self._pipeline is not False and self._pipeline is not None:
             try:
                 batch_results = self._pipeline(
                     uncached_texts, batch_size=64, truncation=True, max_length=512
@@ -451,28 +445,11 @@ class RoBERTaSentimentClassifier:
                     key = hashlib.sha256(text.encode()).hexdigest()
                     self._cache[key] = score
             except Exception as e:
-                logger.warning(
-                    f"RoBERTa batch failed ({type(e).__name__}), "
-                    f"falling back to VADER for {len(uncached_texts)} texts"
-                )
-                self._pipeline = None  # don't retry neural; go straight to VADER
-                self._ensure_vader()
-                for idx, text in zip(uncached_indices, uncached_texts):
-                    scores = self._vader.polarity_scores(text)
-                    results[idx] = scores["compound"]
-                    key = hashlib.sha256(text.encode()).hexdigest()
-                    self._cache[key] = scores["compound"]
-        elif self._vader is not None:
-            for idx, text in zip(uncached_indices, uncached_texts):
-                scores = self._vader.polarity_scores(text)
-                results[idx] = scores["compound"]
-                key = hashlib.sha256(text.encode()).hexdigest()
-                self._cache[key] = scores["compound"]
+                raise LinguisticModelUnavailable(
+                    f"RoBERTa sentiment batch inference failed: {e}"
+                ) from e
         else:
-            # No classifier available — return 0.0 (neutral)
-            for idx, text in zip(uncached_indices, uncached_texts):
-                key = hashlib.sha256(text.encode()).hexdigest()
-                self._cache[key] = 0.0
+            raise LinguisticModelUnavailable("Required RoBERTa sentiment model unavailable")
 
         return results
 
@@ -557,9 +534,13 @@ def sentiment_trajectory_similarity(
     sim_vec = np.array([sim_shape[k] for k in keys])
     real_vec = np.array([real_shape[k] for k in keys])
 
-    norm = np.linalg.norm(sim_vec) * np.linalg.norm(real_vec)
-    if norm < 1e-10:
+    sim_norm = np.linalg.norm(sim_vec)
+    real_norm = np.linalg.norm(real_vec)
+    if sim_norm < 1e-10 and real_norm < 1e-10:
+        return 1.0
+    if sim_norm < 1e-10 or real_norm < 1e-10:
         return 0.0
+    norm = sim_norm * real_norm
 
     cosine = float(np.dot(sim_vec, real_vec) / norm)
     # Clamp to [0, 1] since cosine can be negative
@@ -596,16 +577,19 @@ async def speech_act_ratio(
             try:
                 results = pipe(texts, batch_size=64, truncation=True, max_length=512)
                 for r in results:
-                    cat = _QUANTOR_TO_FOUR.get(r["label"], "assertive")
+                    label = r["label"]
+                    if label not in _QUANTOR_TO_FOUR:
+                        raise LinguisticModelUnavailable(
+                            f"Unknown speech-act label: {label!r}"
+                        )
+                    cat = _QUANTOR_TO_FOUR[label]
                     counts[cat] += 1
-            except Exception:
-                for msg in messages:
-                    cat = _speech_act_local(msg.text)
-                    counts[cat] += 1
+            except Exception as exc:
+                raise LinguisticModelUnavailable(
+                    f"Local speech-act batch inference failed: {exc}"
+                ) from exc
         else:
-            for msg in messages:
-                cat = _speech_act_local(msg.text)
-                counts[cat] += 1
+            raise LinguisticModelUnavailable("Required local speech-act model is unavailable")
 
     total = sum(counts.values())
     return {cat: count / total for cat, count in counts.items()}
@@ -764,10 +748,9 @@ class LinguisticMetrics:
             "sentiment_trajectory_similarity": sentiment_trajectory_similarity(sim_messages, real_messages),
             "speech_act_similarity": await speech_act_similarity(sim_messages, real_messages, classifier=classifier),
         }
-        try:
-            result["sip"] = semantic_information_preservation(sim_messages, real_messages)
-        except Exception:
-            result["sip"] = 0.0
+        # A model/load failure is not a semantic mismatch and must not be
+        # fabricated as a valid zero score.
+        result["sip"] = semantic_information_preservation(sim_messages, real_messages)
         return result
 
 

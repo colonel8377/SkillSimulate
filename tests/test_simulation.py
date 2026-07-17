@@ -11,6 +11,8 @@ def test_action_type_for_platform():
     wiki_actions = ActionType.for_platform(Platform.WIKIPEDIA)
     assert ActionType.EDIT in wiki_actions
     assert ActionType.REVERT in wiki_actions
+    assert ActionType.AGREE not in wiki_actions
+    assert ActionType.DISAGREE not in wiki_actions
 
     reddit_actions = ActionType.for_platform(Platform.REDDIT)
     assert ActionType.REPLY in reddit_actions
@@ -69,6 +71,247 @@ def test_user_features():
     assert len(vec) == 13
 
 
+def test_pop_aligned_uses_named_features_not_vector_positions():
+    from src.agents.pop_aligned import compute_cluster_attributes
+    from src.clustering.features import UserFeatures
+
+    feature = UserFeatures(
+        user_id="u",
+        reply_rate=0.99,
+        mean_indentation=2.5,
+        verbosity=9.0,
+        activity=8.0,
+        question_rate=0.3,
+        conflict_engagement_ratio=0.4,
+        message_count=10,
+        thread_count=3,
+    )
+    stats = compute_cluster_attributes([feature])
+    assert stats["reply_depth"]["mean"] == 2.5
+    assert stats["verbosity"]["mean"] == 9.0
+    assert stats["question_rate"]["mean"] == 0.3
+    assert stats["conflict_engagement_ratio"]["mean"] == 0.4
+
+
+def test_canonical_action_taxonomy_aligns_wikipedia_actions():
+    from src.evaluation.aggregator import MetricsAggregator
+
+    assert MetricsAggregator._canonical_action("agree", "wikipedia") == "participation"
+    assert MetricsAggregator._canonical_action("discuss", "wikipedia") == "participation"
+    assert MetricsAggregator._canonical_action("disagree", "wikipedia") == "conflict"
+    assert MetricsAggregator._canonical_action("revert", "wikipedia") == "conflict"
+    assert MetricsAggregator._canonical_action("report", "wikipedia") == "moderation"
+
+
+def test_rsa_unavailable_is_flagged_without_dropping_metric_schema():
+    from src.evaluation.micro import MicroMetrics
+
+    result = MicroMetrics.compute(
+        sim_profiles=np.eye(3), real_profiles=np.eye(3),
+    )
+    assert result["rsa"] == 0.0
+    assert result["rsa_available"] is False
+
+
+def test_linguistic_sample_is_round_stratified():
+    from src.evaluation.aggregator import MetricsAggregator
+
+    messages = [
+        {"msg_id": f"m{r}_{i}", "thread_id": f"t{i % 2}", "round": r}
+        for r in range(10) for i in range(20)
+    ]
+    sample = MetricsAggregator._stratified_message_sample(messages, 20)
+    assert {m["round"] for m in sample} == set(range(10))
+
+
+def test_real_and_sim_chain_depths_match_on_identical_messages():
+    from src.evaluation.aggregator import MetricsAggregator
+
+    thread = Thread("t", Platform.WIKIPEDIA, "topic")
+    thread.add_message(Message(
+        msg_id="root", thread_id="t", user_id="u1",
+        platform=Platform.WIKIPEDIA, timestamp=datetime.now(), text="root",
+        action_type=ActionType.DISCUSS,
+    ))
+    thread.add_message(Message(
+        msg_id="child", thread_id="t", user_id="u2",
+        platform=Platform.WIKIPEDIA, timestamp=datetime.now(), text="child",
+        action_type=ActionType.DISCUSS, parent_msg_id="root",
+    ))
+    # A sliced corpus can retain a message whose parent is outside the slice.
+    thread.add_message(Message(
+        msg_id="orphan", thread_id="t", user_id="u3",
+        platform=Platform.WIKIPEDIA, timestamp=datetime.now(), text="orphan",
+        action_type=ActionType.DISCUSS, parent_msg_id="not-in-slice",
+    ))
+    agg = MetricsAggregator()
+    raw = [agg._msg_to_dict(m) for m in thread.messages]
+    assert agg._compute_chain_lengths([thread]) == [1, 2, 1]
+    assert agg._compute_chain_lengths_from_dicts(raw) == [1, 2, 1]
+
+
+def test_exp1_evaluation_is_local_and_model_independent():
+    from src.config.schemas import ExperimentConfig
+    from src.experiment.exp1_validation import Experiment1Runner
+
+    runner = Experiment1Runner(ExperimentConfig.from_yaml("configs/exp1_v2.yaml"))
+    assert runner.metrics_agg._llm_client is None
+    assert runner.metrics_agg._llm_model_name is None
+
+
+def test_exp1_refuses_verdict_for_incomplete_grid(tmp_path):
+    from types import SimpleNamespace
+    from src.experiment.exp1_validation import Experiment1Runner
+
+    runner = Experiment1Runner.__new__(Experiment1Runner)
+    runner.results_dir = tmp_path
+    runner.config = SimpleNamespace(
+        conditions=["cadp_advisory_nuwa", "cadp_full_nuwa"],
+        datasets=["wikipedia"], models=["m"], num_repeats=1,
+    )
+    with pytest.raises(ValueError, match="incomplete or stale Exp1 grid"):
+        runner.save_all_metrics()
+
+
+def test_degenerate_action_reference_fails_closed():
+    from src.evaluation.aggregator import EvaluationIntegrityError, MetricsAggregator
+
+    with pytest.raises(EvaluationIntegrityError):
+        MetricsAggregator._validate_action_reference({"participation": 1.0})
+
+
+def test_exp1_conditions_share_stimulus_manifest(tmp_path):
+    from types import SimpleNamespace
+    from src.experiment.exp1_validation import Experiment1Runner
+    from src.experiment.runner import ExperimentCell
+
+    seeds = []
+    for i in range(120):
+        thread = Thread(
+            thread_id=f"cga{i:03d}", platform=Platform.WIKIPEDIA,
+            topic=f"topic-{i}",
+        )
+        thread.add_message(Message(
+            msg_id=f"m{i}", thread_id=thread.thread_id, user_id="real",
+            platform=Platform.WIKIPEDIA, timestamp=datetime.now(), text="seed",
+            action_type=ActionType.DISCUSS,
+        ))
+        seeds.append(thread)
+
+    wiki_refs = []
+    for i in range(120):
+        thread = Thread(
+            thread_id=f"wiki{i:03d}", platform=Platform.WIKIPEDIA,
+            topic=f"wiki-topic-{i}",
+        )
+        thread.add_message(Message(
+            msg_id=f"w{i}a", thread_id=thread.thread_id, user_id="u1",
+            platform=Platform.WIKIPEDIA, timestamp=datetime.now(), text="discussion",
+            action_type=ActionType.DISCUSS,
+        ))
+        thread.add_message(Message(
+            msg_id=f"w{i}b", thread_id=thread.thread_id, user_id="u2",
+            platform=Platform.WIKIPEDIA, timestamp=datetime.now(), text="changed",
+            action_type=ActionType.EDIT, parent_msg_id=f"w{i}a",
+        ))
+        wiki_refs.append(thread)
+
+    runner = Experiment1Runner.__new__(Experiment1Runner)
+    runner.results_dir = tmp_path
+    runner.config = SimpleNamespace(
+        seed=42, seed_min_toxicity=0.6, max_sim_threads=3,
+    )
+    runner._load_cga_seed_threads = lambda: seeds
+
+    c1 = ExperimentCell("vanilla", "wikipedia", "m", 0)
+    c2 = ExperimentCell("cadp_full_nuwa", "wikipedia", "m", 0)
+    sim1, ref1, ling1 = runner._prepare_sim_threads(wiki_refs, c1)
+    sim2, ref2, ling2 = runner._prepare_sim_threads(wiki_refs, c2)
+
+    source1 = [t.thread_id.rsplit("_", 1)[-1] for t in sim1]
+    source2 = [t.thread_id.rsplit("_", 1)[-1] for t in sim2]
+    assert source1 == source2
+    assert [t.thread_id for t in ref1] == [t.thread_id for t in ref2]
+    assert [t.thread_id for t in ling1] == [t.thread_id for t in ling2]
+    assert set(source1).isdisjoint({t.thread_id for t in ling1})
+    assert all(t.thread_id.startswith("wiki") for t in ref1)
+
+
+def test_uncalibrated_trigger_sanitizer_is_noop():
+    """Rule-based triggers deleted 2026-07-17; sanitizer is now a no-op."""
+    from src.experiment.exp1_validation import Experiment1Runner
+    status = Experiment1Runner._sanitize_uncalibrated_triggers("wikipedia", {})
+    assert status == "rule_path_removed_no_triggers_to_sanitize"
+
+
+def test_advisory_and_full_have_identical_static_skill_text():
+    from types import SimpleNamespace
+    from src.agents.cadp import CADPAgent
+    from src.agents.cadp_advisory import CADPAdvisoryAgent
+
+    adapter = SimpleNamespace(
+        build_system_prompt=lambda **kwargs: f"system:{kwargs}",
+        build_constraint_text=lambda **kwargs: f"constraints:{kwargs}",
+    )
+    full = CADPAgent.__new__(CADPAgent)
+    full.adapter = adapter
+    full.show_expression_dna = True
+    full.show_mind_models = True
+    full.show_anti_patterns = True
+    advisory = CADPAdvisoryAgent.__new__(CADPAdvisoryAgent)
+    advisory.adapter = adapter
+    advisory.enforcement_harness = None
+
+    assert advisory.get_role_description() == full.get_role_description()
+    assert advisory.get_constraints_text() == full.get_constraints_text()
+    assert advisory.enforcement_harness is None
+    assert advisory.get_reflection_directive() is None
+
+
+def test_locked_cluster_ids_are_anonymized_into_runtime_keyspace(tmp_path):
+    import pickle
+    from types import SimpleNamespace
+    from src.clustering.clusterer import ClusterResult
+    from src.clustering.features import UserFeatures
+    from src.data.pii import anonymize_user_id
+    from src.experiment.exp1_validation import Experiment1Runner
+
+    raw_uid = "VisiblePublicHandle"
+    cr = ClusterResult(
+        labels={raw_uid: 3}, n_clusters=1, centroids=np.zeros((1, 1)),
+        silhouette_score=0.0, davies_bouldin_score=0.0,
+        behavioral_weight=1.0, language_weight=0.0,
+        user_features={raw_uid: UserFeatures(user_id=raw_uid)},
+    )
+    path = tmp_path / "locked.pkl"
+    with path.open("wb") as handle:
+        pickle.dump(cr, handle)
+    runner = Experiment1Runner.__new__(Experiment1Runner)
+    runner.config = SimpleNamespace(cluster_merge_map_path=None)
+
+    loaded = runner._load_locked_clusters(str(path))
+    anonymous_uid = anonymize_user_id(raw_uid)
+    assert loaded.labels == {anonymous_uid: 3}
+    assert anonymous_uid in loaded.user_features
+    assert loaded.user_features[anonymous_uid].user_id == anonymous_uid
+
+
+@pytest.mark.asyncio
+async def test_empty_simulation_fails_integrity_instead_of_evaluating(tmp_path):
+    from src.simulation.sandbox import SimulationIntegrityError, SimulationSandbox
+    from src.simulation.platforms.wikipedia import WikipediaTopology
+
+    sandbox = SimulationSandbox(
+        WikipediaTopology(), checkpoint_dir=tmp_path, min_turn_success_rate=0.95,
+    )
+    thread = Thread("t", Platform.WIKIPEDIA, "topic")
+    with pytest.raises(SimulationIntegrityError):
+        await sandbox.run(
+            agents=[], threads=[thread], num_rounds=1, run_id="empty",
+            condition="vanilla", dataset="wikipedia", model="mock",
+        )
+
+
 def test_expression_dna():
     from src.skill.expression_dna import ExpressionDNAExtractor
     from src.skill.schema import ExpressionDNA
@@ -119,7 +362,9 @@ def test_skill_file_serialization():
                 AntiPattern(
                     description="Avoid personal attacks",
                     trigger_conditions=["When disagreeing"],
-                    trigger_keywords=["stupid", "idiot"],
+                    reason="Hostility violates wiki norms",
+                    evidence=["User called another editor 'stupid'"],
+                    correct_alternative="Address the edit, not the editor",
                 ),
             ],
         ),
@@ -237,14 +482,16 @@ def test_g11_github_comment_fallback_no_lifecycle_edge():
 
 
 def test_g6_tier1_safe_template_fallback():
-    """G6: Tier 1 uses safe-template fallback after max_retries=3 exhausted."""
+    """G6: Tier 1 uses safe-template fallback after max_retries exhausted."""
     import asyncio
     from src.enforcement.tier1_filter import Tier1ExpressionFilter
     from src.skill.schema import ExpressionDNA
 
+    # Centroid at origin, threshold tiny → any non-zero text embedding is
+    # well outside the cosine boundary and triggers regeneration.
     edna = ExpressionDNA(
         embedding_centroid=[0.0] * 384,
-        embedding_std=[1.0] * 384,
+        embedding_cosine_threshold=0.001,
     )
 
     # Stub embedder so every text is "out of bounds" deterministically
@@ -259,7 +506,7 @@ def test_g6_tier1_safe_template_fallback():
     tier1 = Tier1ExpressionFilter(alpha=1.0, llm_client=None, max_retries=3)
     tier1._embedder = StubEmbedder()
 
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         tier1.enforce_and_regenerate(
             text="some text",
             original_messages=[{"role": "user", "content": "hi"}],
@@ -272,50 +519,61 @@ def test_g6_tier1_safe_template_fallback():
     assert enforcement.passed is False
 
 
-def test_g7_per_antipattern_behavioral_threshold():
-    """G7: AntiPattern carries trigger_behavioral_threshold; tier3 honours it."""
-    from src.skill.schema import AntiPattern
-    from src.enforcement.tier3_block import Tier3AntiPatternBlock
+def test_tier3_llm_judge_blocks_hostility():
+    """Tier-3 LLM judge: a `violated=true` verdict blocks the message.
 
-    ap_high = AntiPattern(
-        description="avoid report",
-        trigger_conditions=[],
-        trigger_action_patterns=["report"],
-        trigger_behavioral_threshold=0.99,  # very high — should not fire at default 0.5
-    )
-    ap_default = AntiPattern(
-        description="avoid close",
-        trigger_conditions=[],
-        trigger_action_patterns=["close"],
-        # trigger_behavioral_threshold=None → uses global 0.5
+    Replaces the deleted rule-based test_g7_per_antipattern_behavioral_threshold
+    after the 2026-07-17 enforcement simplification collapsed Tier 3 to a
+    single LLM judge call.
+    """
+    import asyncio
+    from src.enforcement.tier3_llm_judge import Tier3LLMJudge
+    from src.skill.schema import (
+        AntiPattern, CapabilityTrack, ConstraintTrack,
+        ExpressionDNA, MindModel, SkillFile,
     )
 
-    # Attach a stub classifier returning proba=0.6
-    class StubClassifier:
-        trained = True
-        def predict_proba(self, history):
-            return 0.6
-
-    tier3 = Tier3AntiPatternBlock(alpha=1.0)
-    tier3.behavioral_threshold = 0.5
-    tier3.attach_behavioral_classifier(StubClassifier(), threshold=0.5)
-
-    # ap_high threshold 0.99 → 0.6 < 0.99 → classifier path says no; but
-    # action_patterns=["report"] runs legacy path which fires on history match.
-    # Use history that does NOT contain "report" so legacy path also no.
-    r_high = tier3._check_behavioral(
-        ["edit"], ap_high.trigger_action_patterns,
-        per_pattern_threshold=ap_high.trigger_behavioral_threshold,
+    ap = AntiPattern(
+        description="Personal attacks",
+        trigger_conditions=["message insults another editor"],
+        reason="Hostility is prohibited",
     )
-    r_default = tier3._check_behavioral(
-        ["close"], ap_default.trigger_action_patterns,
-        per_pattern_threshold=ap_default.trigger_behavioral_threshold,
+    skill = SkillFile(
+        cluster_id="c0",
+        platform="wikipedia",
+        capability=CapabilityTrack(
+            expression_dna=ExpressionDNA(),
+            mind_models=[],
+        ),
+        constraint=ConstraintTrack(anti_patterns=[ap]),
+        archetype_label="test",
     )
-    # ap_default: classifier says 0.6 >= 0.5 → fires
-    assert r_default is not None and "0.6" in r_default
-    # ap_high: classifier says 0.6 < 0.99 → no; legacy action match against
-    # ["edit"] for pattern ["report"] → no. Should return None.
-    assert r_high is None
+
+    class StubLLM:
+        async def chat_completion(self, *_, **__):
+            return '{"0": {"violated": true, "confidence": 0.9, "reason": "insult"}}'
+
+    judge = Tier3LLMJudge(llm_client=StubLLM(), audit_only=False)
+
+    async def _run():
+        from src.enforcement.harness import EnforcementHarness
+        harness = EnforcementHarness(
+            enable_tier1=False,
+            enable_tier2=False,
+            enable_tier3=True,
+            skill=skill,
+            tier3_llm_judge=judge,
+        )
+        text, log, replan = await harness.enforce_output(
+            text="you are a troll and a fool",
+            original_messages=[],
+        )
+        assert log.tier3_llm_post is not None
+        assert log.tier3_llm_post.passed is False
+        assert log.tier3_hard_block_triggered is True
+        assert replan is not None and "LLM judge" in replan
+
+    asyncio.run(_run())
 
 
 def test_g9_linguistics_orthogonality_verifier():
@@ -339,25 +597,18 @@ def test_g9_linguistics_orthogonality_verifier():
     assert isinstance(report["leakage_risk"], bool)
 
 
-def test_g2_antipattern_llm_prompt_emits_trigger_fields():
-    """G2: AntiPatternDetector LLM-detection prompt asks for A/B/C trigger fields
-    and the parser wires them into the AntiPattern dataclass."""
-    import inspect
-    from src.skill.anti_patterns import DETECTION_PROMPT, AntiPatternDetector
-
-    # Prompt must request all seven fields
-    for field in [
-        "trigger_regex",
-        "trigger_semantic_phrases",
-        "trigger_action_patterns",
-        "trigger_keywords",
-    ]:
-        assert field in DETECTION_PROMPT, f"prompt missing {field}"
-
-    # AntiPattern dataclass must expose Category A/B/C fields
+def test_g2_antipattern_schema_is_trimmed():
+    """G2 (2026-07-17 refactor): AntiPattern exposes only the 5 fields the
+    LLM judge consumes; rule-based trigger fields are deleted."""
     from src.skill.schema import AntiPattern
     fields = {f.name for f in AntiPattern.__dataclass_fields__.values()}
-    assert {"trigger_regex", "trigger_semantic_phrases", "trigger_action_patterns"} <= fields
+    expected = {"description", "trigger_conditions", "reason",
+                "evidence", "correct_alternative"}
+    assert fields == expected, f"extra/missing fields: {fields ^ expected}"
+    # Rule-based fields must be gone
+    assert not ({"trigger_regex", "trigger_keywords", "trigger_semantic_phrases",
+                 "trigger_action_patterns", "trigger_semantic_threshold",
+                 "trigger_behavioral_threshold"} & fields)
 
 
 def test_g1_dual_pass_negative_case_selection():
@@ -425,7 +676,7 @@ def test_g8_proxy_fallback_summary():
     assert summary["release_ready"] is False
 
 
-async def test_g8_evaluate_survives_held_out_events_load_failure():
+async def test_g8_evaluate_survives_held_out_events_load_failure(monkeypatch):
     """Regression: if _load_held_out_events throws, evaluate() must still
     construct a MetricsReport (held_out_events is referenced at report-build
     time, so it must be pre-initialized to None outside the try)."""
@@ -437,25 +688,32 @@ async def test_g8_evaluate_survives_held_out_events_load_failure():
 
     # Build minimal real threads + sim result
     real_threads = []
-    for i in range(3):
+    for i in range(10):
         t = Thread(thread_id=f"rt{i}", platform=Platform.WIKIPEDIA, topic=f"r{i}")
-        for j in range(3):
+        for j in range(2):
             t.add_message(Message(
-                msg_id=f"rt{i}m{j}", thread_id=f"rt{i}", user_id=f"ru{j%2}",
+                msg_id=f"rt{i}m{j}", thread_id=f"rt{i}", user_id=f"ru{i}_{j}",
                 platform=Platform.WIKIPEDIA, timestamp=datetime.now(),
-                text=f"real msg {j}", action_type=ActionType.DISCUSS,
+                text=f"real msg {j}",
+                action_type=ActionType.DISCUSS if j == 0 else ActionType.EDIT,
+                parent_msg_id=f"rt{i}m0" if j else None,
             ))
         real_threads.append(t)
 
     sim_result = SimulationResult(
         run_id="test", condition="cadp_full", dataset="wikipedia",
         model="gpt-4o", repeat=0, rounds=1,
-        messages=[{
-            "msg_id": "s1", "thread_id": "rt0", "user_id": "a1",
-            "action_type": "discuss", "text": "sim msg",
-            "parent_msg_id": None,
-        }],
-        agent_states=[{"agent_id": "a1", "cluster_id": 0}],
+        messages=[
+            {
+                "msg_id": f"s{i}", "thread_id": "sim_t", "user_id": f"a{i}",
+                "action_type": "discuss" if i % 2 == 0 else "edit",
+                "text": f"sim msg {i}", "round": 0,
+                "parent_msg_id": f"s{i-1}" if i else None, "metadata": {},
+            }
+            for i in range(10)
+        ],
+        agent_states=[{"agent_id": f"a{i}", "cluster_id": i % 2} for i in range(10)],
+        per_round_metrics=[{"round": 0}], run_fingerprint="fp",
     )
 
     agg = MetricsAggregator()
@@ -465,11 +723,481 @@ async def test_g8_evaluate_survives_held_out_events_load_failure():
         raise RuntimeError("simulated load failure")
     agg._load_held_out_events = boom
 
+    async def fake_linguistics(*_args, **_kwargs):
+        return {
+            "discourse_relation_match": 1.0,
+            "sentiment_trajectory_similarity": 1.0,
+            "speech_act_similarity": 1.0,
+            "sip": 1.0,
+        }
+    monkeypatch.setattr(
+        "src.evaluation.aggregator.LinguisticMetrics.compute", fake_linguistics,
+    )
+
     # Must not raise
     report = await agg.evaluate(sim_result, real_threads)
     # Predictive layer removed; heuristic flag always False now
     assert report.used_held_out_events_heuristic is False
     assert report.used_role_label_proxy is True  # no role_labels dir configured
+    assert "complexity_gap" in report.metrics
+    assert "caricature_index_real" in report.metrics
+    assert "caricature_gap" in report.metrics
+
+
+def test_wikipedia_free_text_does_not_create_platform_action():
+    from src.data.wikipedia import WikipediaLoader
+
+    loader = WikipediaLoader("unused")
+    assert loader._infer_action({}, "I reported that the edit was reverted") == ActionType.DISCUSS
+    assert loader._infer_action({"rev_id": 123}, "ordinary summary") == ActionType.EDIT
+
+
+def test_wikipedia_topology_uses_platform_actions_and_conflict_metadata():
+    from src.simulation.platforms.wikipedia import WikipediaTopology
+
+    thread = Thread("t", Platform.WIKIPEDIA, "topic")
+    thread.add_message(Message(
+        "m", "t", "other", Platform.WIKIPEDIA, datetime.now(), "attack",
+        ActionType.DISCUSS, metadata={"toxicity": "0.8"},
+    ))
+    actions = WikipediaTopology().get_valid_actions(thread, "agent")
+    assert ActionType.REPORT in actions
+    assert ActionType.AGREE not in actions
+    assert ActionType.DISAGREE not in actions
+
+
+def test_action_js_smoothing_is_small_probability_epsilon():
+    from src.evaluation.macro import normalized_entropy_distance
+
+    p = {"participation": 1.0, "conflict": 0.0}
+    assert normalized_entropy_distance(p, p, smoothing=0.001) == pytest.approx(0.0)
+    assert 0 < normalized_entropy_distance(
+        {"participation": 1.0}, {"conflict": 1.0}, smoothing=0.001,
+    ) < 1
+    with pytest.raises(ValueError):
+        normalized_entropy_distance(p, p, smoothing=-0.1)
+
+
+def test_sentiment_zero_trajectory_self_similarity(monkeypatch):
+    import src.evaluation.linguistics as ling
+
+    zeros = {"variance": 0.0, "trend_slope": 0.0, "oscillation_freq": 0.0, "range": 0.0}
+    monkeypatch.setattr(ling, "sentiment_trajectory_shape", lambda _messages: zeros)
+    assert ling.sentiment_trajectory_similarity([], []) == 1.0
+
+
+@pytest.mark.asyncio
+async def test_speech_act_model_failure_fails_closed(monkeypatch):
+    import src.evaluation.linguistics as ling
+
+    monkeypatch.setattr(ling, "_get_local_speech_act_pipeline", lambda: False)
+    message = Message("m", "t", "u", Platform.WIKIPEDIA, datetime.now(), "text")
+    with pytest.raises(ling.LinguisticModelUnavailable):
+        await ling.speech_act_ratio([message])
+
+
+def test_pdtb_model_failure_fails_closed(monkeypatch):
+    import src.evaluation.linguistics as ling
+
+    monkeypatch.setattr(ling, "_get_pdtb_pipeline", lambda: False)
+    message = Message("m", "t", "u", Platform.WIKIPEDIA, datetime.now(), "text")
+    with pytest.raises(ling.LinguisticModelUnavailable):
+        ling.discourse_relation_distribution([message])
+
+
+def test_sentiment_model_failure_fails_closed(monkeypatch):
+    import src.evaluation.linguistics as ling
+
+    classifier = ling.RoBERTaSentimentClassifier()
+    monkeypatch.setattr(classifier, "_ensure_pipeline", lambda: None)
+    classifier._pipeline = False
+    with pytest.raises(ling.LinguisticModelUnavailable):
+        classifier.score_batch(["text"])
+
+
+def test_composite_metric_weights_must_be_explicit_and_normalized():
+    from src.evaluation.aggregator import MetricsAggregator
+
+    MetricsAggregator(
+        linguistic_metric_weights={
+            "discourse_relation_match": 0.25,
+            "sentiment_trajectory_similarity": 0.25,
+            "speech_act_similarity": 0.25,
+            "sip": 0.25,
+        },
+        interaction_metric_weights={"cascade": 0.5, "graph": 0.5},
+    )
+    with pytest.raises(ValueError, match="sum to 1"):
+        MetricsAggregator(
+            linguistic_metric_weights={
+                "discourse_relation_match": 1.0,
+                "sentiment_trajectory_similarity": 1.0,
+                "speech_act_similarity": 1.0,
+                "sip": 1.0,
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_micro_batch_exposes_earlier_same_round_messages():
+    from types import SimpleNamespace
+    from src.simulation.platforms.wikipedia import WikipediaTopology
+    from src.simulation.sandbox import SimulationSandbox
+
+    class Agent:
+        engagement_ratio = 1.0
+
+        def __init__(self, agent_id):
+            self.agent_id = agent_id
+
+        async def take_turn(self, thread, _actions, round_num):
+            observed = len(thread.messages)
+            return Message(
+                f"{self.agent_id}-{round_num}", thread.thread_id, self.agent_id,
+                thread.platform, datetime.now(), str(observed), ActionType.DISCUSS,
+                parent_msg_id=thread.messages[-1].msg_id,
+            ), None
+
+        def observe(self, *_args):
+            pass
+
+    thread = Thread("t", Platform.WIKIPEDIA, "topic")
+    thread.add_message(Message(
+        "seed", "t", "real", Platform.WIKIPEDIA, datetime.now(), "seed",
+        ActionType.DISCUSS,
+    ))
+    sandbox = SimulationSandbox(WikipediaTopology(), micro_batch_size=1)
+    messages, _, _, planned = await sandbox._run_round(
+        [Agent("a"), Agent("b")], [thread], 0,
+    )
+    assert planned == 2
+    assert [row["text"] for row in messages] == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_manipulation_audit_reports_inactive_without_blocking_treatment(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from src.experiment.exp1_validation import Experiment1Runner
+    from src.experiment.runner import ExperimentCell
+    from src.skill.schema import CapabilityTrack, ConstraintTrack, ExpressionDNA, SkillFile
+
+    class Checkpoints:
+        def is_completed(self, _run_id):
+            return True
+
+        def load(self, _run_id):
+            return {
+                "agents_state": [{"agent_id": "a", "cluster_id": 0}],
+                "messages_log": [{"user_id": "a", "text": "outlier"}],
+                "extra": {"checkpoint_schema_version": 2, "round_complete": True},
+            }
+
+    class Embedder:
+        def encode(self, *_args, **_kwargs):
+            raise AssertionError("executor wrapper should be mocked")
+
+    async def fake_embed(_fn, _texts, **_kwargs):
+        return np.tile(np.array([[2.0, 0.0]]), (len(_texts), 1))
+
+    monkeypatch.setattr("src.config.embedder.run_embed_in_executor", fake_embed)
+    monkeypatch.setattr("src.config.settings.get_shared_embedder", lambda: Embedder())
+    runner = Experiment1Runner.__new__(Experiment1Runner)
+    runner.config = SimpleNamespace(manipulation_min_potential_rate=0.5, num_repeats=3)
+    runner.checkpoint = Checkpoints()
+    runner.results_dir = tmp_path
+    skill = SkillFile(
+        cluster_id="0", platform="wikipedia",
+        capability=CapabilityTrack(ExpressionDNA(
+            embedding_centroid=[0.0, 1.0],
+            embedding_cosine_threshold=0.1,
+        ), []),
+        constraint=ConstraintTrack([]),
+    )
+    audit = await runner._validate_manipulation_potential(
+        ExperimentCell("cadp_full_nuwa", "wikipedia", "flash", 0), {0: skill},
+    )
+    assert audit["passed"] is True
+    assert audit["potential_rate"] == 1.0
+    assert (tmp_path / "manipulation_audits" / "cadp_full_nuwa_wikipedia_flash_r0.json").exists()
+
+    async def in_distribution(_fn, _texts, **_kwargs):
+        return np.tile(np.array([[0.1, 1.0]]), (len(_texts), 1))
+    monkeypatch.setattr("src.config.embedder.run_embed_in_executor", in_distribution)
+    inactive = await runner._validate_manipulation_potential(
+        ExperimentCell("cadp_full_nuwa", "wikipedia", "flash", 1), {0: skill},
+    )
+    assert inactive["passed"] is False
+    assert inactive["potential_rate"] == 0.0
+
+
+def test_observed_continuation_uses_same_thread_prefix_and_suffix(tmp_path):
+    from types import SimpleNamespace
+    from src.experiment.exp1_validation import Experiment1Runner
+    from src.experiment.runner import ExperimentCell
+
+    threads = []
+    for i in range(4):
+        thread = Thread(f"source-{i}", Platform.WIKIPEDIA, f"topic-{i}")
+        for j in range(6):
+            thread.add_message(Message(
+                f"m{i}-{j}", thread.thread_id, f"u{j % 2}", Platform.WIKIPEDIA,
+                datetime.now(), f"message {j}",
+                ActionType.EDIT if j == 4 else ActionType.DISCUSS,
+                parent_msg_id=f"m{i}-{j-1}" if j else None,
+                metadata={"toxicity": 0.7 if i == 0 else 0.0},
+            ))
+        threads.append(thread)
+
+    runner = Experiment1Runner.__new__(Experiment1Runner)
+    runner.results_dir = tmp_path
+    runner.config = SimpleNamespace(
+        continuation_min_messages=6, continuation_prefix_fraction=0.5,
+        max_sim_threads=2, seed=42,
+    )
+    runner._tier1_calibration_thread_ids = set()
+    runner._load_distillation_thread_ids = lambda: set()
+    sim, refs, ling = runner._prepare_observed_continuations(
+        threads, ExperimentCell("cadp_advisory_nuwa", "wikipedia", "flash", 0),
+    )
+    assert len(sim) == len(refs) == len(ling) == 2
+    originals = {thread.thread_id: thread for thread in threads}
+    for seed, reference in zip(sim, refs):
+        source_id = reference.thread_id
+        original_ids = [m.msg_id for m in originals[source_id].messages]
+        assert [m.msg_id for m in seed.messages] == original_ids[:3]
+        assert [m.msg_id for m in reference.messages] == original_ids[3:]
+        suffix_ids = {m.msg_id for m in reference.messages}
+        assert any(m.parent_msg_id in suffix_ids for m in reference.messages)
+    sim_full, refs_full, _ = runner._prepare_observed_continuations(
+        threads, ExperimentCell("cadp_full_nuwa", "wikipedia", "flash", 0),
+    )
+    assert [t.thread_id for t in refs_full] == [t.thread_id for t in refs]
+    assert [
+        [m.msg_id for m in thread.messages] for thread in sim_full
+    ] == [
+        [m.msg_id for m in thread.messages] for thread in sim
+    ]
+
+
+def test_wikipedia_loader_balances_target_across_years(tmp_path, monkeypatch):
+    import json
+    from src.data.wikipedia import WikipediaLoader
+
+    dirs = []
+    for year in (2001, 2002):
+        directory = tmp_path / f"wikiconv-{year}"
+        directory.mkdir()
+        (directory / "conversations.json").write_text(json.dumps({
+            f"c{year}": {"meta": {"page_title": str(year)}}
+        }))
+        rows = [
+            {"id": f"{year}-{i}", "conversation_id": f"c{year}",
+             "speaker": f"u{i}", "text": "comment", "meta": {},
+             "reply-to": f"{year}-0" if i else None}
+            for i in range(2)
+        ]
+        (directory / "utterances.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n"
+        )
+        dirs.append(directory)
+
+    loader = WikipediaLoader(str(tmp_path), target_threads=2, min_messages=2)
+    monkeypatch.setattr(loader, "_load_cga_labels", lambda _root: {})
+    loaded = loader._load_convokit(dirs, tmp_path)
+    assert {thread.thread_id for thread in loaded} == {"c2001", "c2002"}
+
+
+@pytest.mark.asyncio
+async def test_planner_separates_platform_action_from_stance():
+    from src.agents.planning import Planner
+
+    class LLM:
+        async def chat_completion_json(self, *_args, **_kwargs):
+            return {
+                "action_type": "discuss", "stance": "oppositional",
+                "text": "I disagree with the premise", "target_msg_id": "m",
+                "reasoning": "challenge",
+            }
+
+    thread = Thread("t", Platform.WIKIPEDIA, "topic")
+    thread.add_message(Message(
+        "m", "t", "other", Platform.WIKIPEDIA, datetime.now(), "claim",
+        ActionType.DISCUSS,
+    ))
+    plan = await Planner(LLM()).plan(
+        thread, [ActionType.DISCUSS, ActionType.EDIT], "",
+    )
+    assert plan.action_type == ActionType.DISCUSS
+    assert plan.stance == "oppositional"
+
+
+def test_viability_pre_registered_go_rule():
+    import pandas as pd
+    from types import SimpleNamespace
+    from src.analysis.viability import evaluate_viability
+
+    rows = []
+    for repeat in range(3):
+        common = {
+            "dataset": "wikipedia", "model": "m", "repeat": repeat,
+            "simulation_message_count": 100,
+            "enforcement_safe_template_rate": 0.0,
+        }
+        rows.append({
+            **common, "condition": "cadp_advisory_nuwa",
+            "action_fidelity_distance": 0.5,
+            "interaction_structure_distance": 0.6,
+            "linguistic_fidelity_distance": 0.4,
+            "action_text_consistency": 0.95,
+        })
+        rows.append({
+            **common, "condition": "cadp_full_nuwa",
+            "action_fidelity_distance": 0.4,
+            "interaction_structure_distance": 0.5,
+            "linguistic_fidelity_distance": 0.35,
+            "action_text_consistency": 0.95,
+        })
+    config = SimpleNamespace(
+        viability_treatment="cadp_full_nuwa",
+        viability_control="cadp_advisory_nuwa",
+        viability_primary_metrics=[
+            "action_fidelity_distance", "interaction_structure_distance",
+            "linguistic_fidelity_distance",
+        ],
+        viability_min_pairs=3,
+        viability_min_metric_wins=2,
+        viability_min_repeat_win_fraction=2 / 3,
+        viability_min_relative_improvement=0.05,
+        viability_max_family_regression=0.10,
+        viability_min_message_ratio=0.95,
+        viability_max_safe_template_rate=0.10,
+        viability_min_action_text_consistency=0.90,
+    )
+    report = evaluate_viability(pd.DataFrame(rows), config)
+    assert report["verdict"] == "GO"
+    assert report["metric_wins"] == 3
+    assert all(
+        row["required_repeat_wins"] == 2
+        for row in report["metric_results"].values()
+    )
+
+
+@pytest.mark.parametrize("failure", ["effect", "regression", "action_text"])
+def test_viability_stop_guards(failure):
+    import pandas as pd
+    from types import SimpleNamespace
+    from src.analysis.viability import evaluate_viability
+
+    metrics = [
+        "action_fidelity_distance", "interaction_structure_distance",
+        "linguistic_fidelity_distance",
+    ]
+    rows = []
+    for repeat in range(3):
+        common = {
+            "dataset": "wikipedia", "model": "m", "repeat": repeat,
+            "simulation_message_count": 100,
+            "enforcement_safe_template_rate": 0.0,
+            "action_text_consistency": 0.95,
+        }
+        rows.append({
+            **common, "condition": "cadp_advisory_nuwa",
+            **{metric: 1.0 for metric in metrics},
+        })
+        treatment_metrics = {metric: 0.9 for metric in metrics}
+        if failure == "effect":
+            treatment_metrics = {metric: 0.99 for metric in metrics}
+        elif failure == "regression":
+            treatment_metrics["linguistic_fidelity_distance"] = 1.2
+        treatment = {
+            **common, "condition": "cadp_full_nuwa", **treatment_metrics,
+        }
+        if failure == "action_text":
+            treatment["action_text_consistency"] = 0.80
+        rows.append(treatment)
+    config = SimpleNamespace(
+        viability_treatment="cadp_full_nuwa",
+        viability_control="cadp_advisory_nuwa",
+        viability_primary_metrics=metrics,
+        viability_min_pairs=3,
+        viability_min_metric_wins=2,
+        viability_min_repeat_win_fraction=2 / 3,
+        viability_min_relative_improvement=0.05,
+        viability_max_family_regression=0.10,
+        viability_min_message_ratio=0.95,
+        viability_max_safe_template_rate=0.10,
+        viability_min_action_text_consistency=0.90,
+    )
+    report = evaluate_viability(pd.DataFrame(rows), config)
+    assert report["verdict"] == "STOP"
+
+
+def test_balanced_population_and_empirical_engagement_do_not_collapse():
+    import random
+    from src.clustering.clusterer import ClusterResult
+    from src.clustering.features import UserFeatures
+    from src.simulation.population import PopulationBuilder
+
+    features = {}
+    labels = {}
+    for cid in range(6):
+        for i in range(40):
+            uid = f"{cid}-{i}"
+            features[uid] = UserFeatures(user_id=uid, message_count=5 + i * i)
+            labels[uid] = cid
+    cr = ClusterResult(
+        labels=labels, n_clusters=6, centroids=np.zeros((6, 1)),
+        silhouette_score=0.0, davies_bouldin_score=0.0,
+        behavioral_weight=1.0, language_weight=0.0,
+        user_features=features,
+    )
+    allocations = PopulationBuilder._allocate_balanced(18, cr.get_cluster_ids())
+    assert allocations == {cid: 3 for cid in range(6)}
+    rng = random.Random(42)
+    ratios = [
+        PopulationBuilder._sample_engagement_ratio("0", cr, rng)
+        for _ in range(18)
+    ]
+    assert len(set(round(value, 4) for value in ratios)) > 3
+    assert min(ratios) >= 0.05
+    assert max(ratios) <= 0.50
+
+
+def test_distillation_overlap_fails_closed():
+    from src.experiment.exp1_validation import Experiment1Runner
+    with pytest.raises(ValueError, match="Train/evaluation leakage"):
+        Experiment1Runner._assert_zero_distillation_overlap(
+            ["held-out", "leaked"], {"leaked"}, "unit-test",
+        )
+
+
+def test_locked_vector_bootstrap_reports_source_and_final_ari():
+    from src.clustering.clusterer import ClusterResult
+    from src.clustering.features import UserFeatures
+    from src.clustering.validation import ClusterStabilityValidator
+
+    features = {}
+    labels = {}
+    for i in range(160):
+        cid = i % 2
+        features[str(i)] = UserFeatures(
+            user_id=str(i), reply_rate=float(cid) + (i % 7) * 0.001,
+            verbosity=float(cid) + (i % 5) * 0.001,
+        )
+        labels[str(i)] = cid
+    cr = ClusterResult(
+        labels=labels, n_clusters=2, centroids=np.zeros((2, 2)),
+        silhouette_score=0.0, davies_bouldin_score=0.0,
+        behavioral_weight=1.0, language_weight=0.0,
+        user_features=features,
+    )
+    report = ClusterStabilityValidator.validate_locked_vectors(
+        cr, n_iterations=3, train_sample_size=120,
+        eval_sample_size=100, random_state=7,
+    )
+    assert report["protocol"] == "locked_k8_merge_bootstrap_v2"
+    assert len(report["source_k8_ari_scores"]) == 3
+    assert len(report["ari_scores"]) == 3
 
 
 def test_g4_alpha_sweep_75_cells():
@@ -492,54 +1220,207 @@ def test_g4_alpha_sweep_75_cells():
 
 
 # ----------------------------------------------------------------------
-# Audit P7 — Tier-1 Bonferroni regression test
+# Tier-1 cosine-distance filter regression tests
+# (2026-07-17 refactor: replaced Bonferroni z-score filter)
 # ----------------------------------------------------------------------
 
-def test_tier1_bonferroni_threshold_d384():
-    """Pin the dimension-aware Bonferroni threshold at d=384.
+@pytest.mark.asyncio
+async def test_tier1_cosine_rejects_far_text(monkeypatch):
+    """Text whose embedding is far from the centroid (cosine distance > threshold)
+    is rejected."""
+    import src.enforcement.tier1_filter as tier1_module
+    from src.enforcement.tier1_filter import Tier1ExpressionFilter
+    from src.skill.schema import ExpressionDNA
 
-    Outline §4.4 + tier1_filter docstring derive: alpha_per_dim = 2(1-Φ(2))/d,
-    threshold = Φ⁻¹(1 - alpha_per_dim/2). For per_dim_sigma=2.0 and d=384
-    (the embedding dim of ``all-MiniLM-L6-v2``) this evaluates to ≈3.85,
-    safely above E[max|z|]≈sqrt(2 ln 384)≈3.45 so the filter does not
-    systematically over-flag.
+    class StubEmbedder:
+        def encode(self, *_args, **_kwargs):
+            # Orthogonal to the centroid → cosine distance = 1.0.
+            return np.array([0.0, 1.0])
+
+        def get_sentence_embedding_dimension(self):
+            return 2
+
+    filter_ = Tier1ExpressionFilter(alpha=1.0)
+    filter_._embedder = StubEmbedder()
+
+    async def immediate_embed(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+    monkeypatch.setattr(tier1_module, "run_embed_in_executor", immediate_embed)
+
+    edna = ExpressionDNA(
+        embedding_centroid=[1.0, 0.0],
+        embedding_cosine_threshold=0.1,  # tight boundary
+    )
+    result = await filter_.check_post_generation("sample", {"expression_dna": edna})
+    assert result.passed is False
+    assert "cosine distance" in result.reason
+
+
+@pytest.mark.asyncio
+async def test_tier1_cosine_passes_in_cluster_text(monkeypatch):
+    """Text whose embedding is near the centroid passes."""
+    import src.enforcement.tier1_filter as tier1_module
+    from src.enforcement.tier1_filter import Tier1ExpressionFilter
+    from src.skill.schema import ExpressionDNA
+
+    class StubEmbedder:
+        def encode(self, *_args, **_kwargs):
+            return np.array([1.0, 0.0])
+
+        def get_sentence_embedding_dimension(self):
+            return 2
+
+    filter_ = Tier1ExpressionFilter(alpha=1.0)
+    filter_._embedder = StubEmbedder()
+
+    async def immediate_embed(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+    monkeypatch.setattr(tier1_module, "run_embed_in_executor", immediate_embed)
+
+    edna = ExpressionDNA(
+        embedding_centroid=[1.0, 0.0],
+        embedding_cosine_threshold=0.5,
+    )
+    result = await filter_.check_post_generation("sample", {"expression_dna": edna})
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_tier1_safe_template_fallback(monkeypatch):
+    """Tier 1 falls back to safe_template when retries exhausted."""
+    from src.enforcement.tier1_filter import Tier1ExpressionFilter
+    from src.skill.schema import ExpressionDNA
+
+    edna = ExpressionDNA(
+        embedding_centroid=[1.0, 0.0],
+        embedding_cosine_threshold=0.001,
+    )
+
+    class StubEmbedder:
+        def encode(self, *_args, **_kwargs):
+            return np.array([0.0, 1.0])
+
+    tier1 = Tier1ExpressionFilter(alpha=1.0, llm_client=None, max_retries=1)
+    tier1._embedder = StubEmbedder()
+
+    async def immediate_embed(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+    monkeypatch.setattr(
+        "src.enforcement.tier1_filter.run_embed_in_executor", immediate_embed
+    )
+
+    final_text, result = await tier1.enforce_and_regenerate(
+        text="some text",
+        original_messages=[{"role": "user", "content": "hi"}],
+        context={"expression_dna": edna},
+        safe_template="SAFE_RESPONSE",
+    )
+    assert final_text == "SAFE_RESPONSE"
+    assert result.passed is False
+
+
+# ----------------------------------------------------------------------
+# Tier-2 direct SBERT retrieval regression test
+# (2026-07-17 refactor: dialogue-state classifier removed)
+# ----------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_tier2_retrieval_returns_relevant():
+    """Retriever returns the mind model whose doc matches the dialogue."""
+    from src.enforcement.mind_model_retriever import MindModelRetriever
+    from src.skill.schema import MindModel
+
+    class StubEmbedder:
+        def encode(self, texts, show_progress_bar=False):
+            # Bag-of-words style 4-dim embedding based on keyword presence.
+            single = isinstance(texts, str)
+            inputs = [texts] if single else texts
+            vecs = []
+            for t in inputs:
+                t_lower = t.lower()
+                vecs.append(np.array([
+                    float("vandal" in t_lower),
+                    float("source" in t_lower),
+                    float("welcome" in t_lower),
+                    float("policy" in t_lower),
+                ], dtype=float))
+            return vecs[0] if single else vecs
+
+    retriever = MindModelRetriever(top_k=1)
+    retriever._embedder = StubEmbedder()
+
+    models = [
+        MindModel(name="patrol", description="revert vandalism", application="", limitation="", evidence=[]),
+        MindModel(name="source", description="verify sources citations", application="", limitation="", evidence=[]),
+        MindModel(name="welcome", description="welcome newcomers warmly", application="", limitation="", evidence=[]),
+    ]
+    messages = [{"role": "user", "content": "please check the source of this claim"}]
+    selected = retriever.retrieve_for_messages(models, messages)
+    assert len(selected) == 1
+    assert selected[0].name == "source"
+
+
+# ---------------------------------------------------------------------------
+# Smoke test: CADPAgent construction + judge_meta attribute path
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cadp_agent_cluster_id_accessible_for_judge_meta():
+    """Self.state.cluster_id is where population builder stores the id.
+
+    Regression: earlier judge-meta code used self.cluster_id, which is not
+    set on BaseAgent (cluster_id lives in self.state). This smoke verifies
+    the attribute path used by the two enforce_output call-sites in
+    BaseAgent.take_turn.
     """
-    from scipy.stats import norm
-    from src.enforcement.tier1_filter import _bonferroni_threshold
+    from pathlib import Path
+    from unittest.mock import AsyncMock, MagicMock
 
-    expected = float(norm.ppf(1.0 - (2.0 * (1.0 - norm.cdf(2.0)) / 384) / 2.0))
-    actual = _bonferroni_threshold(per_dim_sigma=2.0, dim=384)
-    assert abs(actual - expected) < 1e-9
-    # Anchor on the analytic value to catch silent regressions (e.g. anyone
-    # reverting to the legacy 2.0 threshold or to the sqrt(2 ln d) Gumbel
-    # approximation ≈3.45 used by the no-scipy fallback path).
-    assert 3.80 < actual < 3.90, f"expected ≈3.85 at d=384, got {actual}"
-    # And distinctly above both the legacy 2σ and the Gumbel approximation,
-    # so a refactor that mistakenly uses either of those would fail here.
-    assert actual > 3.50, "threshold collapsed below sqrt(2 ln 384)≈3.45"
+    from src.agents.cadp import CADPAgent
+
+    skill_path = Path("outputs/skills/skill_cluster_0_wikipedia_nuwa.yaml")
+    if not skill_path.exists():
+        pytest.skip("Skill corpus not found — run skill compilation first")
+    from src.skill.compiler import SkillCompiler
+    skill = SkillCompiler.load_skill(skill_path)
+
+    mock_llm = MagicMock()
+    mock_llm.models = {}
+    mock_llm.model_name = "mock"
+
+    agent = CADPAgent(
+        agent_id="smoke_0",
+        llm_client=mock_llm,
+        model_name="mock",
+        cluster_id="7",
+        skill=skill,
+        alpha=1.0,
+        backend="base",
+        seed=42,
+        tier3_llm_judge_enabled=False,
+    )
+
+    assert agent.state.cluster_id == "7"
+    assert agent.enforcement_harness is not None
 
 
-def test_tier1_bonferroni_threshold_low_dim():
-    """At d=1 the Bonferroni correction is a no-op: threshold == per_dim_sigma."""
-    from src.enforcement.tier1_filter import _bonferroni_threshold
-    assert abs(_bonferroni_threshold(2.0, 1) - 2.0) < 1e-9
+# ---------------------------------------------------------------------------
+# Smoke test: Tier2 retrieval is sync (executor-ready)
+# ---------------------------------------------------------------------------
 
+def test_tier2_retrieve_for_messages_is_sync():
+    """MindModelRetriever.retrieve_for_messages must be a plain function.
 
-def test_tier1_bonferroni_monotone_in_d():
-    """Threshold strictly increases with embedding dimensionality."""
-    from src.enforcement.tier1_filter import _bonferroni_threshold
-    thresholds = [_bonferroni_threshold(2.0, d) for d in (1, 32, 128, 384, 1024)]
-    assert all(b > a for a, b in zip(thresholds, thresholds[1:])), thresholds
-
-
-def test_tier1_filter_dimension_aware_default():
-    """Tier1ExpressionFilter must default to dimension_aware=True.
-
-    Falling back to the legacy 2σ threshold silently would systematically
-    over-flag at d=384 — the exact regression P7 is meant to prevent.
+    The caller (Tier2MindModelInjection.check_pre_generation) ships it
+    to ``run_embed_in_executor``. If the method is ``async def``, the
+    executor returns an un-awaitable coroutine, and iterating it in
+    ``_format_mind_models`` raises ``TypeError: 'coroutine' object is
+    not iterable``.
     """
     import inspect
-    from src.enforcement.tier1_filter import Tier1ExpressionFilter
-    sig = inspect.signature(Tier1ExpressionFilter.__init__)
-    assert sig.parameters["dimension_aware"].default is True
+    from src.enforcement.mind_model_retriever import MindModelRetriever
+    assert not inspect.iscoroutinefunction(MindModelRetriever.retrieve_for_messages), (
+        "retrieve_for_messages must be synchronous — "
+        "Tier2 ships it to an executor thread"
+    )
 

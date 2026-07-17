@@ -400,7 +400,14 @@ async def run_experiment(config_path: str, exp_type: str = "exp1") -> None:
     from src.experiment.transfer_test import CrossDatasetTransferRunner
 
     config = ExperimentConfig.from_yaml(config_path)
-    setup_logging(level="INFO")
+    from datetime import datetime
+    _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _log_dir = Path("logs")
+    _log_dir.mkdir(exist_ok=True)
+    setup_logging(
+        level="INFO",
+        log_file=str(_log_dir / f"{config.name}_{_ts}.log"),
+    )
 
     logger.info(f"Starting {exp_type} experiment: {config.name}")
 
@@ -457,28 +464,10 @@ async def run_experiment(config_path: str, exp_type: str = "exp1") -> None:
         logger.info(f"Final cost summary: {costs}")
 
     elif exp_type == "trigger_calibration":
-        from src.experiment.trigger_calibration import TriggerCalibrationRunner
-
-        runner = TriggerCalibrationRunner(config)
-        from src.utils.io import save_json
-
-        for dataset in config.datasets:
-            result = await runner.run(dataset)
-            result_path = runner.results_dir / f"trigger_calibration_{dataset}.json"
-            save_json(result, result_path)
-
-            # Cross-dataset transfer (all pairs)
-            for target in config.datasets:
-                if target == dataset:
-                    continue
-                transfer = await runner.run_cross_dataset(dataset, target)
-                transfer_path = runner.results_dir / (
-                    f"trigger_transfer_{dataset}_to_{target}.json"
-                )
-                save_json(transfer, transfer_path)
-
-        costs = runner.llm.get_cost_summary()
-        logger.info(f"Final cost summary: {costs}")
+        raise SystemExit(
+            "trigger_calibration experiment type was removed in the "
+            "2026-07-17 enforcement simplification (rule-based Tier 3 deleted)."
+        )
 
     elif exp_type == "alpha_sensitivity":
         from src.experiment.alpha_sensitivity import AlphaSensitivityRunner

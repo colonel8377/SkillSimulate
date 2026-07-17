@@ -1,13 +1,12 @@
-"""Rich-Narrative Persona agent — lever-1 ceiling / kill condition.
+"""Rich Cluster Narrative — internal lever-1 ceiling / kill condition.
 
 Reframe v1 (2026-07-08): the richest possible persona description built
-from the SAME cluster statistics as CADP, but in narrative form with
-concrete episodes and example moves. NO compiled .skill rules, NO
+from aggregate cluster statistics in narrative form. NO compiled .skill rules, NO
 filter-retry. Tests whether distilled behavioral skills beat the
 strongest lever-1 description.
 
-If CADP loses to this on Predictive Fidelity, the headline thesis fails.
-Token-budget matched to a CADP skill file so length is not the confound.
+If CADP fails the pre-registered viability metrics against this condition,
+the method-led route stops. This is not a Scaling-Law reproduction.
 """
 
 from __future__ import annotations
@@ -19,10 +18,10 @@ class RichNarrativeAgent(DescriptivePersonaAgent):
     """Lever-1 ceiling condition: maximalist narrative persona.
 
     Identical system-prompt wrapping as ``DescriptivePersonaAgent``; the
-    only difference is the depth of ``persona_description`` (long
-    multi-paragraph narrative vs terse bullet stats). Same data source,
-    same builder path → isolates "rules vs description" as the sole
-    variable in the CADP-vs-rich_narrative kill comparison.
+    only difference relative to DescriptivePersonaAgent is the depth of
+    ``persona_description``. Relative to CADP, both information granularity
+    and execution mechanism differ; this is an overall-package viability
+    control, not a single-variable causal contrast.
     """
 
     def get_constraints_text(self) -> str:

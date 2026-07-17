@@ -158,6 +158,29 @@ class TestAgentMemory:
         # Summary should appear in top results due to the 1.5× boost
         assert any(m.msg_id == "summary_1" for m in retrieved)
 
+    def test_agent_runtime_state_roundtrip_is_lossless(self):
+        from src.agents.vanilla import VanillaAgent
+        from src.agents.reflection import ReflectionState
+
+        source = VanillaAgent(agent_id="a", llm_client=object(), cluster_id="2")
+        source.state.current_round = 7
+        source.state.messages_sent = 3
+        source.state.actions_taken = {"discuss": 3}
+        source.engagement_ratio = 0.25
+        source.memory.add(self._make_msg("remember this", 4), round=4, importance=2.0)
+        source.reflection.state = ReflectionState("belief", ["position"], 5)
+
+        raw = source.get_runtime_state()
+        restored = VanillaAgent(agent_id="a", llm_client=object(), cluster_id="2")
+        restored.restore_runtime_state(raw)
+
+        assert restored.state.current_round == 7
+        assert restored.state.messages_sent == 3
+        assert restored.state.actions_taken == {"discuss": 3}
+        assert restored.engagement_ratio == 0.25
+        assert restored.memory.retrieve(current_round=7)[0].text == "remember this"
+        assert restored.reflection.state.summary == "belief"
+
 
 # ---------------------------------------------------------------------------
 # Issue 2: Checkpoint — turn JSONL + FAILED marker + integrity check
@@ -187,6 +210,26 @@ class TestCheckpointManager:
         cm = CheckpointManager(tmp_path)
         assert cm.get_last_successful_turn("c") is None
 
+    def test_latest_round_uses_numeric_not_lexicographic_order(self, tmp_path):
+        cm = CheckpointManager(tmp_path)
+        cm.save("c", 9, [], [])
+        cm.save("c", 49, [], [])
+        assert cm.load("c")["round"] == 49
+
+    def test_corrupt_latest_checkpoint_falls_back(self, tmp_path):
+        cm = CheckpointManager(tmp_path)
+        cm.save("c", 4, [], [])
+        (tmp_path / "c_round_9.json").write_text("{partial")
+        assert cm.load("c")["round"] == 4
+
+    def test_partial_turns_after_full_round_are_discarded(self, tmp_path):
+        cm = CheckpointManager(tmp_path)
+        cm.append_turn("c", 4, 0, "a", "ok", {"msg_id": "m4"})
+        cm.append_turn("c", 5, 0, "a", "ok", {"msg_id": "partial"})
+        cm.truncate_turns_after_round("c", 4)
+        turns = cm.load_turns("c")
+        assert [t["round"] for t in turns] == [4]
+
     def test_load_turns_tolerates_corrupt_lines(self, tmp_path):
         cm = CheckpointManager(tmp_path)
         path = cm._turns_path("c")
@@ -211,8 +254,15 @@ class TestCheckpointManager:
     def test_is_completed_accepts_valid_result_file(self, tmp_path):
         cm = CheckpointManager(tmp_path)
         result_path = tmp_path / "result.json"
-        result_path.write_text(json.dumps({"final_metrics": {}}))
-        cm.mark_completed("c", str(result_path))
+        result_path.write_text(json.dumps({
+            "final_metrics": {},
+            "simulation_integrity_passed": True,
+            "simulation_message_count": 10,
+            "simulation_round_count": 2,
+            "simulation_expected_round_count": 2,
+            "run_fingerprint": "fp",
+        }))
+        cm.mark_completed("c", str(result_path), run_fingerprint="fp")
         assert cm.is_completed("c")
 
     def test_is_completed_rejects_corrupt_result_file(self, tmp_path):

@@ -49,6 +49,9 @@ class WikipediaLoader(DatasetLoader):
         # is needed.  None = no thread-level cap (rely on ``limit`` only).
         self.target_threads = target_threads
         self.min_messages = min_messages
+        # Optional complete-year subset for observed-continuation studies.
+        # Unlike target_threads, this never stops mid-file/thread.
+        self.allowed_years: set[int] | None = None
 
     def get_platform(self) -> Platform:
         return Platform.WIKIPEDIA
@@ -61,6 +64,15 @@ class WikipediaLoader(DatasetLoader):
         # action history (modification/deletion/restoration) + toxicity, so they
         # are used in preference to any flat *.jsonl dump in the same tree.
         convokit_dirs = self._find_convokit_corpora(data_dir)
+        if self.allowed_years:
+            convokit_dirs = [
+                directory for directory in convokit_dirs
+                if any(str(year) in directory.name for year in self.allowed_years)
+            ]
+            if not convokit_dirs:
+                raise ValueError(
+                    f"No WikiConv corpora found for years {sorted(self.allowed_years)}"
+                )
         if convokit_dirs:
             threads = self._load_convokit(convokit_dirs, data_dir)
         else:
@@ -108,7 +120,16 @@ class WikipediaLoader(DatasetLoader):
             "restoration": ActionType.RESTORE,
         }
 
+        import math
+
         n_utts = 0
+        # A thread target is distributed across year corpora. The old loader
+        # checked the global target only between files and therefore stopped
+        # after 2001–2002, despite claiming an 18-year sample.
+        per_dir_thread_target = (
+            max(1, math.ceil(self.target_threads / len(corpus_dirs)))
+            if self.target_threads is not None and corpus_dirs else None
+        )
         # When limited, sample evenly across year-corpora rather than
         # front-loading the earliest (small, low-conflict) years.
         per_dir = (
@@ -116,19 +137,12 @@ class WikipediaLoader(DatasetLoader):
             if (self.limit is not None and corpus_dirs) else None
         )
         for cdir in corpus_dirs:
-            # Early termination: stop if we already have enough qualifying threads.
-            if self.target_threads is not None:
-                qualifying = sum(
-                    1 for t in threads_map.values()
-                    if len(t.messages) >= self.min_messages
-                )
-                if qualifying >= self.target_threads:
-                    break
             if self.limit is not None and n_utts >= self.limit:
                 break
             logger.info(f"Loading {cdir.name} …")
             conv_meta = self._load_conversations(cdir)
             dir_count = 0
+            dir_qualifying: set[str] = set()
             with open(cdir / "utterances.jsonl") as f:
                 for line in f:
                     line = line.strip()
@@ -157,6 +171,13 @@ class WikipediaLoader(DatasetLoader):
                             )
                             threads_map[msg.thread_id] = thread
                         thread.add_message(msg)
+                        if len(thread.messages) >= self.min_messages:
+                            dir_qualifying.add(thread.thread_id)
+                    if (
+                        per_dir_thread_target is not None
+                        and len(dir_qualifying) >= per_dir_thread_target
+                    ):
+                        break
 
         qualifying = sum(
             1 for t in threads_map.values()
@@ -168,6 +189,15 @@ class WikipediaLoader(DatasetLoader):
             + (f" (limit={self.limit}, ~{per_dir}/year)" if self.limit else "")
             + (f" (target_threads={self.target_threads})" if self.target_threads else "")
         )
+        # With a thread-driven target, downstream consumers asked explicitly
+        # for conversations of at least ``min_messages``. Returning hundreds
+        # of thousands of incomplete short threads only makes PII scrubbing
+        # and filtering expensive and cannot affect the selected sample.
+        if self.target_threads is not None or self.allowed_years:
+            return [
+                thread for thread in threads_map.values()
+                if len(thread.messages) >= self.min_messages
+            ]
         return list(threads_map.values())
 
     @staticmethod
@@ -255,7 +285,10 @@ class WikipediaLoader(DatasetLoader):
                 platform=self.get_platform(),
                 timestamp=self._parse_ts(utt.get("timestamp")),
                 text=str(utt.get("text") or ""),
-                action_type=self._infer_action(utt, str(utt.get("text") or "")),
+                # A WikiConv utterance is a talk-page comment. Platform
+                # events are represented separately below; words such as
+                # "report" or "revert" in prose are not event evidence.
+                action_type=ActionType.DISCUSS,
                 parent_msg_id=str(reply_to) if reply_to else None,
                 metadata=base_meta,
             )
@@ -476,13 +509,10 @@ class WikipediaLoader(DatasetLoader):
             if meta.get("action") == "edit":
                 return ActionType.EDIT
 
-        # 3. Infer from comment text patterns (Wikipedia edit summary conventions)
-        text_lower = text.lower().strip()
-        if any(pat in text_lower for pat in _REVERT_PATTERNS):
-            return ActionType.REVERT
-        if any(pat in text_lower for pat in _REPORT_PATTERNS):
-            return ActionType.REPORT
-        if text_lower.startswith("edit") or src.get("rev_id"):
+        # A revision id is structural evidence for an edit. Do not infer a
+        # platform event from English words in free text: that confounds
+        # stance/content with the action being evaluated.
+        if src.get("rev_id"):
             return ActionType.EDIT
 
         return ActionType.DISCUSS

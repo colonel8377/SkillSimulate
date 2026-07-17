@@ -167,5 +167,53 @@ class AgentMemory:
     def clear(self) -> None:
         self._items.clear()
 
+    def export_state(self) -> list[dict]:
+        """Return a JSON-serializable lossless memory snapshot."""
+        return [
+            {
+                "message": {
+                    "msg_id": item.message.msg_id,
+                    "thread_id": item.message.thread_id,
+                    "user_id": item.message.user_id,
+                    "platform": item.message.platform.value,
+                    "timestamp": item.message.timestamp.isoformat(),
+                    "text": item.message.text,
+                    "action_type": item.message.action_type.value,
+                    "parent_msg_id": item.message.parent_msg_id,
+                    "metadata": dict(item.message.metadata),
+                },
+                "importance": item.importance,
+                "round": item.round,
+                "kind": item.kind,
+            }
+            for item in self._items
+        ]
+
+    def restore_state(self, items: list[dict]) -> None:
+        """Replace memory contents from :meth:`export_state` output."""
+        from datetime import datetime
+        from src.data.schemas import ActionType, Platform
+
+        restored: list[MemoryItem] = []
+        for item in items:
+            raw = item["message"]
+            restored.append(MemoryItem(
+                message=Message(
+                    msg_id=raw["msg_id"],
+                    thread_id=raw["thread_id"],
+                    user_id=raw["user_id"],
+                    platform=Platform(raw["platform"]),
+                    timestamp=datetime.fromisoformat(raw["timestamp"]),
+                    text=raw.get("text", ""),
+                    action_type=ActionType(raw["action_type"]),
+                    parent_msg_id=raw.get("parent_msg_id"),
+                    metadata=dict(raw.get("metadata") or {}),
+                ),
+                importance=float(item.get("importance", 1.0)),
+                round=int(item.get("round", 0)),
+                kind=item.get("kind", "event"),
+            ))
+        self._items = restored
+
     def __len__(self) -> int:
         return len(self._items)

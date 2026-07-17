@@ -204,8 +204,36 @@ class BaseAgent(ABC):
             # We construct it lazily from the (soon-to-be-finalised) action
             # type — at this point plan.action_type is the planner's choice.
             tier1_safe_template = self._safe_template_response(thread, plan.action_type)
+            regeneration_messages = self._build_regeneration_messages(
+                thread=thread,
+                available_actions=available_actions,
+                memory_context=memory_context,
+                constraints=merged_constraints,
+                plan=plan,
+            )
+            recent_messages = [
+                {
+                    "user_id": m.user_id,
+                    "action_type": m.action_type.value,
+                    "text": m.text,
+                }
+                for m in thread.messages[-10:]
+            ]
+            # Per-turn annotation metadata forwarded to the Tier-3 judge
+            # log (human-labeling support): lets every JSONL row be traced
+            # back to agent / round / action / thread without the checkpoint.
+            judge_meta = {
+                "agent_id": self.agent_id,
+                "cluster_id": self.state.cluster_id,
+                "round": current_round,
+                "action_type": plan.action_type.value,
+                "thread_id": thread.thread_id,
+                "reformulation_attempt": 0,
+            }
             final_text, post_log, replan_feedback = await self.enforcement_harness.enforce_output(
-                final_text, gen_messages, safe_template=tier1_safe_template
+                final_text, regeneration_messages, safe_template=tier1_safe_template,
+                context_messages=recent_messages,
+                meta=judge_meta,
             )
 
             # Step 5: Forced Reformulation Protocol (outline §4.4.2)
@@ -232,6 +260,7 @@ class BaseAgent(ABC):
                         prev_text=final_text,
                         violation_feedback=replan_feedback,
                         prev_action_type=plan.action_type,
+                        prev_stance=plan.stance,
                     )
                     final_text = replan.text or final_text
                     plan = replan
@@ -241,9 +270,33 @@ class BaseAgent(ABC):
                     # enforce_output returns new_feedback = None iff Tier 3
                     # passes; Tier 1 may still regenerate style on the
                     # Tier-3-clean text, which is its designed behaviour.
+                    recent_messages = [
+                        {
+                            "user_id": m.user_id,
+                            "action_type": m.action_type.value,
+                            "text": m.text,
+                        }
+                        for m in thread.messages[-10:]
+                    ]
                     rechecked_text, loop_log, new_feedback = await self.enforcement_harness.enforce_output(
-                        final_text, gen_messages,
+                        final_text,
+                        self._build_regeneration_messages(
+                            thread=thread,
+                            available_actions=available_actions,
+                            memory_context=memory_context,
+                            constraints=merged_constraints,
+                            plan=plan,
+                        ),
                         safe_template=self._safe_template_response(thread, plan.action_type),
+                        context_messages=recent_messages,
+                        meta={
+                            "agent_id": self.agent_id,
+                            "cluster_id": self.state.cluster_id,
+                            "round": current_round,
+                            "action_type": plan.action_type.value,
+                            "thread_id": thread.thread_id,
+                            "reformulation_attempt": attempt + 1,
+                        },
                     )
                     if loop_log.total_violations > 0:
                         post_log.total_violations += loop_log.total_violations
@@ -351,6 +404,8 @@ class BaseAgent(ABC):
             metadata={
                 "round": current_round,
                 "reasoning": plan.reasoning,
+                "planned_action_type": plan.action_type.value,
+                "stance": plan.stance,
                 # outline §4.4.2 step 4: mark safe-template outputs so they
                 # are counted separately in evaluation.
                 "constraint_forced": constraint_forced,
@@ -430,6 +485,47 @@ class BaseAgent(ABC):
             "conclusion. Could you clarify the reasoning behind it?"
         )
 
+    def _build_regeneration_messages(
+        self,
+        thread: Thread,
+        available_actions: list[ActionType],
+        memory_context: str,
+        constraints: str,
+        plan: ActionPlan,
+    ) -> list[dict[str, str]]:
+        """Build lossless context for Tier-1 style regeneration.
+
+        The old path supplied only topic and memory, so a regenerated string
+        could lose its reply target or contradict the already-selected action.
+        This context freezes those decisions and includes the same observable
+        thread state used by the planner.
+        """
+        recent = thread.messages[-self.max_thread_messages:]
+        per_msg_budget = (
+            max(self.per_msg_token_floor, self.max_memory_tokens // self.per_msg_token_ratio)
+            if self.max_memory_tokens else 0
+        )
+        thread_text = "\n".join(
+            f"<msg id={m.msg_id}> [{m.user_id}] ({m.action_type.value}): "
+            f"{truncate_to_token_budget(m.text, per_msg_budget) if per_msg_budget else m.text[:200]}"
+            for m in recent
+        )
+        action_values = ", ".join(a.value for a in available_actions)
+        user_text = (
+            f"Platform: {thread.platform.value}\n"
+            f"Topic: {thread.topic}\n"
+            f"Available actions: {action_values}\n"
+            f"Selected action (do not change): {plan.action_type.value}\n"
+            f"Selected target_msg_id (do not change): {plan.target_msg_id or ''}\n\n"
+            f"Current thread state:\n{thread_text}\n\n"
+            f"Recent memory:\n{memory_context}\n\n"
+            f"Behavioral constraints:\n{constraints}"
+        )
+        return [
+            {"role": "system", "content": self.get_role_description()},
+            {"role": "user", "content": user_text},
+        ]
+
     def get_state_summary(self) -> dict:
         """Return summary of agent state for logging."""
         return {
@@ -441,3 +537,68 @@ class BaseAgent(ABC):
                 log.get("total_violations", 0) for log in self.state.enforcement_logs
             ),
         }
+
+    def get_runtime_state(self) -> dict:
+        """Return a lossless checkpoint state, distinct from metric summary."""
+        enforcement_rng = None
+        if self.enforcement_harness is not None:
+            rng_t3 = getattr(self.enforcement_harness, "_rng_t3", None)
+            enforcement_rng = {
+                "tier1": self.enforcement_harness.tier1._rng.getstate(),
+                "tier2": self.enforcement_harness.tier2._rng.getstate(),
+                "tier3": rng_t3.getstate() if rng_t3 else None,
+            }
+        return {
+            "schema_version": 2,
+            "agent_id": self.agent_id,
+            "cluster_id": self.state.cluster_id,
+            "current_round": self.state.current_round,
+            "messages_sent": self.state.messages_sent,
+            "actions_taken": dict(self.state.actions_taken),
+            "enforcement_logs": list(self.state.enforcement_logs),
+            "engagement_ratio": self.engagement_ratio,
+            "memory": self.memory.export_state(),
+            "reflection": {
+                "summary": self.reflection.state.summary,
+                "key_positions": list(self.reflection.state.key_positions),
+                "round": self.reflection.state.round,
+            },
+            "enforcement_rng": enforcement_rng,
+        }
+
+    def restore_runtime_state(self, raw: dict) -> None:
+        """Restore a checkpoint created by :meth:`get_runtime_state`."""
+        if raw.get("schema_version") != 2:
+            raise ValueError(
+                f"Agent {self.agent_id}: legacy checkpoint has no lossless runtime state"
+            )
+        if raw.get("agent_id") != self.agent_id:
+            raise ValueError(
+                f"Checkpoint agent mismatch: expected {self.agent_id}, got {raw.get('agent_id')}"
+            )
+        self.state.current_round = int(raw.get("current_round", 0))
+        self.state.messages_sent = int(raw.get("messages_sent", 0))
+        self.state.actions_taken = dict(raw.get("actions_taken") or {})
+        self.state.enforcement_logs = list(raw.get("enforcement_logs") or [])
+        self.engagement_ratio = float(raw.get("engagement_ratio", self.engagement_ratio))
+        self.memory.restore_state(list(raw.get("memory") or []))
+
+        from src.agents.reflection import ReflectionState
+        reflection = raw.get("reflection") or {}
+        self.reflection.state = ReflectionState(
+            summary=reflection.get("summary", ""),
+            key_positions=list(reflection.get("key_positions") or []),
+            round=int(reflection.get("round", 0)),
+        )
+        enforcement_rng = raw.get("enforcement_rng")
+        if self.enforcement_harness is not None and enforcement_rng:
+            def _tuples(value):
+                if isinstance(value, list):
+                    return tuple(_tuples(v) for v in value)
+                return value
+            self.enforcement_harness.tier1._rng.setstate(_tuples(enforcement_rng["tier1"]))
+            self.enforcement_harness.tier2._rng.setstate(_tuples(enforcement_rng["tier2"]))
+            rng_t3 = getattr(self.enforcement_harness, "_rng_t3", None)
+            t3_state = enforcement_rng.get("tier3")
+            if rng_t3 is not None and t3_state is not None:
+                rng_t3.setstate(_tuples(t3_state))

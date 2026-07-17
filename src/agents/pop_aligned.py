@@ -1,7 +1,8 @@
-"""Population-Aligned Persona agent — arXiv:2509.10127.
+"""Cluster-Stat Aligned Persona — internal population-description baseline.
 
-Generates personas by matching the population's attribute distribution
-(demographics + behavioral tendencies), NOT behavioral rules.
+Inspired by population-alignment work, but intentionally does not claim to
+reproduce arXiv:2509.10127's full generation/filtering/importance-sampling
+pipeline. It samples attributes from the project's behavioral clusters.
 Key distinction from CADP: matches *attribute distributions* (correct
 *types* of people) without enforcing behavioral rules (correct *actions*).
 """
@@ -16,7 +17,7 @@ from src.clustering.features import UserFeatures
 
 
 class PopAlignedPersonaAgent(BaseAgent):
-    """Baseline 4: Population-Aligned Persona (arXiv:2509.10127).
+    """Cluster-stat aligned static persona baseline.
 
     Samples individual attributes from the cluster's population distribution
     to create a distribution-matched persona. Uses system prompt only —
@@ -71,12 +72,19 @@ def compute_cluster_attributes(
     if not members_features:
         return {}
 
-    vectors = np.array([f.to_vector() for f in members_features])
-    attr_names = ["reply_depth", "edit_frequency", "stance_shift_rate", "conflict_engagement_ratio"]
+    # Never bind prompt semantics to ``to_vector()`` positions. That vector is
+    # the mutable clustering space and currently begins with reply_rate,
+    # mean_indentation, verbosity, activity.
+    attr_accessors = {
+        "reply_depth": "mean_indentation",
+        "verbosity": "verbosity",
+        "question_rate": "question_rate",
+        "conflict_engagement_ratio": "conflict_engagement_ratio",
+    }
 
     stats = {}
-    for i, name in enumerate(attr_names):
-        col = vectors[:, i]
+    for name, field_name in attr_accessors.items():
+        col = np.array([getattr(f, field_name) for f in members_features], dtype=float)
         stats[name] = {
             "mean": float(np.mean(col)),
             "std": float(np.std(col)),
@@ -115,8 +123,8 @@ def sample_individual_attributes(
 
     attr_labels = {
         "reply_depth": "typical reply depth",
-        "edit_frequency": "editing tendency",
-        "stance_shift_rate": "opinion flexibility",
+        "verbosity": "message verbosity",
+        "question_rate": "inquisitiveness",
         "conflict_engagement_ratio": "conflict involvement",
         "activity_level": "activity level",
         "breadth": "topic breadth",
@@ -140,7 +148,7 @@ def sample_individual_attributes(
             val = mean
 
         # Quantize into descriptive categories for persona readability
-        if attr_key in ("reply_depth", "activity_level", "breadth"):
+        if attr_key in ("reply_depth", "verbosity", "activity_level", "breadth"):
             if val >= mean + 0.5 * std if std > 0 else val >= mean:
                 level = "high"
             elif val <= mean - 0.5 * std if std > 0 else val <= mean:

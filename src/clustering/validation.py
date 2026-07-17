@@ -107,3 +107,113 @@ class ClusterStabilityValidator:
             except Exception:
                 results[k] = {"silhouette": -1.0, "davies_bouldin": float("inf")}
         return results
+
+    @staticmethod
+    def validate_locked_vectors(
+        cluster_result: ClusterResult,
+        merge_map: dict[int, int] | None = None,
+        n_iterations: int = 20,
+        train_sample_size: int = 30_000,
+        eval_sample_size: int = 10_000,
+        random_state: int = 42,
+        ari_mean_threshold: float = 0.80,
+        ari_variance_threshold: float = 0.02,
+    ) -> dict:
+        """Bootstrap stability of a locked QuantileTransformer+KMeans partition.
+
+        Each iteration resamples users with replacement, refits the same
+        preprocessing and KMeans family used by the locked WikiConv artifact,
+        and predicts a fixed evaluation sample. ARI is label-permutation
+        invariant, so fitted cluster IDs need not match the canonical IDs.
+        """
+        from scipy.optimize import linear_sum_assignment
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import QuantileTransformer
+
+        source_labels = getattr(cluster_result, "source_labels", cluster_result.labels)
+        user_ids = [
+            uid for uid in source_labels
+            if uid in cluster_result.user_features and source_labels[uid] >= 0
+        ]
+        if len(user_ids) < 100:
+            raise ValueError("Locked clustering has too few labeled user vectors")
+        X = np.stack([
+            cluster_result.user_features[uid].to_vector() for uid in user_ids
+        ])
+        y_source = np.asarray([source_labels[uid] for uid in user_ids], dtype=int)
+        merge_map = dict(merge_map or {})
+        y_final = np.asarray([merge_map.get(int(v), int(v)) for v in y_source], dtype=int)
+        source_ids = sorted(set(y_source.tolist()))
+        n_clusters = len(source_ids)
+        if n_clusters < 2:
+            raise ValueError("Locked clustering must contain at least two clusters")
+
+        rng = np.random.default_rng(random_state)
+        eval_n = min(eval_sample_size, len(user_ids))
+        eval_idx = rng.choice(len(user_ids), size=eval_n, replace=False)
+        X_eval = X[eval_idx]
+        y_eval_source = y_source[eval_idx]
+        y_eval_final = y_final[eval_idx]
+        train_n = min(train_sample_size, len(user_ids))
+        source_scores: list[float] = []
+        final_scores: list[float] = []
+        for iteration in range(n_iterations):
+            train_idx = rng.choice(len(user_ids), size=train_n, replace=True)
+            X_train = X[train_idx]
+            y_train_source = y_source[train_idx]
+            scaler = QuantileTransformer(
+                output_distribution="normal",
+                n_quantiles=min(1000, len(X_train)),
+                random_state=random_state + iteration,
+            )
+            X_train_scaled = scaler.fit_transform(X_train)
+            model = KMeans(
+                n_clusters=n_clusters,
+                random_state=random_state + iteration,
+                n_init=5,
+            ).fit(X_train_scaled)
+            predicted_train = model.labels_
+            predicted_eval = model.predict(scaler.transform(X_eval))
+            source_scores.append(float(adjusted_rand_score(y_eval_source, predicted_eval)))
+
+            # Map arbitrary fitted IDs to canonical source-K8 IDs using the
+            # bootstrap training sample, then apply the pre-registered merge.
+            fitted_ids = sorted(set(predicted_train.tolist()))
+            contingency = np.zeros((len(fitted_ids), len(source_ids)), dtype=int)
+            fitted_pos = {v: i for i, v in enumerate(fitted_ids)}
+            source_pos = {v: i for i, v in enumerate(source_ids)}
+            for pred, truth in zip(predicted_train, y_train_source):
+                contingency[fitted_pos[int(pred)], source_pos[int(truth)]] += 1
+            rows, cols = linear_sum_assignment(-contingency)
+            aligned = {fitted_ids[r]: source_ids[c] for r, c in zip(rows, cols)}
+            predicted_final = np.asarray([
+                merge_map.get(aligned[int(v)], aligned[int(v)]) for v in predicted_eval
+            ])
+            final_scores.append(float(adjusted_rand_score(y_eval_final, predicted_final)))
+
+        source_values = np.asarray(source_scores, dtype=float)
+        values = np.asarray(final_scores, dtype=float)
+        is_stable = bool(
+            values.mean() >= ari_mean_threshold
+            and values.var() <= ari_variance_threshold
+        )
+        return {
+            "protocol": "locked_k8_merge_bootstrap_v2",
+            "preprocessor": "QuantileTransformer(output_distribution=normal)",
+            "clusterer": f"KMeans(k={n_clusters}, n_init=5) then canonical merge",
+            "n_users_available": len(user_ids),
+            "n_iterations": n_iterations,
+            "train_sample_size": train_n,
+            "eval_sample_size": eval_n,
+            "source_k8_ari_scores": source_scores,
+            "source_k8_ari_mean": float(source_values.mean()),
+            "source_k8_ari_variance": float(source_values.var()),
+            "ari_scores": final_scores,
+            "ari_mean": float(values.mean()),
+            "ari_variance": float(values.var()),
+            "ari_ci_low": float(np.quantile(values, 0.025)),
+            "ari_ci_high": float(np.quantile(values, 0.975)),
+            "ari_mean_threshold": ari_mean_threshold,
+            "ari_variance_threshold": ari_variance_threshold,
+            "is_stable": is_stable,
+        }

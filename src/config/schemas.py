@@ -36,6 +36,9 @@ class ConditionName(str, Enum):
     # _get_or_compile_skills for the fail-fast behavior this implies.
     CADP_FULL_COLLEAGUE = "cadp_full_colleague"
     CADP_FULL_NUWA = "cadp_full_nuwa"
+    # Content-matched feasibility control: the same Nuwa skill as Full,
+    # rendered as static advisory prompt content with no enforcement.
+    CADP_ADVISORY_NUWA = "cadp_advisory_nuwa"
     CADP_SHUFFLED = "cadp_shuffled"
     CADP_MINUS_EDNA = "cadp_minus_edna"
     CADP_MINUS_MM = "cadp_minus_mm"
@@ -112,15 +115,56 @@ class ExperimentConfig:
     max_sim_threads: int = 5     # cap on threads used per simulation cell
     checkpoint_every: int = 5    # save state every N rounds
     max_concurrency: int = 4     # parallel LLM calls
+    micro_batch_size: int = 0    # 0 = one frozen round; >0 commits between batches
+    population_allocation: str = "proportional"  # proportional | balanced
     max_context_items: int = 5       # memory items shown per turn (to planner)
     per_msg_token_ratio: int = 10    # per-msg budget = max_memory_tokens // ratio
     per_msg_token_floor: int = 60    # per-msg token floor (legacy fallback)
     max_thread_messages: int = 5     # recent thread messages shown in prompt
     reflection_interval: int = 10    # periodic reflection every N rounds
     seed_min_toxicity: float = 0.6  # min max-toxicity for CGA seed threads
+    max_reformulation_retries: int = 1  # Tier-3 forced-reformulation budget
+    tier1_max_retries: int = 1          # Tier-1 style-regeneration budget
+    reference_strategy: str = "matched_external"  # matched_external | observed_continuation
+    continuation_min_messages: int = 6
+    continuation_prefix_fraction: float = 0.5
+    continuation_years: list[int] = field(default_factory=list)
+    continuation_min_platform_events: int = 2
+    continuation_event_strata_cap: int = 3
+    action_js_smoothing: float = 0.0
+    linguistic_metric_weights: dict[str, float] = field(default_factory=lambda: {
+        "discourse_relation_match": 0.25,
+        "sentiment_trajectory_similarity": 0.25,
+        "speech_act_similarity": 0.25,
+        "sip": 0.25,
+    })
+    interaction_metric_weights: dict[str, float] = field(default_factory=lambda: {
+        "cascade": 0.5,
+        "graph": 0.5,
+    })
+    manipulation_min_potential_rate: float = 0.0
     seed: int = 42
     backend: str = "base"
-    # Exp 2 scale test
+    # --- Exp1 viability gate (pre-registered before result generation) ---
+    viability_enabled: bool = False
+    viability_treatment: str = "cadp_full_nuwa"
+    viability_control: str = "rich_narrative"
+    viability_primary_metrics: list[str] = field(default_factory=lambda: [
+        "ned", "uniformity_gap", "complexity_gap",
+        "ks_statistic", "dtw_distance",
+    ])
+    viability_min_pairs: int = 3
+    viability_min_metric_wins: int = 3
+    viability_min_repeat_win_fraction: float = 2.0 / 3.0
+    viability_min_message_ratio: float = 0.95
+    viability_max_safe_template_rate: float = 0.10
+    viability_min_relative_improvement: float = 0.0
+    viability_max_family_regression: float = 1.0
+    viability_min_action_text_consistency: float = 0.0
+    tier3_llm_judge_enabled: bool = False
+    tier3_llm_judge_model: str = "classification"
+    tier3_llm_judge_audit_only: bool = False
+    tier3_llm_judge_output_dir: str = "outputs/results/tier3_llm_judgments"
     scale_test: bool = False
     scale_test_sizes: list[int] = field(default_factory=lambda: [30, 100])
     # Transfer test mode (outline §5.5)
